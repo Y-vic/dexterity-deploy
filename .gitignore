@@ -17,5 +17,5 @@ pnd-sharpa/deploy/runtime/
 **/sharpa-manus-sdk/
 pnd-sharpa/src/noitom_node/vendor/
 
-# AstrBot is an unrelated standalone repository.
-astribot-sharpa/
+# Keep the AstrBot container directory, but never vendor the AstrBot repository.
+/astribot-sharpa/AstrBot/
