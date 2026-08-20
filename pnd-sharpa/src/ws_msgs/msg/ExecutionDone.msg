@@ -1,0 +1,10 @@
+std_msgs/Header header
+uint64 request_id
+string action_id
+uint64 revision
+uint64 execute_start
+uint64 execute_length
+uint64 executed_steps
+bool success
+bool done
+string error

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#071018">
+  <title>Quest Teleoperation</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js",
+        "three/addons/": "./vendor/addons/"
+      }
+    }
+  </script>
+  <script>
+    window.questReport = (phase, detail = '') => {
+      const query = new URLSearchParams({
+        quest_phase: String(phase),
+        detail: String(detail && (detail.message || detail)).slice(0, 240),
+      });
+      fetch(`./runtime-config.json?${query}`, {
+        cache: 'no-store',
+        keepalive: true,
+      }).catch(() => {});
+    };
+    window.addEventListener('error', (event) => {
+      window.questReport('window_error', event.error || event.message);
+    });
+    window.addEventListener('unhandledrejection', (event) => {
+      window.questReport('unhandled_rejection', event.reason);
+    });
+    window.questReport('html_loaded');
+  </script>
+</head>
+<body>
+  <canvas id="xr-canvas" aria-hidden="true"></canvas>
+  <main class="shell">
+    <section class="panel">
+      <p class="eyebrow">ADAM TELEOPERATION</p>
+      <h1>Quest WebVR</h1>
+      <p class="summary">ZED 画面会持续显示，Quest 官方 Touch 模型或手势追踪模型会保留在 VR 中。</p>
+      <div class="actions">
+        <button id="enter-xr" type="button" disabled>检查 WebXR…</button>
+      </div>
+      <dl class="status-grid">
+        <div><dt>WebXR</dt><dd id="xr-status">检查中</dd></div>
+        <div><dt>Tracking</dt><dd id="tracking-status">未连接</dd></div>
+        <div><dt>Calibration</dt><dd id="calibration-status">未校准</dd></div>
+        <div><dt>ZED</dt><dd id="video-status">未连接</dd></div>
+      </dl>
+      <p id="error-message" class="error" role="alert"></p>
+    </section>
+    <video id="robot-video" autoplay muted playsinline webkit-playsinline></video>
+  </main>
+  <script type="module" src="./quest_app.js"></script>
+</body>
+</html>

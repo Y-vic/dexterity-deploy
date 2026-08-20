@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>obs_node</name>
+  <version>0.1.0</version>
+  <description>TCP observation sender for robot state, tactile data, and ZED metadata.</description>
+  <maintainer email="pnd.humanoid@example.com">pnd-humanoid</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>teleop_interfaces</depend>
+  <depend>deploy_common</depend>
+  <exec_depend>adam_node</exec_depend>
+  <exec_depend>sharpa_node</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

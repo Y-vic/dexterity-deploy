@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>teleoperation</name>
+  <version>0.1.0</version>
+  <description>Launch teleoperation nodes.</description>
+  <maintainer email="pnd.humanoid@example.com">pnd-humanoid</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>bias_node</exec_depend>
+  <exec_depend>status_node</exec_depend>
+  <exec_depend>adam_node</exec_depend>
+  <exec_depend>noitom_node</exec_depend>
+  <exec_depend>manus_node</exec_depend>
+  <exec_depend>sharpa_node</exec_depend>
+  <exec_depend>zed_node</exec_depend>
+  <exec_depend>quest_node</exec_depend>
+  <exec_depend>monitor_node</exec_depend>
+  <exec_depend>foxglove_node</exec_depend>
+  <exec_depend>deploy_common</exec_depend>
+  <exec_depend>actor_node</exec_depend>
+  <exec_depend>obs_node</exec_depend>
+
+  <test_depend>ament_pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

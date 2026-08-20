@@ -1,0 +1,44 @@
+state_node:
+  ros__parameters:
+    aggregate_hardware_state: false
+    state_merge_hz: 30.0
+    max_state_skew_ms: 50.0
+    max_state_age_ms: 250.0
+    max_message_size: 67108864
+    max_buffer_bytes: 67108864
+    ego_buffer_frames: 3
+    state_buffer_frames: 19
+    tau_buffer_frames: 19
+    wrench_buffer_frames: 19
+    deformation_buffer_frames: 3
+    ego_camera_topic: /sharpa/v3/source/ego_cam
+    left_wrist_camera_topic: /sharpa/v3/source/left_wrist_cam
+    right_wrist_camera_topic: /sharpa/v3/source/right_wrist_cam
+    state_topic: /sharpa/v3/source/state
+    ur_state_topic: /ur_position
+    hand_state_topic: /sharpa/hand_state
+    tau_topic: /sharpa/v3/source/tau
+    wrench_topic: /sharpa/v3/source/wrench
+    deformation_topic: /sharpa/v3/source/deformation
+    build_observation_service: /sharpa/v3/state/build_observation
+    fault_topic: /sharpa/v3/policy/fault
+    state_status_topic: /sharpa/v3/state/status
+
+policy_node:
+  ros__parameters:
+    server_base_url: http://127.0.0.1:5500
+    session_id: ""
+    prompt: ""
+    auto_reset: true
+    request_poll_hz: 20.0
+    require_execution_feedback: true
+    connect_timeout_s: 5.0
+    request_timeout_s: 90.0
+    reconnect_initial_s: 0.5
+    reconnect_max_s: 8.0
+    max_message_size: 67108864
+    build_observation_service: /sharpa/v3/state/build_observation
+    action_topic: /sharpa/v3/policy/action
+    execution_feedback_topic: /sharpa/v3/policy/execution_feedback
+    fault_topic: /sharpa/v3/policy/fault
+    status_topic: /sharpa/v3/policy/status

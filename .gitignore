@@ -1,0 +1,21 @@
+deps/cache/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+build/
+install/
+log/
+*.egg-info/
+pnd-sharpa/deploy/runs/
+pnd-sharpa/deploy/runtime/
+
+# External/robot SDK payloads are installed separately on each machine.
+**/external/**/sdk/
+**/sharpa-wave-sdk/
+**/sharpa-manus-sdk/
+pnd-sharpa/src/noitom_node/vendor/
+
+# AstrBot is an unrelated standalone repository.
+astribot-sharpa/

@@ -1,0 +1,10 @@
+string session_id
+uint64 request_id
+---
+string schema
+string session_id
+uint64 request_id
+bool reset
+string metadata_format_id
+bool has_fault
+sharpa_policy_v3_interfaces/PolicyFault fault

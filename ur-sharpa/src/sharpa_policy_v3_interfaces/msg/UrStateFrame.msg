@@ -1,0 +1,10 @@
+uint64 timestamp_ns
+uint32 joint_dimension
+float32[] left_joint
+float32[] right_joint
+uint32 eef_dimension
+float32[] left_eef
+float32[] right_eef
+string eef_frame
+bool normal_mode
+bool valid

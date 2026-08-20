@@ -1,0 +1,28 @@
+string schema
+string session_id
+uint64 request_id
+string action_id
+uint64 revision
+uint64 timestamp_ns
+
+float64 frequency_hz
+uint32 action_length
+uint32 execute_start
+uint32 execute_length
+
+string left_wrist_action_type
+uint32 left_wrist_dimension
+float32[] left_wrist
+string right_wrist_action_type
+uint32 right_wrist_dimension
+float32[] right_wrist
+uint32 hand_joint_dimension
+float32[] hand_joint
+
+string diagnostics_policy_family
+string diagnostics_checkpoint_id
+string diagnostics_checkpoint_path
+float64 diagnostics_inference_latency_ms
+
+bool has_next_metadata_format
+string next_metadata_format_id

@@ -1,0 +1,13 @@
+string schema
+string session_id
+bool has_action
+uint64 request_id
+string action_id
+uint64 revision
+uint32 execute_start
+uint32 execute_length
+uint32 executed_steps
+bool success
+string failure_code
+string failure_message
+uint64 timestamp_ns

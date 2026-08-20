@@ -1,0 +1,165 @@
+# External SDK manifest.
+#
+# RULE: every `source` field is a public URL you can open in a browser to
+# reach the official download page or the exact file. Never use local paths.
+# When the file is behind a login, `source` is the product's download/release
+# page and `note` explains what to look for there.
+#
+# This is the single source of truth for what external SDKs each machine
+# needs. `deps/fetch.sh --embodiment X` reads this file, downloads only the
+# entries whose `embodiments` list contains X, and verifies sha256 before
+# unpacking.
+#
+# Rules:
+#   - Every entry MUST have version + source + sha256.
+#   - `source` is the exact URL that produced the hash. If upstream deletes
+#     the URL, capture a mirror URL and add it to `mirrors`.
+#   - `install_hint` is documentation only — the fetcher does not run it.
+#     Automation for install steps lives in the embodiment package, not here.
+
+sdks:
+  # ---- UR side ---------------------------------------------------------
+  - name: ur_rtde
+    version: "1.6.0"
+    source: "https://pypi.org/project/ur-rtde/1.6.0/"
+    sha256: "NEEDS_PIN"
+    unpack: "pip"
+    embodiments: [ur]
+    install_hint: |
+      pip install ur-rtde==1.6.0
+      Confirmed at 1.6.0 on ur host.
+      Do NOT upgrade without regression-testing servoJ timing.
+
+  - name: sharpa_wave_sdk_ur
+    version: "4.3.12"
+    source: "https://github.com/sharpa-robotics/sharpa-wave-sdk/releases/tag/v4.3.12"
+    sha256: "NEEDS_PIN"
+    unpack: "zip"
+    embodiments: [ur]
+    install_hint: |
+      Go to https://github.com/sharpa-robotics/sharpa-wave-sdk/releases/tag/v4.3.12
+      Download SharpaWaveSDK_4_3_12.zip. Extract and set sdk_root in
+      hardware_v3.yaml to the extracted path.
+      Currently at ur:/home/fqx/Sharpa/SDK/SharpaWaveSDK_4_3_12
+      NOTE: UR uses WaveSDK 4.3.12. PND uses sharpa-wave-sdk 5.0.2 (apt deb).
+      Different versions — do not cross-install.
+
+  # ---- PND side --------------------------------------------------------
+  - name: pnd_lowstate_dds
+    version: "bundled-with-hardware"
+    source: "bundled-with-hardware"
+    sha256: "n/a"
+    unpack: "n/a"
+    embodiments: [pnd-robot]
+    install_hint: |
+      PND DDS lowstate bindings are pre-installed on the PND robot hardware.
+      No download needed. The bindings are available at robot boot time.
+
+  - name: sharpa_sdk_pnd
+    version: "5.0.2"
+    source: "https://github.com/sharpa-robotics/sharpa-wave-sdk/releases"
+    sha256: "NEEDS_PIN"
+    unpack: "dpkg"
+    embodiments: [pnd-robot]
+    install_hint: |
+      Go to https://github.com/sharpa-robotics/sharpa-wave-sdk/releases
+      Download sharpa-wave-sdk_5.0.2_amd64.deb, then:
+        sudo dpkg -i sharpa-wave-sdk_5.0.2_amd64.deb
+      Confirmed at 5.0.2 on pnd-robot. Different from UR's WaveSDK 4.3.12.
+
+  - name: pnd_teleop_urdf
+    version: "v0.8.0"
+    source: "https://github.com/pndbotics/pnd_teleoperation/releases/download/v0.8.0/pnd-teleop-amd64.tar.gz"
+    sha256: "NEEDS_PIN"
+    unpack: "tar -xzf"
+    embodiments: [pnd-robot]
+    install_hint: |
+      wget https://github.com/pndbotics/pnd_teleoperation/releases/download/v0.8.0/pnd-teleop-amd64.tar.gz
+      Extract noitom_mocap/ and adam_retarget/ into src/noitom_node/vendor/
+      Or use the curl installer:
+        curl -fsSL https://raw.githubusercontent.com/pndbotics/pnd_teleoperation/refs/heads/main/install.sh | bash
+      After install: source /opt/pnd/pnd_teleop/install/setup.bash
+
+  - name: noitom_axis_studio
+    version: "bundled-in-pnd_teleoperation"
+    source: "https://raw.githubusercontent.com/pndbotics/pnd_teleoperation/refs/heads/main/install.sh"
+    sha256: "n/a"
+    unpack: "bash"
+    embodiments: [pnd-robot]
+    install_hint: |
+      Noitom libMocapApi.so is bundled inside pnd_teleoperation. No separate download.
+      Install via:
+        curl -fsSL https://raw.githubusercontent.com/pndbotics/pnd_teleoperation/refs/heads/main/install.sh | bash
+      After install: /opt/pnd/pnd_teleop/install/noitom_mocap/lib/libMocapApi.so
+
+  - name: manus_sdk
+    version: "NEEDS_CONFIRM"
+    source: "https://github.com/sharpa-robotics/sharpa-manus-sdk"
+    sha256: "NEEDS_PIN"
+    unpack: "git"
+    embodiments: [pnd-robot]
+    install_hint: |
+      git clone https://github.com/sharpa-robotics/sharpa-manus-sdk
+      Sharpa's encapsulation of the Manus MetaGloves SDK for hand tracking
+      and retargeting. Used only in teleop mode via manus_node.
+
+  # ---- Both / camera ---------------------------------------------------
+  - name: zed_sdk_ur
+    version: "4.2"
+    source: "https://www.stereolabs.com/developers/release"
+    sha256: "NEEDS_PIN"
+    unpack: "bash"
+    embodiments: [ur]
+    install_hint: |
+      Go to https://www.stereolabs.com/developers/release, select ZED SDK 4.2,
+      CUDA 12, Ubuntu 22.04. Download and run:
+        bash ZED_SDK_Ubuntu22_cuda12_v4.2.x.zstd.run
+      Requires CUDA 12. Installs system-wide to /usr/local/zed/
+      pyzed 4.2 confirmed on UR host.
+
+  - name: pyzed_ur
+    version: "4.2"
+    source: "https://pypi.org/project/pyzed/4.2/"
+    sha256: "NEEDS_PIN"
+    unpack: "pip"
+    embodiments: [ur]
+    install_hint: |
+      Install zed_sdk_ur first, then: pip install pyzed==4.2
+      pyzed version must match the ZED SDK major version.
+
+  - name: zed_sdk_pnd
+    version: "NEEDS_CONFIRM"
+    source: "https://www.stereolabs.com/developers/release"
+    sha256: "NEEDS_PIN"
+    unpack: "bash"
+    embodiments: [pnd-robot]
+    install_hint: |
+      Confirm exact version on pnd-robot first:
+        python3 -c 'import pyzed.sl as sl; print(sl.__version__)'
+      Then download matching SDK from https://www.stereolabs.com/developers/release
+      pyzed 1.3.0 on pnd-robot suggests an older SDK generation than UR's 4.2.
+
+  - name: pyzed_pnd
+    version: "NOT_INSTALLED"
+    source: "https://www.stereolabs.com/developers/release"
+    sha256: "n/a"
+    unpack: "n/a"
+    embodiments: [pnd-robot]
+    install_hint: |
+      WARNING: pyzed 1.3.0 on pnd-robot is an UNRELATED package (wrong deps:
+      durationpy, python-dateutil, requests) — NOT the Stereolabs ZED Python API.
+      ZED on PND is driven via RTP streaming, not the Python SDK.
+      If Stereolabs pyzed is needed, download the matching ZED SDK from
+      https://www.stereolabs.com/developers/release and install the bundled pyzed.
+
+  # ---- Workstation only ------------------------------------------------
+  - name: foxglove_studio
+    version: "NEEDS_CONFIRM"
+    source: "https://foxglove.dev/download"
+    sha256: "NEEDS_PIN"
+    unpack: "AppImage"
+    embodiments: [pnd-workstation]
+    install_hint: |
+      Download AppImage from https://foxglove.dev/download
+        chmod +x Foxglove-Studio-*.AppImage && ./Foxglove-Studio-*.AppImage
+      Connect to ws://pnd-robot-ip:8765 (foxglove_bridge default port).

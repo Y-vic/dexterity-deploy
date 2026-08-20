@@ -1,0 +1,13 @@
+string metadata_format_json
+string session_id
+uint64 request_id
+uint64 timestamp_ns
+string prompt
+string execution_feedback_json
+uint64 max_message_size
+---
+bool success
+bool retryable
+string error_code
+string error_message
+uint8[] observation_msgpack

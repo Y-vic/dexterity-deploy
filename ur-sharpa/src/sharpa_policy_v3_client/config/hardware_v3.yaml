@@ -1,0 +1,115 @@
+ur_node:
+  ros__parameters:
+    left_ip: 192.168.56.20
+    right_ip: 192.168.56.10
+    publish_hz: 30.0
+    rtde_frequency_hz: 125.0
+    enable_execution: false
+    execution_confirmation: ""
+    initialize_on_startup: true
+    initial_left_joint:
+      [1.8484487533569336, -1.8753947019577026, 2.3183090686798096,
+       -0.7468836903572083, 2.0163028240203857, -0.46528369188308716]
+    initial_right_joint:
+      [4.617546558380127, -1.1520198583602905, -2.2634379863739014,
+       -2.5849359035491943, -1.868857741355896, 2.060574531555176]
+    initialization_steps: 120
+    initialization_step_delay_s: 0.02
+    initialization_tolerance_rad: 0.08
+    state_topic: /ur_position
+    command_topic: /sharpa/v3/hardware/ur/command
+    result_topic: /sharpa/v3/hardware/command_result
+    stop_topic: /sharpa/v3/hardware/stop
+
+sharpa_node:
+  ros__parameters:
+    sdk_root: /home/fqx/Sharpa/SDK/SharpaWaveSDK_4_3_12
+    publish_hz: 30.0
+    discovery_timeout_s: 5.0
+    enable_execution: false
+    execution_confirmation: ""
+    max_hand_step_rad: 1.0
+    initialize_on_startup: true
+    initial_left_joint:
+      [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    initial_right_joint:
+      [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+       0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    initialization_steps: 180
+    initialization_step_delay_s: 0.02
+    initialization_tolerance_rad: 0.08
+    hand_state_topic: /sharpa/hand_state
+    tau_topic: /sharpa/v3/source/tau
+    wrench_topic: /sharpa/v3/source/wrench
+    deformation_topic: /sharpa/v3/source/deformation
+    command_topic: /sharpa/v3/hardware/sharpa/command
+    result_topic: /sharpa/v3/hardware/command_result
+    stop_topic: /sharpa/v3/hardware/stop
+
+zed_node:
+  ros__parameters:
+    resolution: HD720
+    publish_hz: 30.0
+    serial_number: 0
+    jpeg_quality: 90
+    topic: /sharpa/v3/source/ego_cam
+
+state_node:
+  ros__parameters:
+    aggregate_hardware_state: true
+    state_merge_hz: 30.0
+    max_state_skew_ms: 50.0
+    max_state_age_ms: 250.0
+    max_message_size: 67108864
+    max_buffer_bytes: 67108864
+    ego_buffer_frames: 3
+    state_buffer_frames: 19
+    tau_buffer_frames: 19
+    wrench_buffer_frames: 19
+    deformation_buffer_frames: 3
+    ego_camera_topic: /sharpa/v3/source/ego_cam
+    left_wrist_camera_topic: /sharpa/v3/source/left_wrist_cam
+    right_wrist_camera_topic: /sharpa/v3/source/right_wrist_cam
+    ur_state_topic: /ur_position
+    hand_state_topic: /sharpa/hand_state
+    state_topic: /sharpa/v3/source/state
+    tau_topic: /sharpa/v3/source/tau
+    wrench_topic: /sharpa/v3/source/wrench
+    deformation_topic: /sharpa/v3/source/deformation
+    build_observation_service: /sharpa/v3/state/build_observation
+    fault_topic: /sharpa/v3/policy/fault
+    state_status_topic: /sharpa/v3/state/status
+
+policy_node:
+  ros__parameters:
+    server_base_url: http://127.0.0.1:5500
+    session_id: ""
+    prompt: ""
+    auto_reset: true
+    request_poll_hz: 20.0
+    require_execution_feedback: true
+    connect_timeout_s: 5.0
+    request_timeout_s: 90.0
+    reconnect_initial_s: 0.5
+    reconnect_max_s: 8.0
+    max_message_size: 67108864
+    build_observation_service: /sharpa/v3/state/build_observation
+    action_topic: /sharpa/v3/policy/action
+    execution_feedback_topic: /sharpa/v3/policy/execution_feedback
+    fault_topic: /sharpa/v3/policy/fault
+    status_topic: /sharpa/v3/policy/status
+
+action_node:
+  ros__parameters:
+    enable_execution: false
+    execution_confirmation: ""
+    command_timeout_s: 0.5
+    action_topic: /sharpa/v3/policy/action
+    feedback_topic: /sharpa/v3/policy/execution_feedback
+    fault_topic: /sharpa/v3/policy/fault
+    ur_state_topic: /ur_position
+    ur_command_topic: /sharpa/v3/hardware/ur/command
+    sharpa_command_topic: /sharpa/v3/hardware/sharpa/command
+    result_topic: /sharpa/v3/hardware/command_result
+    stop_topic: /sharpa/v3/hardware/stop

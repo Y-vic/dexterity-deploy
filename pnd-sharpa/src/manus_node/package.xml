@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>manus_node</name>
+  <version>0.1.0</version>
+  <description>Manus SDK acquisition and Sharpa retargeted-joint publisher.</description>
+  <maintainer email="pnd.humanoid@example.com">pnd-humanoid</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <exec_depend>python3-zmq</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

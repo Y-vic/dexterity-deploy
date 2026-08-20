@@ -1,0 +1,313 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="adam_pro_sharpa">
+  <compiler angle="radian" />
+  <worldbody>
+    <body name="pelvis" pos="0 0 0.95">
+      <inertial pos="-0.00034724 0 -0.00735759" quat="0.502838 0.502859 -0.497127 0.497143" mass="10.3565" diaginertia="0.0687803 0.0621174 0.0345151" />
+      <site name="imu" size="0.01" pos="0 0 0" />
+      <joint name="floating_base" type="free" limited="false" actuatorfrclimited="false" />
+      <body name="hipPitchLeft" pos="0 0.0961925 -0.0332412" quat="0.953717 -0.300706 0 0">
+        <inertial pos="-0.0566022 0.0576144 -0.00077159" quat="-0.0505313 0.548334 -0.448358 0.704097" mass="2.2338" diaginertia="0.00520115 0.00510328 0.00286381" />
+        <joint name="hipPitch_Left" pos="0 0 0" axis="0 1 0" range="-2.164 2.164" actuatorfrcrange="-230 230" />
+        <body name="hipRollLeft" pos="-0.0255 0.069 0" quat="0.953717 0.300706 0 0">
+          <inertial pos="0.0392416 4.107e-05 -0.0103292" quat="0.0275849 0.82035 0.0241895 0.570683" mass="1.35108" diaginertia="0.00141452 0.00129056 0.00119603" />
+          <joint name="hipRoll_Left" pos="0 0 0" axis="1 0 0" range="-0.733 1.605" actuatorfrcrange="-160 160" />
+          <body name="thighLeft" pos="0.044 0 -0.0525">
+            <inertial pos="0.00244052 -0.00866423 -0.134336" quat="0.711611 -0.0492483 0.0272749 0.700315" mass="6.43433" diaginertia="0.0639418 0.0583116 0.0126694" />
+            <joint name="hipYaw_Left" pos="0 0 0" axis="0 0 1" range="-0.785 0.785" actuatorfrcrange="-105 105" />
+            <body name="shinLeft" pos="0 -0.0355 -0.369">
+              <inertial pos="-0.00053135 0.00081959 -0.145381" quat="0.788039 0.00408898 0.00696215 0.615572" mass="2.25363" diaginertia="0.0215921 0.0215141 0.00136466" />
+              <joint name="kneePitch_Left" pos="0 0 0" axis="0 1 0" range="0.052 2.391" actuatorfrcrange="-230 230" />
+              <body name="anklePitchLeft" pos="0 0 -0.37">
+                <inertial pos="0 0 0" mass="0.0301423" diaginertia="3.14e-06 3.14e-06 2.04e-06" />
+                <joint name="anklePitch_Left" pos="0 0 0" axis="0 1 0" range="-1 0.35" actuatorfrcrange="-40 40" />
+                <body name="toeLeft">
+                  <inertial pos="0.0374997 -4.016e-05 -0.0419674" quat="-0.0209271 0.743591 -0.0168677 0.668094" mass="0.634796" diaginertia="0.00233488 0.00226889 0.000434699" />
+                  <joint name="ankleRoll_Left" pos="0 0 0" axis="1 0 0" range="-0.3491 0.3491" actuatorfrcrange="-12 12" />
+                  <geom size="0.12 0.05 0.01" pos="0.05 0 -0.055" type="box" rgba="0.752941 0.752941 0.752941 1" />
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="hipPitchRight" pos="0 -0.0961925 -0.0332412" quat="0.953717 0.300706 0 0">
+        <inertial pos="-0.0566179 -0.0575934 -0.00078211" quat="0.0466125 0.551069 0.444978 0.704376" mass="2.23477" diaginertia="0.00520391 0.00510426 0.00286722" />
+        <joint name="hipPitch_Right" pos="0 0 0" axis="0 1 0" range="-2.164 2.164" actuatorfrcrange="-230 230" />
+        <body name="hipRollRight" pos="-0.0255 -0.069 0" quat="0.953717 -0.300706 0 0">
+          <inertial pos="0.0392598 -5.814e-05 -0.0103241" quat="-0.02931 0.821547 -0.0263648 0.568776" mass="1.3517" diaginertia="0.00141668 0.00129138 0.00119538" />
+          <joint name="hipRoll_Right" pos="0 0 0" axis="1 0 0" range="-1.605 0.733" actuatorfrcrange="-160 160" />
+          <body name="thighRight" pos="0.044 0 -0.0525">
+            <inertial pos="0.00245598 0.00865064 -0.134332" quat="0.700408 0.0274534 -0.0491764 0.711517" mass="6.43084" diaginertia="0.0639169 0.0582708 0.0126767" />
+            <joint name="hipYaw_Right" pos="0 0 0" axis="0 0 1" range="-0.785 0.785" actuatorfrcrange="-105 105" />
+            <body name="shinRight" pos="0 0.0355 -0.369">
+              <inertial pos="-0.00052844 -0.00082152 -0.145334" quat="0.619488 0.00695186 0.00407547 0.784965" mass="2.25459" diaginertia="0.0215721 0.021496 0.00136482" />
+              <joint name="kneePitch_Right" pos="0 0 0" axis="0 1 0" range="0.052 2.391" actuatorfrcrange="-230 230" />
+              <body name="anklePitchRight" pos="0 0 -0.37">
+                <inertial pos="0 0 0" mass="0.0301423" diaginertia="3.14e-06 3.14e-06 2.04e-06" />
+                <joint name="anklePitch_Right" pos="0 0 0" axis="0 1 0" range="-1 0.35" actuatorfrcrange="-40 40" />
+                <body name="toeRight">
+                  <inertial pos="0.0375023 4.002e-05 -0.0419671" quat="0.0209768 0.743592 0.0169235 0.66809" mass="0.634808" diaginertia="0.00233489 0.00226889 0.000434726" />
+                  <joint name="ankleRoll_Right" pos="0 0 0" axis="1 0 0" range="-0.3491 0.3491" actuatorfrcrange="-12 12" />
+                  <geom size="0.12 0.05 0.01" pos="0.05 0 -0.055" type="box" rgba="0.752941 0.752941 0.752941 1" />
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="waistRoll_link" pos="0 0 0.044">
+        <inertial pos="0.00093826 0.00093832 0.0399999" quat="0.920274 -0.012433 -0.0050157 0.391045" mass="2.36268" diaginertia="0.00543214 0.00543129 0.00184735" />
+        <joint name="waistRoll" pos="0 0 0" axis="1 0 0" range="-0.279 0.279" actuatorfrcrange="-110 110" />
+        <body name="waistPitch_link" pos="0 0 0.08">
+          <inertial pos="-8.401e-05 0.00189362 0.0254832" quat="0.480284 0.467519 -0.524152 0.525374" mass="0.563538" diaginertia="0.0015597 0.00151436 0.000672504" />
+          <joint name="waistPitch" pos="0 0 0" axis="0 1 0" range="-0.663 1.361" actuatorfrcrange="-110 110" />
+          <body name="torso" pos="0 0.0005 0.053">
+            <inertial pos="-0.00183601 0.00056583 0.166624" quat="0.999452 -0.00189053 -0.0328345 0.00382224" mass="12.7334" diaginertia="0.13029 0.0859386 0.0736823" />
+            <joint name="waistYaw" pos="0 0 0" axis="0 0 1" range="-0.829 0.829" actuatorfrcrange="-110 110" />
+            <body name="shoulderPitchLeft" pos="0 0.165094 0.25923" quat="0.984808 0.173648 0 0">
+              <inertial pos="0.00542694 0.0268987 0.00010792" quat="-0.0545235 0.707235 0.0545271 0.702761" mass="0.216148" diaginertia="0.000380648 0.000322754 0.000187228" />
+              <joint name="shoulderPitch_Left" pos="0 0 0" axis="0 1 0" range="-3.613 2.042" actuatorfrcrange="-65 65" />
+              <body name="shoulderRollLeft" pos="0.0362 0.0435 0" quat="0.984808 -0.173648 0 0">
+                <inertial pos="-0.0343733 0.00962154 -0.0154456" quat="0.942019 0.255487 0.0666284 -0.207093" mass="1.07882" diaginertia="0.00167363 0.00165995 0.000668084" />
+                <joint name="shoulderRoll_Left" pos="0 0 0" axis="1 0 0" range="-0.628 2.793" actuatorfrcrange="-65 65" />
+                <body name="shoulderYawLeft" pos="-0.0362 0.034 -0.0797">
+                  <inertial pos="-0.00051421 -0.00044442 -0.0619328" quat="0.999912 -0.00948825 0.00877343 0.00302026" mass="0.90142" diaginertia="0.00328641 0.0031732 0.000574119" />
+                  <joint name="shoulderYaw_Left" pos="0 0 0" axis="0 0 1" range="-2.583 2.583" actuatorfrcrange="-65 65" />
+                  <body name="elbowLeft" pos="0 -0.0285 -0.18295">
+                    <inertial pos="-0.0140727 0.0292971 -0.0253473" quat="0.716894 0.14594 0.188043 0.65529" mass="0.917707" diaginertia="0.00110505 0.00109887 0.000457654" />
+                    <joint name="elbow_Left" pos="0 0 0" axis="0 1 0" range="-2.496 0.209" actuatorfrcrange="-30 30" />
+                    <body name="wristYawLeft" pos="-0.025 0.0285 -0.0729">
+                      <inertial pos="-0.00174399 0.0001059 -0.0921606" quat="0.999719 0.00455358 0.00795284 0.0218673" mass="0.955879" diaginertia="0.00254019 0.00248455 0.000526048" />
+                      <joint name="wristYaw_Left" pos="0 0 0" axis="0 0 1" range="-2.67 2.67" actuatorfrcrange="-6.4 6.4" />
+                      <body name="wristPitchLeft" pos="0 0 -0.2017">
+                        <inertial pos="-0.00017582 0.00166098 -2.773e-05" quat="0.501712 0.498275 -0.499779 0.500227" mass="0.119635" diaginertia="3.97702e-05 3.35901e-05 2.68997e-05" />
+                        <joint name="wristPitch_Left" pos="0 0 0" axis="0 1 0" range="-0.96 0.96" actuatorfrcrange="-6.4 6.4" />
+                        <body name="wristRollLeft">
+                          <inertial pos="0.000691462 -0.0032265 -0.0813541" quat="0.998437 0.0436792 0.0155633 -0.0311899" mass="0.561689" diaginertia="0.000959476 0.000876782 0.000276973" />
+                          <joint name="wristRoll_Left" pos="0 0 0" axis="1 0 0" range="-0.96 0.96" actuatorfrcrange="-6.4 6.4" />
+                          <body name="left_thumb_CMC_VL" pos="0.026 -0.01 -0.0672" quat="0 1 1.8366e-06 5.10341e-12">
+                            <inertial pos="-4.8e-09 -0.00086981 3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="left_thumb_CMC_FE" pos="0 0 0" axis="0 0 1" range="-0.1745 1.9199" actuatorfrcrange="-6.6 6.6" damping="0.1" />
+                            <body name="left_thumb_MC" pos="0 -0.005 0" quat="0.65328 0.653282 -0.270598 0.270599">
+                              <inertial pos="0.036729 -0.009124 -0.010102" quat="0.0873752 0.777787 -0.0963965 0.614915" mass="0.072329" diaginertia="0.000153362 0.000136171 2.43324e-05" />
+                              <joint name="left_thumb_CMC_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-6.6 6.6" damping="0.1" />
+                              <body name="left_thumb_MCP_VL" pos="0.065 -0.006 -0.010392" quat="0.965926 -0.25882 0 0">
+                                <inertial pos="4.8e-09 0.000869809 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                                <joint name="left_thumb_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.5236 1.3963" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                <body name="left_thumb_PP" quat="0.707105 0.707108 0 0">
+                                  <inertial pos="0.0257652 -0.000314934 0.000890253" quat="0.454503 0.53381 0.453216 0.550517" mass="0.0647521" diaginertia="1.05835e-05 1.0487e-05 2.41074e-06" />
+                                  <joint name="left_thumb_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                  <body name="left_thumb_DP" pos="0.039 0 0" quat="0.707105 -0.707108 0 0">
+                                    <inertial pos="0.0227463 -0.000478405 -0.000107438" quat="0.381379 0.377639 0.604054 0.589116" mass="0.006767" diaginertia="6.72159e-07 6.29599e-07 1.6694e-07" />
+                                    <joint name="left_thumb_IP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                  </body>
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="left_index_MCP_VL" pos="0.0303 -0.001 -0.1417" quat="1.29867e-06 0.707105 1.29867e-06 -0.707108">
+                            <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="left_index_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="left_index_PP" quat="0.707105 0.707108 0 0">
+                              <inertial pos="0.02973 -0.00013902 0.00069319" quat="0.494881 0.489712 0.519831 0.495026" mass="0.1487" diaginertia="2.92258e-05 2.81816e-05 7.13865e-06" />
+                              <joint name="left_index_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="left_index_MP" pos="0.047 0 0" quat="0.707105 -0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="left_index_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="left_index_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.0154775 -0.0028464 0" quat="0.405506 0.405545 0.579234 0.579298" mass="0.005595" diaginertia="3.12859e-07 2.75042e-07 1.13825e-07" />
+                                  <joint name="left_index_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="left_middle_MCP_VL" pos="0.01 0 -0.1447" quat="1.29867e-06 0.707105 1.29867e-06 -0.707108">
+                            <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="left_middle_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="left_middle_PP" quat="0.707105 0.707108 0 0">
+                              <inertial pos="0.02973 -0.00013902 0.00069319" quat="0.494881 0.489712 0.519831 0.495026" mass="0.1487" diaginertia="2.92258e-05 2.81816e-05 7.13865e-06" />
+                              <joint name="left_middle_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="left_middle_MP" pos="0.047 0 0" quat="0.707105 -0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="left_middle_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="left_middle_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.0154775 -0.0028464 0" quat="0.405506 0.405545 0.579234 0.579298" mass="0.005595" diaginertia="3.12859e-07 2.75042e-07 1.13825e-07" />
+                                  <joint name="left_middle_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="left_ring_MCP_VL" pos="-0.0103 -0.0015 -0.1387" quat="1.29867e-06 0.707105 1.29867e-06 -0.707108">
+                            <inertial pos="4.8e-09 0.00086981 3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="left_ring_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="left_ring_PP" quat="0.707105 0.707108 0 0">
+                              <inertial pos="0.02973 -0.00013902 0.00069319" quat="0.494881 0.489712 0.519831 0.495026" mass="0.1487" diaginertia="2.92258e-05 2.81816e-05 7.13865e-06" />
+                              <joint name="left_ring_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="left_ring_MP" pos="0.047 0 0" quat="0.707105 -0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="left_ring_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="left_ring_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.0154775 -0.00301768 2.72318e-08" quat="0.427447 0.427492 0.563227 0.563307" mass="0.005595" diaginertia="3.02433e-07 2.75333e-07 1.24542e-07" />
+                                  <joint name="left_ring_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="left_pinky_MC" pos="-0.0263 -0.01136 -0.1327" quat="-0.707109 2.59736e-06 2.59734e-06 -0.707104">
+                            <inertial pos="0.0119415 0.00484458 0.0174284" quat="0.619191 0.11394 0.215264 0.746513" mass="0.0790656" diaginertia="5.77255e-05 5.081e-05 1.28135e-05" />
+                            <joint name="left_pinky_CMC" pos="0 0 0" axis="0 0 1" range="0 0.2618" damping="0.1" />
+                            <body name="left_pinky_MCP_VL" pos="0.00836 0.0048 0" quat="0.499998 -0.5 0.5 0.500002">
+                              <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                              <joint name="left_pinky_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="left_pinky_PP" quat="0.707105 0.707108 0 0">
+                                <inertial pos="0.02973 -0.00013902 0.00069319" quat="0.494881 0.489712 0.519831 0.495026" mass="0.1487" diaginertia="2.92258e-05 2.81816e-05 7.13865e-06" />
+                                <joint name="left_pinky_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                <body name="left_pinky_MP" pos="0.047 0 0" quat="0.707105 -0.707108 0 0">
+                                  <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                  <joint name="left_pinky_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                  <body name="left_pinky_DP" pos="0.0315 0 0">
+                                    <inertial pos="0.0154775 -0.0030177 0" quat="0.427448 0.427494 0.563228 0.563304" mass="0.005595" diaginertia="3.02432e-07 2.75332e-07 1.24542e-07" />
+                                    <joint name="left_pinky_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                  </body>
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+            <body name="shoulderPitchRight" pos="0 -0.165094 0.25923" quat="0.984808 -0.173648 0 0">
+              <inertial pos="0.00536737 -0.0269397 0.00010693" quat="0.0534521 0.70731 -0.0534944 0.702847" mass="0.216487" diaginertia="0.000381338 0.000323123 0.000187559" />
+              <joint name="shoulderPitch_Right" pos="0 0 0" axis="0 1 0" range="-3.613 2.042" actuatorfrcrange="-65 65" />
+              <body name="shoulderRollRight" pos="0.0362 -0.0435 0" quat="0.984808 0.173648 0 0">
+                <inertial pos="-0.0342995 -0.00987424 -0.0157184" quat="0.935991 -0.254513 0.072526 0.232131" mass="1.08875" diaginertia="0.0017015 0.00168047 0.000675786" />
+                <joint name="shoulderRoll_Right" pos="0 0 0" axis="1 0 0" range="-2.793 0.628" actuatorfrcrange="-65 65" />
+                <body name="shoulderYawRight" pos="-0.0362 -0.034 -0.0797">
+                  <inertial pos="-0.00051403 0.00046316 -0.0619299" quat="0.999904 0.00944783 0.00878884 -0.00513002" mass="0.901393" diaginertia="0.00328611 0.00317291 0.000574074" />
+                  <joint name="shoulderYaw_Right" pos="0 0 0" axis="0 0 1" range="-2.583 2.583" actuatorfrcrange="-65 65" />
+                  <body name="elbowRight" pos="0 0.0285 -0.18295">
+                    <inertial pos="-0.0140891 -0.0292958 -0.0253475" quat="0.638945 0.191038 0.141578 0.73158" mass="0.917707" diaginertia="0.00110466 0.00109851 0.000457521" />
+                    <joint name="elbow_Right" pos="0 0 0" axis="0 1 0" range="-2.496 0.209" actuatorfrcrange="-30 30" />
+                    <body name="wristYawRight" pos="-0.025 -0.0285 -0.0729">
+                      <inertial pos="-0.00173086 -0.00013146 -0.0921689" quat="0.999713 -0.00473049 0.00793689 -0.0221096" mass="0.955878" diaginertia="0.00254068 0.00248454 0.000525567" />
+                      <joint name="wristYaw_Right" pos="0 0 0" axis="0 0 1" range="-2.67 2.67" actuatorfrcrange="-6.4 6.4" />
+                      <body name="wristPitchRight" pos="0 0 -0.2017">
+                        <inertial pos="-0.0001758 0.00166098 -2.773e-05" quat="0.501712 0.498275 -0.499779 0.500227" mass="0.119635" diaginertia="3.97702e-05 3.35901e-05 2.68997e-05" />
+                        <joint name="wristPitch_Right" pos="0 0 0" axis="0 1 0" range="-0.96 0.96" actuatorfrcrange="-6.4 6.4" />
+                        <body name="wristRollRight">
+                          <inertial pos="0.000684646 0.00322744 -0.081363" quat="0.998442 -0.0436989 0.0154149 0.0311017" mass="0.561887" diaginertia="0.000959418 0.000876759 0.000276979" />
+                          <joint name="wristRoll_Right" pos="0 0 0" axis="1 0 0" range="-0.96 0.96" actuatorfrcrange="-6.4 6.4" />
+                          <body name="right_thumb_CMC_VL" pos="0.026 0.01 -0.0672" quat="-1 -3.67321e-06 1.6428e-12 1.8366e-06">
+                            <inertial pos="-4.8e-09 0.00086981 3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="right_thumb_CMC_FE" pos="0 0 0" axis="0 0 1" range="-0.1745 1.9199" actuatorfrcrange="-6.6 6.6" damping="0.1" />
+                            <body name="right_thumb_MC" pos="0 -0.005 0" quat="0.65328 -0.653282 0.270598 0.270599">
+                              <inertial pos="0.036729 -0.009124 0.010102" quat="0.0963965 0.614915 -0.0873752 0.777787" mass="0.072329" diaginertia="0.000153362 0.000136171 2.43324e-05" />
+                              <joint name="right_thumb_CMC_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-6.6 6.6" damping="0.1" />
+                              <body name="right_thumb_MCP_VL" pos="0.065 -0.006 0.010392" quat="0.965926 0.25882 0 0">
+                                <inertial pos="4.8e-09 0.000869809 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                                <joint name="right_thumb_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.5236 1.3963" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                <body name="right_thumb_PP" quat="0.707105 -0.707108 0 0">
+                                  <inertial pos="0.0257652 -0.000314934 -0.000890253" quat="0.53381 0.454503 0.550517 0.453216" mass="0.0647521" diaginertia="1.05835e-05 1.0487e-05 2.41074e-06" />
+                                  <joint name="right_thumb_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                  <body name="right_thumb_DP" pos="0.039 0 0" quat="0.707105 0.707108 0 0">
+                                    <inertial pos="0.0188663 -0.00108576 7.78439e-06" quat="0.316858 0.316535 0.632435 0.632007" mass="0.006517" diaginertia="3.62374e-07 3.08279e-07 1.54285e-07" />
+                                    <joint name="right_thumb_IP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                  </body>
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="right_index_MCP_VL" pos="0.0303 0.001 -0.1417" quat="0.707108 -1.29867e-06 0.707105 1.29868e-06">
+                            <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="right_index_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="right_index_PP" quat="0.707105 -0.707108 0 0">
+                              <inertial pos="0.02973 0.00013902 -0.00069319" quat="0.519831 0.495026 0.494881 0.489712" mass="0.1487" diaginertia="2.92258e-05 2.81816e-05 7.13865e-06" />
+                              <joint name="right_index_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="right_index_MP" pos="0.047 0 0" quat="0.707105 0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="right_index_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="right_index_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.017701 -0.00338368 3.40138e-08" quat="0.453301 0.453498 0.542517 0.54271" mass="0.005345" diaginertia="3.82688e-07 3.75838e-07 8.55338e-08" />
+                                  <joint name="right_index_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="right_middle_MCP_VL" pos="0.01 0 -0.1447" quat="0.707108 -1.29867e-06 0.707105 1.29868e-06">
+                            <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="right_middle_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="right_middle_PP" quat="0.707105 -0.707108 0 0">
+                              <inertial pos="0.02973 0.00013902 -0.00069319" quat="0.509824 0.505019 0.497296 0.487579" mass="0.1487" diaginertia="2.92251e-05 2.81742e-05 7.14667e-06" />
+                              <joint name="right_middle_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="right_middle_MP" pos="0.047 0 0" quat="0.707105 0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="right_middle_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="right_middle_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.0146041 -0.00292499 0" quat="0.352568 0.352601 0.61289 0.612971" mass="0.005345" diaginertia="2.29712e-07 1.80457e-07 1.01345e-07" />
+                                  <joint name="right_middle_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="right_ring_MCP_VL" pos="-0.0103 0.0015 -0.1387" quat="0.707108 -1.29867e-06 0.707105 1.29868e-06">
+                            <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                            <joint name="right_ring_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                            <body name="right_ring_PP" quat="0.707105 -0.707108 0 0">
+                              <inertial pos="0.02973 0.00013902 -0.00069319" quat="0.509824 0.505019 0.497296 0.487579" mass="0.1487" diaginertia="2.92251e-05 2.81742e-05 7.14667e-06" />
+                              <joint name="right_ring_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="right_ring_MP" pos="0.047 0 0" quat="0.707105 0.707108 0 0">
+                                <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                <joint name="right_ring_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                <body name="right_ring_DP" pos="0.0315 0 0">
+                                  <inertial pos="0.0146041 -0.00292496 2.26384e-08" quat="0.352568 0.352599 0.612889 0.612974" mass="0.005345" diaginertia="2.29713e-07 1.80457e-07 1.01344e-07" />
+                                  <joint name="right_ring_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                          <body name="right_pinky_MC" pos="-0.0263 0.01136 -0.1327" quat="3.60867e-12 0.707104 -0.707109 -3.60864e-12">
+                            <inertial pos="0.0119415 0.00484458 -0.0174284" quat="0.619191 -0.11394 -0.215264 0.746513" mass="0.0790656" diaginertia="5.77255e-05 5.081e-05 1.28135e-05" />
+                            <joint name="right_pinky_CMC" pos="0 0 0" axis="0 0 1" range="0 0.2618" damping="0.1" />
+                            <body name="right_pinky_MCP_VL" pos="0.00836 0.0048 0" quat="0.499998 0.5 -0.5 0.500002">
+                              <inertial pos="4.8e-09 0.00086981 -3.6e-09" quat="0.707107 0.707107 0 0" mass="0.000509" diaginertia="1.1167e-08 6.527e-09 5.388e-09" />
+                              <joint name="right_pinky_MCP_FE" pos="0 0 0" axis="0 0 1" range="-0.8727 1.5708" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                              <body name="right_pinky_PP" quat="0.707105 -0.707108 0 0">
+                                <inertial pos="0.02973 0.00013902 -0.00069319" quat="0.509824 0.505019 0.497296 0.487579" mass="0.1487" diaginertia="2.92251e-05 2.81742e-05 7.14667e-06" />
+                                <joint name="right_pinky_MCP_AA" pos="0 0 0" axis="0 0 1" range="-0.3491 0.3491" actuatorfrcrange="-3.728 3.728" damping="0.1" />
+                                <body name="right_pinky_MP" pos="0.047 0 0" quat="0.707105 0.707108 0 0">
+                                  <inertial pos="0.019314 -0.00089299 -0.00018694" quat="-0.0843444 0.698531 -0.0192993 0.710329" mass="0.0091803" diaginertia="9.78177e-07 8.83779e-07 4.00284e-07" />
+                                  <joint name="right_pinky_PIP" pos="0 0 0" axis="0 0 1" range="0 1.7453" actuatorfrcrange="-0.638 0.638" damping="0.1" />
+                                  <body name="right_pinky_DP" pos="0.0315 0 0">
+                                    <inertial pos="0.0146041 -0.00292496 2.26384e-08" quat="0.352568 0.352599 0.612889 0.612974" mass="0.005345" diaginertia="2.29713e-07 1.80457e-07 1.01344e-07" />
+                                    <joint name="right_pinky_DIP" pos="0 0 0" axis="0 0 1" range="0 1.3963" actuatorfrcrange="-0.189369 0.189369" damping="0.1" />
+                                  </body>
+                                </body>
+                              </body>
+                            </body>
+                          </body>
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+            <body name="neckYaw_link" pos="-0.013 0 0.29855">
+              <inertial pos="0.0228442 -0.00120876 0.0992634" quat="0.719761 0.0861591 0.0813325 0.684036" mass="0.399168" diaginertia="0.00132274 0.00131438 0.000128684" />
+              <joint name="neckYaw" pos="0 0 0" axis="0 0 1" range="-1.571 1.571" actuatorfrcrange="-6.4 6.4" />
+              <body name="neckPitch_link" pos="0.0316 0.01995 0.14595">
+                <inertial pos="0.0174597 -0.0210407 0.0470534" quat="0.0369738 0.852876 0.0341259 0.519683" mass="0.956204" diaginertia="0.00368991 0.00348806 0.00231156" />
+                <joint name="neckPitch" pos="0 0 0" axis="0 1 0" range="-0.873 0.873" actuatorfrcrange="-6.4 6.4" />
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

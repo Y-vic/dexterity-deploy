@@ -1,0 +1,192 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PND-SharpA Live</title>
+  <style>
+    :root {
+      --bg: #0d1114;
+      --panel: #171d21;
+      --panel-2: #11171b;
+      --line: #2c363d;
+      --text: #e8f0f4;
+      --muted: #92a4af;
+      --ok: #35c486;
+      --wait: #d6a83c;
+      --bad: #e25f5f;
+      --accent: #73a7ef;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header {
+      height: 58px;
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) auto;
+      align-items: center;
+      gap: 16px;
+      padding: 0 18px;
+      background: #151b1f;
+      border-bottom: 1px solid var(--line);
+    }
+    .title { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
+    .title strong { color: var(--accent); font-size: 17px; font-weight: 650; white-space: nowrap; }
+    .title span { color: var(--text); font-size: 17px; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .status-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 28px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #10161a;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .chip.ok .dot { background: var(--ok); }
+    .chip.waiting .dot, .chip.starting .dot, .chip.disabled .dot, .chip.unsupported .dot { background: var(--wait); }
+    .chip.error .dot { background: var(--bad); }
+    main {
+      height: calc(100vh - 58px);
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      grid-template-rows: 1fr 1fr;
+      gap: 12px;
+      padding: 12px;
+    }
+    .pane {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.26);
+    }
+    .pane-head {
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      background: #192025;
+    }
+    h2 { margin: 0; font-size: 13px; font-weight: 650; letter-spacing: 0; }
+    .meta { color: var(--muted); font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .viewport { flex: 1; min-height: 0; background: var(--panel-2); }
+    img { display: block; width: 100%; height: 100%; object-fit: contain; background: #070a0c; }
+    .video img { aspect-ratio: 2 / 1; }
+    @media (max-width: 1360px) {
+      main { grid-template-columns: 1fr 1fr; grid-template-rows: repeat(3, minmax(320px, 1fr)); height: auto; }
+    }
+    @media (max-width: 980px) {
+      header { height: auto; min-height: 58px; grid-template-columns: 1fr; padding: 10px 12px; }
+      .status-row { justify-content: flex-start; }
+      main { height: auto; grid-template-columns: 1fr; grid-template-rows: none; padding: 10px; }
+      .viewport { height: 44vh; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title">
+      <strong>[Adam Pro, SharpA]</strong>
+      <span id="subtitle">__INITIAL_SUBTITLE__</span>
+    </div>
+    <div class="status-row" id="statusRow"></div>
+  </header>
+  <main>
+    <section class="pane video" data-pane="zed">
+      <div class="pane-head"><h2>Current Videos</h2><span class="meta" id="meta-zed">starting</span></div>
+      <div class="viewport"><img src="/zed.mjpg"></div>
+    </section>
+    <section class="pane" data-pane="robot">
+      <div class="pane-head"><h2>Current PND-SharpA</h2><span class="meta" id="meta-robot">starting</span></div>
+      <div class="viewport"><img src="/robot.mjpg"></div>
+    </section>
+    <section class="pane" data-pane="current_hands">
+      <div class="pane-head"><h2>Current Waist Hands</h2><span class="meta" id="meta-current_hands">starting</span></div>
+      <div class="viewport"><img src="/current_hands.mjpg"></div>
+    </section>
+    <section class="pane video" data-pane="pred_video">
+      <div class="pane-head"><h2>Predicted Video</h2><span class="meta" id="meta-pred_video">starting</span></div>
+      <div class="viewport"><img src="/pred_video.mjpg"></div>
+    </section>
+    <section class="pane" data-pane="pred_robot">
+      <div class="pane-head"><h2>Predicted PND-SharpA</h2><span class="meta" id="meta-pred_robot">starting</span></div>
+      <div class="viewport"><img src="/pred_robot.mjpg"></div>
+    </section>
+    <section class="pane" data-pane="pred_hands">
+      <div class="pane-head"><h2>Predicted Waist Hands</h2><span class="meta" id="meta-pred_hands">starting</span></div>
+      <div class="viewport"><img src="/pred_hands.mjpg"></div>
+    </section>
+  </main>
+  <script>
+    const labels = {
+      zed: "ZED",
+      robot: "Robot",
+      current_hands: "Current Hands",
+      pred_video: "Pred Video",
+      pred_robot: "Pred Robot",
+      pred_hands: "Pred Hands",
+    };
+    const row = document.getElementById("statusRow");
+    const subtitle = document.getElementById("subtitle");
+    function chip(key, status) {
+      const state = status.state || "unknown";
+      return `<span class="chip ${state}"><span class="dot"></span>${labels[key]}: ${state}</span>`;
+    }
+    function metaText(key, status, nowS) {
+      const state = status.state || "unknown";
+      const age = status.updated_unix_s ? Math.max(0, nowS - status.updated_unix_s).toFixed(1) + "s ago" : "";
+      if ((key === "robot" || key === "pred_robot") && status.joints) return `${state} · ${status.joints} joints · ${age}`;
+      if (key === "pred_video" && state === "unsupported") return `${state} · ${status.provider || "model"} · no server video · ${age}`;
+      if (key === "pred_video" && status.request_index !== undefined) return `${state} · req ${status.request_index} · step ${status.step_index ?? "-"} · ${age}`;
+      if (key === "current_hands" || key === "pred_hands") {
+        const samples = status.samples !== undefined ? ` · ${status.samples} samples` : "";
+        const req = status.request_index !== undefined ? ` · req ${status.request_index}` : "";
+        const step = status.step_index !== undefined ? ` · step ${status.step_index}` : "";
+        const waist = status.waist_body ? ` · waist ${status.waist_body}` : "";
+        const q44 = status.q44_source ? ` · q44 ${status.q44_source}` : "";
+        return `${state}${samples}${req}${step}${waist}${q44} · ${age}`;
+      }
+      return age ? `${state} · ${age}` : state;
+    }
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/status.json", {cache: "no-store"});
+        const status = await response.json();
+        const nowS = Date.now() / 1000;
+        if (status._meta && status._meta.prompt) subtitle.textContent = `Task: ${status._meta.prompt}`;
+        const chips = ["zed", "robot", "current_hands", "pred_video", "pred_robot", "pred_hands"];
+        row.innerHTML = chips.map((key) => chip(key, status[key] || {})).join("");
+        Object.keys(labels).forEach((key) => {
+          const el = document.getElementById(`meta-${key}`);
+          if (el) el.textContent = metaText(key, status[key] || {}, nowS);
+        });
+        const bad = chips.map((key) => status[key] || {}).filter((item) => item.state && item.state !== "ok" && item.state !== "unsupported").length;
+        if (!(status._meta && status._meta.prompt)) subtitle.textContent = bad ? `${bad} pane(s) not ready` : "Task: unset";
+      } catch (err) {
+        row.innerHTML = `<span class="chip error"><span class="dot"></span>status: error</span>`;
+        subtitle.textContent = String(err);
+      }
+    }
+    refreshStatus();
+    setInterval(refreshStatus, 1000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+string schema
+string session_id
+bool has_request_id
+uint64 request_id
+bool has_action_id
+string action_id
+bool has_revision
+uint64 revision
+string code
+string message
+bool retryable
+bool safe_stop
+bool clear_plan
+uint64 timestamp_ns
