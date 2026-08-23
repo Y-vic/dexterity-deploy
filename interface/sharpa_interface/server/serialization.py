@@ -5,7 +5,10 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import msgpack
+try:
+    import msgpack
+except ImportError:  # Keep validation-only nodes usable without transport extras.
+    msgpack = None  # type: ignore[assignment]
 import numpy as np
 
 
@@ -109,6 +112,8 @@ def _decode_numpy(value: dict[Any, Any]) -> Any:
 
 def packb(payload: Any, *, max_size: int = MAX_MESSAGE_SIZE) -> bytes:
     limit = _message_limit(max_size)
+    if msgpack is None:
+        raise SerializationError("msgpack is required for policy transport; install python3-msgpack")
     try:
         encoded = msgpack.packb(payload, default=_encode_numpy, use_bin_type=True, strict_types=False)
     except (SerializationError, MessageTooLargeError):
@@ -124,6 +129,8 @@ def unpackb(payload: bytes | bytearray | memoryview, *, max_size: int = MAX_MESS
     limit = _message_limit(max_size)
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("payload must be bytes-like")
+    if msgpack is None:
+        raise SerializationError("msgpack is required for policy transport; install python3-msgpack")
     if len(payload) > limit:
         raise MessageTooLargeError(f"received message is {len(payload)} bytes; limit is {limit}")
     try:

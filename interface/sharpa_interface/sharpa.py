@@ -13,7 +13,57 @@ Any change requires:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from types import MappingProxyType
+from typing import Final, Mapping
+
+# ---------------------------------------------------------------------------
+# Canonical wrist pose contract
+# ---------------------------------------------------------------------------
+# This is the PND policy geometry shared by every embodiment. It deliberately
+# contains no robot-specific mount offset, base calibration, or TCP transform.
+
+CANONICAL_EEF_FRAME: Final[str] = "canonical"
+CANONICAL_ROOT_FRAME: Final[str] = "canonical_root"
+CANONICAL_ROOT_AXIS_ORDER: Final[tuple[str, str, str]] = ("x", "y", "z")
+CANONICAL_ROOT_AXES: Final[tuple[str, str, str]] = (
+    "left",
+    "up",
+    "forward",
+)
+CANONICAL_ROOT_AXIS_DIRECTIONS: Final[Mapping[str, str]] = MappingProxyType({
+    "x": "left",
+    "y": "up",
+    "z": "forward",
+})
+
+# The wrist child frames and side order follow the PND SharpA model. A pose
+# rotation maps the wrist-local +X/+Y/+Z basis into the canonical root basis.
+CANONICAL_WRIST_SIDE_ORDER: Final[tuple[str, str]] = ("left", "right")
+CANONICAL_WRIST_FRAME_BY_SIDE: Final[Mapping[str, str]] = MappingProxyType({
+    "left": "left_hand_C_MC",
+    "right": "right_hand_C_MC",
+})
+CANONICAL_WRIST_AXIS_ORDER: Final[tuple[str, str, str]] = ("x", "y", "z")
+CANONICAL_WRIST_ROTATION_SEMANTICS: Final[str] = (
+    "columns_are_wrist_xyz_axes_in_canonical_root"
+)
+
+# pose9 = xyz in canonical root (metres), then the first two columns of the
+# canonical-root-from-wrist rotation matrix, matching PND `mat_to_rot6d`.
+CANONICAL_EEF_POSE9_ORDER: Final[tuple[str, ...]] = (
+    "x",
+    "y",
+    "z",
+    "r00",
+    "r10",
+    "r20",
+    "r01",
+    "r11",
+    "r21",
+)
+CANONICAL_ROT6D_CONVENTION: Final[str] = "first_two_matrix_columns"
+CANONICAL_EEF_POSITION_UNITS: Final[str] = "meter"
+CANONICAL_EEF_DEFINITION: Final[str] = "absolute"
 
 # ---------------------------------------------------------------------------
 # Joint order

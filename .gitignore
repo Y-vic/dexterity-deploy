@@ -4,14 +4,39 @@ __pycache__/
 .venv/
 .pytest_cache/
 .ruff_cache/
+.coverage
+htmlcov/
+.codex/
+.codex_me/
 build/
 install/
 log/
 *.egg-info/
+# Canonical colcon output roots for the UR SharpA workspace.
+ur-sharpa/build/
+ur-sharpa/install/
+ur-sharpa/log/
+ur-sharpa/build-clean/
+ur-sharpa/install-clean/
+ur-sharpa/log-clean/
+ur-sharpa/build-*/
+ur-sharpa/install-*/
+ur-sharpa/log-*/
+ur-sharpa/build_*/
+ur-sharpa/install_*/
+ur-sharpa/log_*/
+ur-sharpa/episodes/
+ur-sharpa/rosbag2_*/
+ur-sharpa/core
+ur-sharpa/core.*
+build-humble/
+install-humble/
 pnd-sharpa/deploy/runs/
 pnd-sharpa/deploy/runtime/
 
 # External/robot SDK payloads are installed separately on each machine.
+ur-sharpa/external/*
+!ur-sharpa/external/README.md
 **/external/**/sdk/
 **/sharpa-wave-sdk/
 **/sharpa-manus-sdk/

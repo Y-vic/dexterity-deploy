@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ur_launch</name>
+  <version>0.2.0</version>
+  <description>Explicit Teleop and Deploy launch composition for UR SharpA.</description>
+  <maintainer email="ur.sharpa@example.com">ur-sharpa</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ur_node</exec_depend>
+  <exec_depend>sharpa_node</exec_depend>
+  <exec_depend>camera_node</exec_depend>
+  <exec_depend>bias_node</exec_depend>
+  <exec_depend>dashboard_node</exec_depend>
+  <exec_depend>recording_node</exec_depend>
+  <exec_depend>status_node</exec_depend>
+  <exec_depend>monitor_node</exec_depend>
+  <exec_depend>robot_states_node</exec_depend>
+  <exec_depend>policy_client_node</exec_depend>
+  <exec_depend>actor_ik_node</exec_depend>
+  <exec_depend>vive_node</exec_depend>
+  <exec_depend>manus_node</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

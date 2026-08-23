@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>UR SharpA Control Room</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #071014;
+      --panel: #0d1a20;
+      --panel-2: #10232b;
+      --line: #203943;
+      --text: #edf7f8;
+      --muted: #87a2aa;
+      --cyan: #38d9c5;
+      --blue: #4a91ff;
+      --amber: #f3b65c;
+      --red: #fa6470;
+      --green: #55d68b;
+      --shadow: 0 18px 55px rgba(0, 0, 0, .28);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-width: 320px;
+      background:
+        radial-gradient(circle at 13% -10%, rgba(56,217,197,.12), transparent 32%),
+        radial-gradient(circle at 93% 4%, rgba(74,145,255,.10), transparent 30%),
+        var(--bg);
+      color: var(--text);
+      font: 15px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    button { font: inherit; }
+    .shell { width: min(1440px, calc(100% - 40px)); margin: 28px auto 48px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 24px; margin-bottom: 18px; }
+    .eyebrow { color: var(--cyan); font-size: 11px; font-weight: 800; letter-spacing: .18em; text-transform: uppercase; }
+    h1 { margin: 3px 0 0; font-size: clamp(25px, 3vw, 38px); letter-spacing: -.04em; }
+    .subtitle { margin: 5px 0 0; color: var(--muted); }
+    .overall { display: flex; align-items: center; gap: 9px; padding: 9px 14px; border: 1px solid var(--line); border-radius: 999px; background: rgba(13,26,32,.78); font-weight: 750; white-space: nowrap; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 14px currentColor; }
+    .dot.ok { background: var(--green); color: var(--green); }
+    .dot.bad { background: var(--red); color: var(--red); }
+    .panel { background: linear-gradient(145deg, rgba(16,35,43,.94), rgba(10,24,30,.94)); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); }
+    .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .control-block { padding: 18px; }
+    .block-head { display: flex; align-items: start; justify-content: space-between; gap: 14px; margin-bottom: 15px; }
+    .block-title { margin: 0; font-size: 17px; }
+    .block-note { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+    .state-chip { padding: 5px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .05em; text-transform: uppercase; }
+    .segments { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .segments button { min-height: 52px; border: 1px solid var(--line); border-radius: 11px; background: rgba(6,15,19,.75); color: var(--text); cursor: pointer; font-weight: 750; transition: .15s ease; }
+    .segments button:hover:not(:disabled) { transform: translateY(-1px); border-color: #3e6672; background: #142b34; }
+    .segments button:disabled { cursor: not-allowed; opacity: .34; }
+    .segments button.active { border-color: color-mix(in srgb, var(--accent) 70%, white); background: color-mix(in srgb, var(--accent) 18%, #0b181d); color: #fff; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 32%, transparent); }
+    .segments button[data-tone="neutral"] { --accent: #8ca4ac; }
+    .segments button[data-tone="go"] { --accent: var(--blue); }
+    .segments button[data-tone="stop"] { --accent: var(--red); }
+    .model-selection { display: flex; align-items: center; min-height: 40px; margin-top: 10px; padding: 8px 11px; border: 1px dashed #31505b; border-radius: 10px; color: var(--muted); font-size: 12px; }
+    .model-selection strong { color: var(--text); }
+    .feedback { min-height: 22px; margin: 12px 3px 16px; color: var(--muted); }
+    .feedback.error { color: #ff8790; }
+    .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .card { min-height: 132px; padding: 16px; background: rgba(13,26,32,.82); border: 1px solid var(--line); border-radius: 15px; }
+    .card h2 { margin: 0 0 13px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .13em; text-transform: uppercase; }
+    .value { font-size: 21px; font-weight: 800; letter-spacing: -.02em; }
+    .value.ok { color: var(--green); }
+    .value.bad { color: var(--red); }
+    .detail { margin-top: 6px; color: var(--muted); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .wide-grid { display: grid; grid-template-columns: 1.35fr .65fr; gap: 12px; margin-top: 12px; }
+    .buffer-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .buffer-item { padding: 10px; border: 1px solid #1c343d; border-radius: 10px; background: rgba(4,13,17,.42); }
+    .buffer-top { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+    .buffer-top span:first-child { color: var(--muted); }
+    .buffer-history { margin-top: 5px; color: var(--muted); font: 10px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .bar { height: 4px; margin-top: 8px; border-radius: 9px; background: #19313a; overflow: hidden; }
+    .bar > i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan), var(--blue)); }
+    .meta-tags { display: flex; flex-wrap: wrap; gap: 7px; }
+    .meta-tag { padding: 6px 8px; border: 1px solid #294853; border-radius: 8px; background: rgba(5,17,22,.58); color: #bfd1d5; font-size: 11px; }
+    .visual-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+    .visual { overflow: hidden; }
+    .visual-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 0; }
+    .visual-head h2 { margin: 0; font-size: 15px; }
+    .visual-head span { color: var(--muted); font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; }
+    canvas { display: block; width: calc(100% - 20px); height: 420px; margin: 10px; border: 1px solid #d7dce0; border-radius: 12px; background: #fafafa; }
+    .drawer-backdrop { position: fixed; inset: 0; z-index: 20; background: rgba(0,0,0,.55); opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+    .drawer { position: absolute; top: 0; right: 0; width: min(640px, 94vw); height: 100%; padding: 22px; overflow: auto; background: #09171c; border-left: 1px solid var(--line); box-shadow: -30px 0 80px rgba(0,0,0,.45); transform: translateX(100%); transition: transform .24s ease; }
+    .open .drawer { transform: translateX(0); }
+    .drawer-head { display: flex; justify-content: space-between; align-items: start; gap: 20px; position: sticky; top: -22px; z-index: 2; margin: -22px -22px 18px; padding: 22px; background: rgba(9,23,28,.96); border-bottom: 1px solid var(--line); backdrop-filter: blur(12px); }
+    .drawer h2 { margin: 0; font-size: 22px; }
+    .drawer p { margin: 4px 0 0; color: var(--muted); }
+    .icon-btn { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 10px; background: #10242b; color: var(--text); cursor: pointer; }
+    .picker-label { margin: 18px 0 8px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+    .task-list { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 5px; }
+    .task-pill { flex: 0 0 auto; padding: 9px 12px; border: 1px solid var(--line); border-radius: 999px; background: #0e2027; color: var(--text); cursor: pointer; }
+    .task-pill.active { border-color: var(--cyan); color: var(--cyan); }
+    .task-pill.incompatible { opacity: .58; }
+    .task-prompt { min-height: 42px; margin: 10px 0; color: var(--muted); font-size: 12px; }
+    .run-list { display: grid; gap: 9px; }
+    .run-card { width: 100%; padding: 13px; text-align: left; border: 1px solid var(--line); border-radius: 12px; background: #0d2027; color: var(--text); cursor: pointer; }
+    .run-card:hover:not(:disabled) { border-color: var(--cyan); background: #102a31; }
+    .run-card:disabled { cursor: not-allowed; opacity: .45; }
+    .run-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .run-id { font-weight: 780; overflow-wrap: anywhere; }
+    .run-meta { margin-top: 5px; color: var(--muted); font-size: 11px; }
+    @media (max-width: 1050px) { .status-grid { grid-template-columns: repeat(2, 1fr); } .wide-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 780px) { .shell { width: min(100% - 22px, 1440px); margin-top: 18px; } header { align-items: start; flex-direction: column; } .control-grid, .visual-grid { grid-template-columns: 1fr; } .buffer-list { grid-template-columns: repeat(2, 1fr); } canvas { height: 340px; } }
+    @media (max-width: 480px) { .status-grid { grid-template-columns: 1fr; } .segments { grid-template-columns: 1fr; } .buffer-list { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div><div class="eyebrow">Robotics Control Room</div><h1>UR SharpA 部署</h1><p class="subtitle">机器、远端模型与实时策略状态统一控制</p></div>
+      <div class="overall"><span class="dot" id="overallDot"></span><span id="overallText">正在连接</span></div>
+    </header>
+
+    <section class="control-grid">
+      <article class="panel control-block">
+        <div class="block-head"><div><h2 class="block-title">机器控制</h2><p class="block-note">复位、部署、停止三态互斥</p></div><span class="state-chip" id="machineChip">STOPPED</span></div>
+        <div class="segments">
+          <button id="machineReset" data-tone="neutral" onclick="machineAction('reset_both')">机器复位</button>
+          <button id="machineStart" data-tone="go" onclick="machineAction('start_deploy')">机器启动</button>
+          <button id="machineStop" data-tone="stop" onclick="machineAction('stop_deploy')">机器停止</button>
+        </div>
+      </article>
+      <article class="panel control-block">
+        <div class="block-head"><div><h2 class="block-title">模型控制</h2><p class="block-note">远端 task / run 选择与 server 生命周期</p></div><span class="state-chip" id="modelChip">STOPPED</span></div>
+        <div class="segments">
+          <button id="modelSelect" data-tone="neutral" onclick="openPicker(false)">模型选择</button>
+          <button id="modelStart" data-tone="go" onclick="startModel()">模型启动</button>
+          <button id="modelStop" data-tone="stop" onclick="stopModel()">模型停止</button>
+        </div>
+        <div class="model-selection" id="modelSelection">尚未选择模型</div>
+      </article>
+    </section>
+    <div class="feedback" id="feedback">建议顺序：机器复位 → 模型启动 → 机器启动。</div>
+
+    <section class="status-grid">
+      <article class="card"><h2>UR 双臂</h2><div class="value" id="urValue">等待状态</div><div class="detail" id="urDetail"></div></article>
+      <article class="card"><h2>SharpA 双手</h2><div class="value" id="handValue">等待状态</div><div class="detail" id="handDetail"></div></article>
+      <article class="card"><h2>远端模型</h2><div class="value" id="modelValue">未启动</div><div class="detail" id="modelDetail"></div></article>
+      <article class="card"><h2>策略推理</h2><div class="value" id="inferenceValue">0 次</div><div class="detail" id="inferenceDetail">等待 metadata</div></article>
+    </section>
+
+    <section class="wide-grid">
+      <article class="card"><h2>Observation Buffers</h2><div class="buffer-list" id="bufferList"></div></article>
+      <article class="card"><h2>模型 Metadata</h2><div class="meta-tags" id="metadataTags"><span class="meta-tag">等待模型连接</span></div><div class="detail" id="metadataDetail"></div></article>
+    </section>
+
+    <section class="visual-grid">
+      <article class="panel visual"><div class="visual-head"><h2>输入 · 机器人真实状态</h2><span id="inputStamp">等待硬件数据</span></div><canvas id="inputCanvas"></canvas></article>
+      <article class="panel visual"><div class="visual-head"><h2>输出 · 本次模型预测</h2><span id="outputStamp">等待模型输出</span></div><canvas id="outputCanvas"></canvas></article>
+    </section>
+  </main>
+
+  <div class="drawer-backdrop" id="picker" onclick="backdropClose(event)">
+    <aside class="drawer">
+      <div class="drawer-head"><div><h2 id="pickerTitle">选择模型</h2><p>只显示配置完整并且可以直接部署的 task / run。</p></div><button class="icon-btn" onclick="closePicker()">✕</button></div>
+      <div id="pickerLoading">正在读取远端 task…</div>
+      <div id="pickerContent" hidden>
+        <div class="picker-label">Task</div><div class="task-list" id="taskList"></div>
+        <div class="task-prompt" id="taskPrompt"></div>
+        <div class="picker-label">Run ID</div><div class="run-list" id="runList"></div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    const bufferNames={ego_cam:'Ego 相机',left_wrist_cam:'左腕相机',right_wrist_cam:'右腕相机',state:'机器人状态',tau:'关节力矩',wrench:'指尖六维力',deformation:'触觉形变'};
+    const machineLabels={0:'已停止',1:'初始位置',2:'部署中'};
+    let latest={}; let commandBusy=false; let catalog=null; let selectedTask=null; let selectedRun=null; let launchOnPick=false;
+    let predictionPlayer={key:'',frames:[],frequencyHz:1,startedAt:0,index:0,requestId:0};let predictionAnimation=0;
+
+    const byId=id=>document.getElementById(id);
+    function setFeedback(text,error=false){feedback.textContent=text;feedback.className='feedback'+(error?' error':'')}
+    function setValue(id,text,good){const node=byId(id);node.textContent=text;node.className='value '+(good===true?'ok':good===false?'bad':'')}
+    async function requestJson(url,options={}){const response=await fetch(url,{cache:'no-store',...options});const body=await response.json();if(!response.ok||body.accepted===false)throw new Error(body.gate_reason||body.error||`HTTP ${response.status}`);return body}
+
+    async function machineAction(action){
+      commandBusy=true;paintControls();setFeedback({reset_both:'正在复位双臂和双手…',start_deploy:'正在启用机器部署…',stop_deploy:'正在停止机器…'}[action]);
+      try{await requestJson('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action})});setFeedback({reset_both:'复位命令已发送，请等待到达初始位置。',start_deploy:'机器部署已启动。',stop_deploy:'机器已停止。'}[action])}
+      catch(error){setFeedback(error.message,true)}finally{commandBusy=false;await refresh()}
+    }
+
+    async function openPicker(autoStart){
+      launchOnPick=autoStart;pickerTitle.textContent=autoStart?'选择并启动模型':'选择模型';picker.classList.add('open');pickerLoading.hidden=false;pickerContent.hidden=true;
+      try{catalog=await requestJson('/api/models');renderCatalog();pickerLoading.hidden=true;pickerContent.hidden=false}
+      catch(error){pickerLoading.textContent=error.message;setFeedback(error.message,true)}
+    }
+    function closePicker(){picker.classList.remove('open')}
+    function backdropClose(event){if(event.target===picker)closePicker()}
+    function renderCatalog(){
+      taskList.replaceChildren();const tasks=(catalog.tasks||[]).filter(task=>(task.runs||[]).some(run=>run.launchable));if(!selectedTask||!tasks.some(task=>task.name===selectedTask.name))selectedTask=tasks[0];
+      tasks.forEach(task=>{const button=document.createElement('button');button.className='task-pill'+(task===selectedTask?' active':'');button.textContent=task.name;button.onclick=()=>{selectedTask=task;renderCatalog()};taskList.append(button)});
+      taskPrompt.textContent=(selectedTask&&selectedTask.prompt)||'没有可部署的 task';runList.replaceChildren();
+      ((selectedTask&&selectedTask.runs)||[]).filter(run=>run.launchable).forEach(run=>{const button=document.createElement('button');button.className='run-card';const row=document.createElement('div');row.className='run-row';const id=document.createElement('span');id.className='run-id';id.textContent=`${run.family} / ${run.id}`;row.append(id);const meta=document.createElement('div');meta.className='run-meta';meta.textContent=`${run.variant||run.stage} · checkpoint ready`;button.append(row,meta);button.onclick=()=>chooseRun(run);runList.append(button)});
+    }
+    async function chooseRun(run){selectedRun=run;modelSelection.innerHTML=`已选择&nbsp; <strong>${selectedTask.name}</strong>&nbsp; / &nbsp;<strong>${run.family}:${run.id}</strong>`;closePicker();if(launchOnPick)await startSelectedModel()}
+    async function startModel(){if(selectedTask&&selectedRun)await startSelectedModel();else await openPicker(true)}
+    async function startSelectedModel(){
+      if(!selectedTask||!selectedRun){setFeedback('请先选择 task 和 run。',true);return}
+      commandBusy=true;paintControls();setFeedback(`正在启动 ${selectedTask.name} / ${selectedRun.id}…`);
+      try{await requestJson('/api/model/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({task:selectedTask.name,family:selectedRun.family,run_id:selectedRun.id})});setFeedback('模型已提交：启动进程 → 加载 checkpoint → 校验身份 → 模型就绪。')}
+      catch(error){setFeedback(error.message,true)}finally{commandBusy=false;await refresh()}
+    }
+    async function stopModel(){
+      commandBusy=true;paintControls();setFeedback('正在先停止机器执行，再关闭远端模型…');
+      try{const result=await requestJson('/api/model/stop',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});setFeedback(result.machine_warning?`模型停止中；机器停止告警：${result.machine_warning}`:'模型正在停止。')}
+      catch(error){setFeedback(error.message,true)}finally{commandBusy=false;await refresh()}
+    }
+
+    function paintControls(){
+      const control=latest.control||{},model=latest.model||{},policy=latest.policy||{},bias=latest.bias||{};const resetting=bias.active===true||['requested','homing_ur','homing_sharpa','verify'].includes(bias.phase);const machineRunning=control.ur_state===2;const machineStopped=control.ur_state===0&&!resetting;const modelBusy=['starting','loading','stopping'].includes(model.phase);const identityOk=policy.model_identity_ok===true;
+      machineReset.classList.toggle('active',resetting);machineStart.classList.toggle('active',machineRunning);machineStop.classList.toggle('active',machineStopped);
+      machineReset.disabled=commandBusy||machineRunning;machineStart.disabled=commandBusy||control.ur_state!==1||control.sharpa_state!==1||model.phase!=='running'||!identityOk;machineStop.disabled=commandBusy||machineStopped;
+      modelSelect.classList.toggle('active',!!selectedRun);modelStart.classList.toggle('active',['starting','loading','running'].includes(model.phase));modelStop.classList.toggle('active',model.phase==='stopping'||model.phase==='stopped');
+      modelSelect.disabled=commandBusy||modelBusy;modelStart.disabled=commandBusy||modelBusy||model.phase==='running';modelStop.disabled=commandBusy||model.phase==='stopped';
+      machineChip.textContent=resetting?'RESETTING':machineRunning?'RUNNING':control.ur_state===1?'HOMED':'STOPPED';modelChip.textContent=model.phase==='starting'?'STARTING':model.phase==='loading'?'LOADING':model.phase==='running'?(identityOk?'READY':policy.model_identity_error?'MISMATCH':'VERIFYING'):(model.phase||'stopped').toUpperCase();
+    }
+
+    function paintStatus(){
+      const control=latest.control||{},ur=latest.ur||{},hand=latest.sharpa||{},model=latest.model||{},policy=latest.policy||{};
+      setValue('urValue',machineLabels[control.ur_state]||'状态未知',ur.valid===true);urDetail.textContent=`${ur.normal_mode?'Normal mode':'非 Normal mode'}${ur.status?' · '+ur.status:''}`;
+      const handsOk=hand.left_valid===true&&hand.right_valid===true;setValue('handValue',handsOk?(control.sharpa_state===1?'双手在线':'双手已停止'):'数据不完整',handsOk);handDetail.textContent=`左手 ${hand.left_valid?'OK':'失联'} · 右手 ${hand.right_valid?'OK':'失联'} · Tau ${hand.tau_valid?'OK':'无效'}`;
+      const identityOk=policy.model_identity_ok===true,identityError=policy.model_identity_error||'',elapsed=model.updated_at?Math.max(0,Date.now()/1000-Number(model.updated_at)):0;const modelLabel=model.phase==='starting'?'模型启动中':model.phase==='loading'?'模型加载中':model.phase==='running'?(identityOk?'模型就绪':identityError?'模型错配':'身份校验中'):model.phase==='stopping'?'停止中':model.phase==='fault'?'启动失败':'未启动';const modelGood=model.phase==='running'&&identityOk;setValue('modelValue',modelLabel,modelGood?true:(model.phase==='fault'||!!identityError)?false:null);modelDetail.textContent=[model.task,model.family&&model.run_id?`${model.family}:${model.run_id}`:'',model.port?`remote port ${model.port}`:'',model.detail,['starting','loading'].includes(model.phase)?`elapsed ${elapsed.toFixed(1)} s`:'',identityError].filter(Boolean).join('\n');
+      const count=Number(policy.inference_count||0);setValue('inferenceValue',`${count} 次`,policy.phase==='executing'||policy.phase==='ready');const latency=typeof policy.latency_s==='number'?`${(policy.latency_s*1000).toFixed(0)} ms`:'--';const requestId=policy.last_request_id===undefined?-1:policy.last_request_id;inferenceDetail.textContent=`request ${requestId} · ${latency}\n${policy.phase||'waiting'}${policy.error?' · '+policy.error:''}`;
+      const allReady=ur.valid&&handsOk;overallText.textContent=control.ur_state===2?'机器部署中':model.phase==='starting'?'模型启动中':model.phase==='loading'?'模型加载中':model.phase==='running'&&!identityOk?'正在校验模型身份':model.phase==='running'?(control.ur_state===1?'模型就绪，等待机器启动':'模型在线'):allReady?'硬件在线':'等待系统';overallDot.className='dot '+(allReady?'ok':ur.valid===false?'bad':'');
+    }
+
+    function paintBuffers(){
+      const buffers=(latest.buffers||{}).buffers||{};bufferList.replaceChildren();Object.entries(bufferNames).forEach(([key,label])=>{const value=buffers[key]||{};const frames=Number(value.frames||0),capacity=Number(value.capacity||0),history=Number(value.history_frames||0),current=Number(value.current_frames||0);const item=document.createElement('div');item.className='buffer-item';const top=document.createElement('div');top.className='buffer-top';const name=document.createElement('span');name.textContent=label;const count=document.createElement('strong');count.textContent=`${frames} / ${capacity||'–'}`;top.append(name,count);const detail=document.createElement('div');detail.className='buffer-history';detail.textContent=`history ${history} · current ${current}`;const bar=document.createElement('div');bar.className='bar';const fill=document.createElement('i');fill.style.width=`${capacity?Math.min(100,frames/capacity*100):0}%`;bar.append(fill);item.append(top,detail,bar);bufferList.append(item)})
+    }
+    function paintMetadata(){
+      const meta=(latest.policy||{}).metadata||{};metadataTags.replaceChildren();const tags=[];if(meta.policy_family)tags.push(meta.policy_family);if(meta.format_id)tags.push(meta.format_id);(meta.requirements||[]).forEach(req=>tags.push(`${req.name} ${req.history}+${req.current?1:0}`));if(!tags.length)tags.push('等待模型连接');tags.forEach(text=>{const tag=document.createElement('span');tag.className='meta-tag';tag.textContent=text;metadataTags.append(tag)});metadataDetail.textContent=[meta.task_id&&`task ${meta.task_id}`,meta.checkpoint_id&&`ckpt ${meta.checkpoint_id}`,meta.prompt].filter(Boolean).join('\n')
+    }
+
+    const edges=[];[1,5,9,13,17].forEach(start=>{edges.push([0,start],[start,start+1],[start+1,start+2],[start+2,start+3])});
+    const dot3=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+    const sceneCenter=[0,.28,.35],sceneSpan=.9;
+    function validHand(points){return Array.isArray(points)&&points.length===21&&points.every(point=>Array.isArray(point)&&point.length===3&&point.every(Number.isFinite))}
+    function drawStar(ctx,x,y,r){ctx.beginPath();for(let i=0;i<10;i++){const a=-Math.PI/2+i*Math.PI/5,rr=i%2?r*.42:r;const px=x+Math.cos(a)*rr,py=y+Math.sin(a)*rr;i?ctx.lineTo(px,py):ctx.moveTo(px,py)}ctx.closePath();ctx.fill();ctx.stroke()}
+    function drawScene(canvas,data,label,title){
+      const ratio=window.devicePixelRatio||1,width=canvas.clientWidth,height=canvas.clientHeight;if(canvas.width!==Math.round(width*ratio)||canvas.height!==Math.round(height*ratio)){canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio)}const ctx=canvas.getContext('2d');ctx.setTransform(ratio,0,0,ratio,0,0);ctx.clearRect(0,0,width,height);ctx.fillStyle='#fafafa';ctx.fillRect(0,0,width,height);
+      const left=data&&data.left_keypoints,right=data&&data.right_keypoints;if(!validHand(left)||!validHand(right)){ctx.fillStyle='#758087';ctx.font='14px system-ui';ctx.textAlign='center';ctx.fillText((data&&(data.visualization_error||data.error))||label,width/2,height/2);ctx.textAlign='start';return}
+      const plotPoint=p=>[p[0],p[2],p[1]],az=Math.PI/3,el=Math.PI/9,rightAxis=[-Math.sin(az),Math.cos(az),0],upAxis=[-Math.cos(az)*Math.sin(el),-Math.sin(az)*Math.sin(el),Math.cos(el)],scale=Math.min(width*.80,height*.74)/sceneSpan;
+      const project=point=>{const p=plotPoint(point).map((v,i)=>v-sceneCenter[i]);return[width*.5+dot3(p,rightAxis)*scale,height*.54-dot3(p,upAxis)*scale]};
+      ctx.strokeStyle='#d9dee1';ctx.lineWidth=1;for(let i=-2;i<=2;i++){const offset=i*sceneSpan/4,a=project([-sceneSpan/2,0,offset]),b=project([sceneSpan/2,0,offset]),c=project([offset,0,-sceneSpan/2]),d=project([offset,0,sceneSpan/2]);ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.stroke();ctx.beginPath();ctx.moveTo(...c);ctx.lineTo(...d);ctx.stroke()}
+      const origin=project([0,0,0]);ctx.fillStyle='#2c2c2c';ctx.strokeStyle='#fff';ctx.lineWidth=1;drawStar(ctx,origin[0],origin[1],9);
+      const axisLength=.16;[['x',[axisLength,0,0]],['z',[0,0,axisLength]],['y',[0,axisLength,0]]].forEach(([name,end])=>{const p=project(end);ctx.strokeStyle='#899197';ctx.lineWidth=1.1;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...p);ctx.stroke();ctx.fillStyle='#60686d';ctx.font='11px ui-monospace,monospace';ctx.fillText(name,p[0]+4,p[1]-3)});
+      [['L hand',left,'#2468b4','circle'],['R hand',right,'#d94a4a','square']].forEach(([name,points,color,marker])=>{ctx.strokeStyle=color;ctx.fillStyle=color;ctx.lineWidth=2;edges.forEach(([a,b])=>{const pa=project(points[a]),pb=project(points[b]);ctx.beginPath();ctx.moveTo(...pa);ctx.lineTo(...pb);ctx.stroke()});points.forEach((point,index)=>{const p=project(point);ctx.beginPath();if(index===0&&marker==='square'){ctx.rect(p[0]-4,p[1]-4,8,8)}else{ctx.arc(p[0],p[1],index===0?4:2.7,0,Math.PI*2)}ctx.fill();ctx.strokeStyle=index===0?'#222':color;ctx.lineWidth=index===0?1:0;ctx.stroke();ctx.strokeStyle=color;ctx.lineWidth=2});});
+      ctx.font='12px system-ui';ctx.fillStyle='#2468b4';ctx.beginPath();ctx.arc(18,20,4,0,Math.PI*2);ctx.fill();ctx.fillStyle='#30383d';ctx.fillText('L hand',28,24);ctx.fillStyle='#d94a4a';ctx.fillRect(91,16,8,8);ctx.fillStyle='#30383d';ctx.fillText('R hand',106,24);ctx.fillStyle='#2c2c2c';ctx.strokeStyle='#fff';drawStar(ctx,181,20,7);ctx.fillStyle='#30383d';ctx.fillText('root',193,24);
+      ctx.fillStyle='#222';ctx.font='600 12px system-ui';ctx.textAlign='right';ctx.fillText(title,width-14,23);ctx.font='11px ui-monospace,monospace';ctx.fillStyle='#6d767b';ctx.fillText('canonical root · fixed 0.90 m · SharpA URDF FK',width-14,height-14);ctx.textAlign='start';
+    }
+    function predictionKey(prediction){return[prediction.session_id,prediction.request_id,prediction.action_id,prediction.revision,prediction.timestamp_ns,prediction.execute_start,prediction.execute_length].join('|')}
+    function drawPrediction(now){
+      const player=predictionPlayer;if(!player.frames.length)return false;const elapsed=Math.max(0,now-player.startedAt),index=Math.min(player.frames.length-1,Math.floor(elapsed*player.frequencyHz/1000));player.index=index;const frame=player.frames[index];drawScene(outputCanvas,frame,'等待本次模型预测','PREDICTED WRIST + HAND');outputStamp.textContent=frame.visualization_error?'FK 不可用':`request ${player.requestId} · step ${frame.step} · ${index+1}/${player.frames.length} · ${player.frequencyHz.toFixed(1)} Hz`;return index<player.frames.length-1
+    }
+    function animatePrediction(now){predictionAnimation=0;if(drawPrediction(now))predictionAnimation=requestAnimationFrame(animatePrediction)}
+    function syncPrediction(prediction){
+      const frames=Array.isArray(prediction.frames)?prediction.frames:[],key=predictionKey(prediction);if(!frames.length){if(predictionAnimation)cancelAnimationFrame(predictionAnimation);predictionAnimation=0;predictionPlayer={key,frames:[],frequencyHz:1,startedAt:0,index:0,requestId:0};drawScene(outputCanvas,{},'等待本次模型预测','PREDICTED WRIST + HAND');outputStamp.textContent='等待模型输出';return}if(key===predictionPlayer.key)return;
+      if(predictionAnimation)cancelAnimationFrame(predictionAnimation);const frequency=Number(prediction.frequency_hz),receivedAt=Number(prediction.received_at_unix_ms),age=Number.isFinite(receivedAt)?Math.max(0,Date.now()-receivedAt):0;predictionPlayer={key,frames,frequencyHz:Number.isFinite(frequency)&&frequency>0?frequency:1,startedAt:performance.now()-age,index:0,requestId:prediction.request_id};predictionAnimation=requestAnimationFrame(animatePrediction)
+    }
+    function paintSkeletons(){const measured=latest.measured_motion||{},prediction=latest.prediction||{};drawScene(inputCanvas,measured,'等待机器人测量状态','CURRENT WRIST + HAND');inputStamp.textContent=measured.sample_count?`canonical · sample ${measured.sample_count}`:(measured.error?'FK 不可用':'等待硬件数据');syncPrediction(prediction)}
+
+    async function refresh(){
+      try{latest=await requestJson('/api/status');paintControls();paintStatus();paintBuffers();paintMetadata();paintSkeletons()}
+      catch(error){overallText.textContent='Dashboard 断开';overallDot.className='dot bad';setFeedback(error.message,true)}
+    }
+    window.addEventListener('resize',()=>{paintSkeletons();drawPrediction(performance.now())});setInterval(refresh,500);refresh();
+  </script>
+</body>
+</html>

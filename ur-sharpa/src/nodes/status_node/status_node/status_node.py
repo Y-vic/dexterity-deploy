@@ -1,0 +1,229 @@
+"""Hidden ROS control state machine for teleop and deploy."""
+
+from __future__ import annotations
+
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    import rclpy
+    from rclpy._rclpy_pybind11 import RCLError
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+    from std_msgs.msg import Bool, String
+    from ur_msgs.msg import (
+        CameraSet,
+        ControlStatus,
+        HandStateFrame,
+        HardwareCommandResult,
+        UrStateFrame,
+    )
+    ROS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    ROS_AVAILABLE = False
+    Node = object  # type: ignore
+
+from .gates import GateMachine
+
+
+if ROS_AVAILABLE:
+    class StatusNode(Node):
+        """ROS-only shell around :class:`GateMachine`; no HTTP server."""
+
+        def __init__(self):
+            super().__init__("status_node")
+            self.declare_parameter("mode", "teleop")
+            self.declare_parameter("camera_max_age_s", 0.25)
+            self.declare_parameter("status_rate_hz", 10.0)
+            self.declare_parameter("web_enabled", False)
+            self.declare_parameter("web_port", 8080)
+            self.machine = GateMachine(
+                mode=str(self.get_parameter("mode").value),
+                camera_max_age_s=float(self.get_parameter("camera_max_age_s").value),
+            )
+            qos = QoSProfile(depth=10)
+            camera_qos = QoSProfile(
+                depth=1, history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+            )
+            self.status_pub = self.create_publisher(ControlStatus, "/control/status", qos)
+            self.bias_pub = self.create_publisher(String, "/control/bias_request", qos)
+            self.record_pub = self.create_publisher(String, "/control/record_command", qos)
+            self.stop_pub = self.create_publisher(Bool, "/hardware/stop", qos)
+            self.create_subscription(String, "/control/ui_command", self._command, qos)
+            self.create_subscription(CameraSet, "/camera/set", self._camera, camera_qos)
+            self.create_subscription(String, "/control/bias_status", self._bias, qos)
+            self.create_subscription(String, "/control/record_status", self._record, qos)
+            self.create_subscription(String, "/teleop/vive_status", self._upstream("vive_status"), qos)
+            self.create_subscription(String, "/teleop/manus_status", self._upstream("manus_status"), qos)
+            self.create_subscription(UrStateFrame, "/ur/state", self._ur_state, qos)
+            self.create_subscription(HandStateFrame, "/sharpa/state", self._sharpa_state, qos)
+            self.create_subscription(HardwareCommandResult, "/ur/command_result", self._result("ur"), qos)
+            self.create_subscription(HardwareCommandResult, "/sharpa/command_result", self._result("sharpa"), qos)
+            self.upstream = {}
+            self._pending_bias = None
+            self.http = None
+            if bool(self.get_parameter("web_enabled").value):
+                self._start_compat_api(int(self.get_parameter("web_port").value))
+            self.create_timer(1.0 / max(.1, float(self.get_parameter("status_rate_hz").value)), self._publish)
+
+        def _start_compat_api(self, port):
+            node = self
+            class Handler(BaseHTTPRequestHandler):
+                def log_message(self, *_args): pass
+                def _json(self, payload, code=200):
+                    data = json.dumps(payload, separators=(",", ":")).encode()
+                    self.send_response(code); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+                def do_GET(self):
+                    if self.path.startswith("/api/status"):
+                        self._json(node._snapshot()); return
+                    self.send_error(404)
+                def do_POST(self):
+                    if not self.path.startswith("/api/action"): self.send_error(404); return
+                    try:
+                        count = int(self.headers.get("content-length", "0"))
+                        self._json(node._apply_action(json.loads(self.rfile.read(count) or b"{}")))
+                    except Exception as exc:
+                        self._json({"accepted": False, "gate_reason": str(exc)}, 400)
+            self.http = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+            threading.Thread(target=self.http.serve_forever, daemon=True, name="status-api").start()
+
+        def _upstream(self, key):
+            def callback(msg):
+                try:
+                    self.upstream[key] = json.loads(msg.data)
+                except Exception:
+                    self.upstream[key] = msg.data
+            return callback
+
+        def _result(self, key):
+            def callback(msg):
+                self.upstream[f"{key}_command"] = {
+                    "success": bool(msg.success),
+                    "failure_code": msg.failure_code,
+                    "failure_message": msg.failure_message,
+                }
+            return callback
+
+        def _camera(self, msg):
+            self.machine.update_cameras(
+                {"ego": msg.ego_timestamp_ns, "left_wrist": msg.left_wrist_timestamp_ns,
+                 "right_wrist": msg.right_wrist_timestamp_ns},
+                {"ego": msg.ego_valid, "left_wrist": msg.left_wrist_valid,
+                 "right_wrist": msg.right_wrist_valid}, time.time(),
+            )
+
+        def _ur_state(self, msg):
+            self.machine.update_hardware_readiness(
+                ur_ready=bool(msg.valid and msg.normal_mode)
+            )
+
+        def _sharpa_state(self, msg):
+            self.machine.update_hardware_readiness(
+                sharpa_ready=bool(msg.left_valid or msg.right_valid)
+            )
+            self.upstream["sharpa_sides"] = {
+                "left_valid": bool(msg.left_valid),
+                "right_valid": bool(msg.right_valid),
+            }
+
+        def _bias(self, msg):
+            payload = json.loads(msg.data) if msg.data else {}
+            self.machine.on_bias_status(payload)
+            self.upstream["bias_status"] = payload
+
+        def _record(self, msg):
+            try:
+                self.upstream["record_status"] = json.loads(msg.data)
+            except Exception:
+                self.upstream["record_status"] = msg.data
+
+        def _command(self, msg):
+            try:
+                body = json.loads(msg.data) if msg.data.startswith("{") else {"action": msg.data}
+            except Exception:
+                body = {"action": msg.data.strip()}
+            self._apply_action(body)
+
+        def _apply_action(self, body):
+            action = str(body.get("action", ""))
+            actions = {
+                "start_ur": self.machine.attempt_start_ur,
+                "run_ur": self.machine.attempt_run_ur,
+                "reset_ur": self.machine.attempt_reset_ur,
+                "start_sharpa": self.machine.attempt_start_sharpa,
+                "reset_both": self.machine.attempt_reset_both,
+                "start_record": self.machine.attempt_start_recording,
+                "stop_record": self.machine.attempt_stop_recording,
+                "discard_record": self.machine.attempt_discard_recording,
+                "start_deploy": self.machine.attempt_start_deploy,
+                "stop_deploy": self.machine.attempt_stop_deploy,
+                "pause": self.machine.attempt_pause,
+                "stop": self.machine.attempt_pause,
+            }
+            outcome = actions.get(action, lambda: self.machine._set_reason(f"unknown action: {action}"))()
+            if outcome.hardware_stop is not None:
+                msg = Bool(); msg.data = bool(outcome.hardware_stop); self.stop_pub.publish(msg)
+            if outcome.bias_request and outcome.hardware_stop is False:
+                self._pending_bias = (time.monotonic() + 0.1, outcome.bias_request)
+            elif outcome.bias_request:
+                self._publish_string(self.bias_pub, outcome.bias_request)
+            if outcome.record_command:
+                self._publish_string(self.record_pub, outcome.record_command)
+            self.upstream["last_action"] = {"action": action, "accepted": bool(outcome), "reason": outcome.reason}
+            result = self._snapshot()
+            result["accepted"] = bool(outcome)
+            result["gate_reason"] = outcome.reason
+            return result
+
+        def _snapshot(self):
+            return {"status": self.machine.status_payload(), "upstream": dict(self.upstream)}
+
+        @staticmethod
+        def _publish_string(pub, value):
+            msg = String(); msg.data = str(value); pub.publish(msg)
+
+        def _publish(self):
+            if self._pending_bias is not None and time.monotonic() >= self._pending_bias[0]:
+                _due, request = self._pending_bias
+                self._pending_bias = None
+                self._publish_string(self.bias_pub, request)
+            state = self.machine
+            msg = ControlStatus()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.timestamp_ns = time.time_ns()
+            msg.ur_state = int(state.ur_state)
+            msg.sharpa_state = int(state.sharpa_state)
+            msg.record_state = int(state.record_state)
+            msg.active_source = int(state.active_source)
+            msg.gate_reason = state.gate_reason or state.camera_gate_reason()
+            msg.session_id = state.session_id
+            self.status_pub.publish(msg)
+
+        def destroy_node(self):
+            if self.http is not None:
+                self.http.shutdown(); self.http.server_close()
+            return super().destroy_node()
+
+else:
+    class StatusNode:  # pragma: no cover
+        def __init__(self, *_args, **_kwargs):
+            raise RuntimeError("rclpy is unavailable")
+
+
+def main(args=None):
+    if not ROS_AVAILABLE:
+        raise RuntimeError("rclpy is unavailable")
+    rclpy.init(args=args)
+    node = StatusNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException, RCLError):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

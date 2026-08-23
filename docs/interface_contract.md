@@ -64,8 +64,17 @@ key 都必须存在，允许添加额外 key；只有标注 `| None` 的 value �
 ```
 
 State wrist 始终包含 `joint`、`eef`、`eef_def`。`eef_def=None` 等价于默认
-`absolute`；public interface 不接收 relative observation。EEF 使用
-`xyz + rot6d`，shape `(9,)`，具体本体坐标由 ROS adapter 负责。
+`absolute`；public interface 不接收 relative observation。EEF 使用 PND 定义的
+canonical wrist contract：
+
+- frame id 为 `canonical`；root 为 `canonical_root`，`+X=left`、`+Y=up`、
+  `+Z=forward`。
+- wrist child 顺序为 `left_hand_C_MC`、`right_hand_C_MC`。
+- pose9 为 root 中的绝对 `xyz`（米），随后是 root-from-wrist 旋转矩阵的前两列：
+  `[r00,r10,r20,r01,r11,r21]`。
+
+精确定义由 `sharpa_interface/sharpa.py` 冻结。TCP 偏移、机械安装偏差和本体 base
+标定都属于 embodiment adapter，禁止写入公共 interface。
 
 固定数据：hand joint/tau 每手 22D；wrench 每手 `(5,6)`；deformation 每手
 `uint8 (5,240,240)`；相机使用 JPEG bytes。History 不含 current。
@@ -122,6 +131,14 @@ State wrist 始终包含 `joint`、`eef`、`eef_def`。`eef_def=None` 等价于�
 Server policy 内部可以使用 relative EEF，但发送到 workstation 前必须转换为
 `absolute`；`parse_policy_action()` 默认拒绝 public boundary 上的 relative EEF。
 当前 auxiliary 所有值填 `None`，以后支持预测模态时保留同名 key。
+
+## Migration notes
+
+### 0.3.0 (2026-08-22)
+
+以 PND wrist pose 为跨本体 canonical ABI，冻结 root/wrist 轴、左右 frame 顺序和
+column-Rot6D pose9 顺序。本体的 TCP、安装和 base 标定仍是各 adapter 私有实现，
+不属于 interface。
 
 ## ExecutableAction
 

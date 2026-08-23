@@ -9,7 +9,12 @@ NOT do this — it fails cleanly if these are missing, so you know to install.
 - Ubuntu 22.04 (or the exact version confirmed against the machine you
   intend to reproduce; note here when it changes).
 - ROS 2 Humble.
-- `python3-yaml`, `python3-numpy`.
+- `python3-yaml`, `python3-numpy`, `python3-msgpack`, `python3-aiohttp`,
+  `python3-pil`, `python3-zmq`, and `python3-empy` (ROS interface
+  generation).
+- Build and run ROS with the system Python 3.10 after sourcing only
+  `/opt/ros/humble/setup.bash`; a Conda 3.8 environment shadows ROS Python
+  modules and breaks `ament_package`/`rosidl_adapter`.
 - `curl`, `unzip`, `tar` (for `fetch.sh`).
 
 ## UR host only

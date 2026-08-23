@@ -1,0 +1,35 @@
+# Reset the policy session: drop server-side history and re-negotiate the
+# metadata format. Called on session start and after a fault that set
+# clear_plan.
+
+string session_id
+uint64 request_id
+---
+# Schema tag echoed by the server, e.g. "sharpa_policy_reset.v1".
+string schema
+string session_id
+uint64 request_id
+
+# True when the server acknowledged the reset and cleared its state.
+bool reset
+
+# Metadata format the server will use from now on. Empty when reset=false.
+string metadata_format_id
+
+# --- Fault detail, flattened. All empty/false when reset=true. ---
+bool has_fault
+
+# Machine-readable fault code.
+string fault_code
+
+# Human-readable fault detail.
+string fault_message
+
+# Caller may retry the reset unchanged.
+bool fault_retryable
+
+# Caller must halt the arms and hands before doing anything else.
+bool fault_safe_stop
+
+# Caller must discard any buffered action plan.
+bool fault_clear_plan

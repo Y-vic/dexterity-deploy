@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>monitor_node</name>
+  <version>0.1.0</version>
+  <description>Teleop monitor dashboard, recording controls and upload.</description>
+  <maintainer email="ur.sharpa@example.com">ur-sharpa</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_python</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>ur_msgs</exec_depend>
+  <exec_depend>ur_common</exec_depend>
+  <exec_depend>status_node</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
