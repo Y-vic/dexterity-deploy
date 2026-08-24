@@ -18,6 +18,11 @@ _MAGIC = b"USCAMV1\0"
 _HEADER = struct.Struct("<8sQQIB3x")
 
 
+def _complete_jpeg(data: bytes) -> bool:
+    """Cheaply reject empty/truncated shared-memory snapshots."""
+    return len(data) >= 4 and data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"
+
+
 @dataclass(frozen=True)
 class SharedCameraSet:
     encoding: str
@@ -179,7 +184,7 @@ class SharedCameraReader:
             if size > available:
                 return None
             data = os.pread(descriptor, size, _HEADER.size) if valid else b""
-            if valid and len(data) != size:
+            if valid and (len(data) != size or not _complete_jpeg(data)):
                 time.sleep(0)
                 continue
             second_header = os.pread(descriptor, _HEADER.size, 0)

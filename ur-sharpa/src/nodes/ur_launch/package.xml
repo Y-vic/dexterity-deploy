@@ -19,6 +19,7 @@
   <exec_depend>robot_states_node</exec_depend>
   <exec_depend>policy_client_node</exec_depend>
   <exec_depend>actor_ik_node</exec_depend>
+  <exec_depend>replay_node</exec_depend>
   <exec_depend>vive_node</exec_depend>
   <exec_depend>manus_node</exec_depend>
   <export><build_type>ament_python</build_type></export>

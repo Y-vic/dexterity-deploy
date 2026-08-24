@@ -37,14 +37,31 @@ def test_browser_script_keeps_newline_escape():
     assert "setInterval(refreshCameras" not in HTML
     assert 'id="remote-model-path"' in HTML
     assert "truncateMiddle" in HTML
-    assert "正在重启" in HTML
-    assert "恢复失败" in HTML
-    assert "30秒重试" in HTML
-    assert "restart_max_attempts" in HTML
+    assert "不会自动重启" in HTML
+    assert "restart_max_attempts" not in HTML
     assert 'data-action="mark_success"' in HTML
     assert 'data-action="mark_fail"' in HTML
     assert 'data-action="drop_sample"' in HTML
+    assert 'id="saved-success"' in HTML
+    assert 'id="saved-fail"' in HTML
+    assert 'id="saved-undefined"' in HTML
+    assert "recorder.saving" in HTML
+    assert "正在保存…" in HTML
     assert "0.0 s" in HTML
+
+
+def test_recording_counts_only_timestamp_named_samples(tmp_path):
+    (tmp_path / "success").mkdir()
+    (tmp_path / "fail").mkdir()
+    (tmp_path / "success" / "2026-08-24_12-00-02.000001").mkdir()
+    (tmp_path / "fail" / "2026-08-24_12-00-03.000001").mkdir()
+    (tmp_path / "2026-08-24_12-00-04.000001.partial").mkdir()
+
+    assert MonitorController(tmp_path).snapshot()["recording_counts"] == {
+        "success": 1,
+        "fail": 1,
+        "undefined": 0,
+    }
 
 
 def test_default_remote_data_path_is_exposed_to_monitor():
@@ -143,7 +160,7 @@ def test_upload_allows_only_one_background_worker(monkeypatch):
 
 
 def test_upload_rejects_directory_without_complete_marker(tmp_path):
-    sample = tmp_path / "sample_0000"
+    sample = tmp_path / "2026-08-25_12-34-56.123456"
     sample.mkdir()
     (sample / "manifest.json").write_text(
         '{"state":"complete","quality":{"ok":true}}', encoding="utf-8"
@@ -154,8 +171,9 @@ def test_upload_rejects_directory_without_complete_marker(tmp_path):
 
 @pytest.mark.parametrize("category", ["", "success", "fail"])
 def test_upload_preserves_sample_relative_category(tmp_path, monkeypatch, category):
+    sample_name="2026-08-25_12-34-56.123456"
     parent=tmp_path if not category else tmp_path/category
-    sample=parent/"sample_0003"; sample.mkdir(parents=True)
+    sample=parent/sample_name; sample.mkdir(parents=True)
     (sample/"manifest.json").write_text(
         '{"state":"complete","quality":{"ok":true}}', encoding="utf-8"
     )
@@ -168,12 +186,12 @@ def test_upload_preserves_sample_relative_category(tmp_path, monkeypatch, catego
     calls=[]
     monkeypatch.setattr(subprocess,"run",lambda args,**kwargs:calls.append(args))
     controller=MonitorController(tmp_path,upload_host="host",upload_path="/remote/root")
-    relative=f"{category}/sample_0003" if category else "sample_0003"
+    relative=f"{category}/{sample_name}" if category else sample_name
     assert controller._upload_latest() == f"uploaded {relative}"
     remote_parent=f"/remote/root/{category}" if category else "/remote/root"
     assert ["ssh","host",f"mkdir -p -- {remote_parent}"] in calls
     rsync=next(call for call in calls if call[0] == "rsync")
-    assert rsync[-1] == f"host:{remote_parent}/sample_0003.partial/"
+    assert rsync[-1] == f"host:{remote_parent}/{sample_name}.partial/"
 
 
 def test_recording_path_cannot_change_during_sample():

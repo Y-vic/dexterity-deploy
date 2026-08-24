@@ -26,28 +26,28 @@ class SharpaStateCore:
                 "left_valid": bool(snapshot.left_joint_valid), "right_valid": bool(snapshot.right_joint_valid)}
 
 
-class ManusTeleopCommandCache:
-    """Thread-safe per-side cache of received Manus teleop targets.
+class SuccessfulHandCommandCache:
+    """Last complete 44D target successfully handed to the SharpA SDK.
 
-    This cache describes operator intent for the dataset, independently of
-    whether SharpA is running or the hardware arbitration accepts the target.
-    Freshness still prevents an old target from being recorded as a new action.
+    This mirrors pnd-sharpa's ``last_successful_q_cmd`` contract. A partial
+    command is never combined with an older command from the other hand. The
+    value remains a zero-order hold until a new complete command succeeds or
+    the hardware execution state invalidates it.
     """
 
-    def __init__(self, freshness_timeout_s: float = 0.25) -> None:
-        self.freshness_timeout_ns = int(float(freshness_timeout_s) * 1.0e9)
-        if self.freshness_timeout_ns <= 0:
-            raise ValueError("hand command freshness timeout must be positive")
+    def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._q_cmd = np.zeros(44, dtype=np.float32)
-        self._valid = {"left": False, "right": False}
-        self._timestamp_ns = {"left": 0, "right": 0}
-        self._source = {"left": 0, "right": 0}
+        self._q_cmd = np.full(44, np.nan, dtype=np.float32)
+        self._valid = False
+        self._timestamp_ns = 0
+        self._source = 0
 
-    def invalidate(self, side: str | None = None) -> None:
+    def invalidate(self) -> None:
         with self._lock:
-            for current in (("left", "right") if side is None else (side,)):
-                self._valid[current] = False
+            self._q_cmd.fill(np.nan)
+            self._valid = False
+            self._timestamp_ns = 0
+            self._source = 0
 
     def record(
         self,
@@ -57,45 +57,36 @@ class ManusTeleopCommandCache:
         timestamp_ns: int | None = None,
     ) -> None:
         stamp = time.time_ns() if timestamp_ns is None else int(timestamp_ns)
+        if set(dispatched) != {"left", "right"}:
+            self.invalidate()
+            return
+        left = np.asarray(dispatched["left"], dtype=np.float32).reshape(-1)
+        right = np.asarray(dispatched["right"], dtype=np.float32).reshape(-1)
+        if (
+            left.shape != (22,)
+            or right.shape != (22,)
+            or not np.isfinite(left).all()
+            or not np.isfinite(right).all()
+            or stamp <= 0
+            or int(source) <= 0
+        ):
+            self.invalidate()
+            return
         with self._lock:
-            for side, offset in (("left", 0), ("right", 22)):
-                if side not in dispatched:
-                    continue
-                values = np.asarray(dispatched[side], dtype=np.float32).reshape(-1)
-                if values.shape != (22,) or not np.isfinite(values).all():
-                    self._valid[side] = False
-                    continue
-                self._q_cmd[offset:offset + 22] = values
-                self._valid[side] = True
-                self._timestamp_ns[side] = stamp
-                self._source[side] = int(source)
+            self._q_cmd[:22] = left
+            self._q_cmd[22:] = right
+            self._valid = True
+            self._timestamp_ns = stamp
+            self._source = int(source)
 
-    def snapshot(
-        self, now_ns: int | None = None
-    ) -> tuple[np.ndarray, bool, int, int]:
-        current = time.time_ns() if now_ns is None else int(now_ns)
+    def snapshot(self) -> tuple[np.ndarray, bool, int, int]:
         with self._lock:
-            ages = {
-                side: current - self._timestamp_ns[side]
-                for side in ("left", "right")
-            }
-            valid = bool(
-                all(self._valid.values())
-                and all(0 <= age <= self.freshness_timeout_ns for age in ages.values())
-                and self._source["left"] == self._source["right"]
-                and np.isfinite(self._q_cmd).all()
-            )
             return (
                 self._q_cmd.copy(),
-                valid,
-                max(self._timestamp_ns.values()),
-                self._source["left"] if valid else 0,
+                bool(self._valid),
+                int(self._timestamp_ns),
+                int(self._source),
             )
-
-
-# Keep the old import name for downstream code while changing the semantics to
-# the received Manus action rather than a successfully dispatched command.
-SuccessfulHandCommandCache = ManusTeleopCommandCache
 
 
 def main(args=None) -> None:
@@ -120,7 +111,7 @@ def main(args=None) -> None:
             super().__init__("sharpa_node")
             self.declare_parameter("sdk_root", os.environ.get("SHARPA_SDK_ROOT", ""))
             self.declare_parameter("skip_tactile", False)
-            self.declare_parameter("command_freshness_timeout_s", 0.25)
+            self._sdk_lock = threading.RLock()
             self.driver = SharpADevicePair(
                 sdk_root=str(self.get_parameter("sdk_root").value),
                 enable_control=True,
@@ -129,6 +120,7 @@ def main(args=None) -> None:
             self._driver_error = ""
             try:
                 self.driver.connect()
+                self.driver.set_floating()
             except Exception as exc:
                 # Hardware absence is a runtime state, not a reason to kill the
                 # graph. Keep publishing invalid facts so status/recording can
@@ -143,36 +135,84 @@ def main(args=None) -> None:
             self._sharpa_state = SharpaState.STOPPED
             self._active_source = Source.UNKNOWN
             self._stopped = False
-            self._command_cache = ManusTeleopCommandCache(
-                float(self.get_parameter("command_freshness_timeout_s").value)
-            )
+            self._floating = True
+            self._command_cache = SuccessfulHandCommandCache()
             self.create_subscription(HandCommand, "/sharpa/command", self._command, 10)
             self.create_subscription(ControlStatus, "/control/status", self._status, 10)
             self.create_subscription(Bool, "/hardware/stop", self._stop, 10)
             self.timer = self.create_timer(1.0 / 30.0, self._state)
 
         def _status(self, message):
-            try:
-                self._sharpa_state = SharpaState(int(message.sharpa_state))
-            except ValueError:
-                self._sharpa_state = SharpaState.STOPPED
-            try:
-                self._active_source = Source(int(message.active_source))
-            except ValueError:
-                self._active_source = Source.UNKNOWN
+            with self._sdk_lock:
+                previous_state = self._sharpa_state
+                previous_source = self._active_source
+                try:
+                    self._sharpa_state = SharpaState(int(message.sharpa_state))
+                except ValueError:
+                    self._sharpa_state = SharpaState.STOPPED
+                try:
+                    self._active_source = Source(int(message.active_source))
+                except ValueError:
+                    self._active_source = Source.UNKNOWN
+
+                if self._active_source != previous_source:
+                    self._command_cache.invalidate()
+                if (
+                    self._sharpa_state == SharpaState.STOPPED
+                    and previous_state != SharpaState.STOPPED
+                ):
+                    self._set_floating()
+                elif (
+                    self._sharpa_state == SharpaState.RUNNING
+                    and previous_state != SharpaState.RUNNING
+                    and not self._stopped
+                ):
+                    self._set_position_control()
+
+        def _set_floating(self):
+            with self._sdk_lock:
+                self._command_cache.invalidate()
+                if self._floating:
+                    return
+                try:
+                    self.driver.set_floating()
+                    self._floating = True
+                except Exception as exc:
+                    self.get_logger().error(f"failed to set SharpA floating mode: {exc}")
+
+        def _set_position_control(self):
+            with self._sdk_lock:
+                if not self._floating:
+                    return
+                self._command_cache.invalidate()
+                try:
+                    self.driver.set_position_control()
+                    self._floating = False
+                except Exception as exc:
+                    self.get_logger().error(
+                        f"failed to restore SharpA position mode: {exc}"
+                    )
 
         def _stop(self, message):
-            self._stopped = bool(message.data)
-            if self._stopped:
-                self.driver.hold()
+            with self._sdk_lock:
+                self._stopped = bool(message.data)
+                if self._stopped:
+                    self._set_floating()
+                elif self._sharpa_state == SharpaState.RUNNING:
+                    self._set_position_control()
 
         def _state(self):
             msg = HandStateFrame(); msg.timestamp_ns = time.time_ns()
             if self._driver_error:
                 msg.left_valid = False; msg.right_valid = False; self.pub.publish(msg); return
             try:
-                raw = self.driver.read()
-                snapshot = SharpaStateCore.normalize(raw)
+                # Match pnd-sharpa: measured q and the most recent successfully
+                # dispatched q_cmd are captured under one SDK-side lock and
+                # published in the same feedback message.
+                with self._sdk_lock:
+                    raw = self.driver.read()
+                    snapshot = SharpaStateCore.normalize(raw)
+                    command_snapshot = self._command_cache.snapshot()
             except Exception as exc:
                 self.get_logger().error(str(exc)); msg.left_valid = False; msg.right_valid = False; self.pub.publish(msg); return
             stamp = snapshot["timestamp_ns"]
@@ -182,9 +222,7 @@ def main(args=None) -> None:
             msg.tau = np.concatenate((raw.left_tau, raw.right_tau)).tolist()
             msg.tau_valid = bool(raw.left_tau_valid and raw.right_tau_valid)
             msg.dq = [0.0] * 44; msg.dq_valid = False
-            q_cmd, q_cmd_valid, q_cmd_timestamp_ns, q_cmd_source = (
-                self._command_cache.snapshot()
-            )
+            q_cmd, q_cmd_valid, q_cmd_timestamp_ns, q_cmd_source = command_snapshot
             msg.q_cmd = q_cmd.tolist()
             msg.q_cmd_valid = q_cmd_valid
             msg.q_cmd_timestamp_ns = q_cmd_timestamp_ns
@@ -212,38 +250,45 @@ def main(args=None) -> None:
                     command_source = Source.UNKNOWN
                 values = np.asarray(command.q_cmd, dtype=np.float64)
                 if values.shape != (44,) or not np.isfinite(values).all():
-                    if command_source == Source.VIVE:
-                        if bool(command.left_enable):
-                            self._command_cache.invalidate("left")
-                        if bool(command.right_enable):
-                            self._command_cache.invalidate("right")
                     raise ValueError("q_cmd must have 44 finite values")
 
-                # SOURCE_VIVE is the shared source id used by Manus hand
-                # teleop. Capture each enabled side before hardware gating so
-                # recording works while SharpA is paused or unavailable.
-                if command_source == Source.VIVE:
-                    received = {}
-                    if bool(command.left_enable):
-                        received["left"] = values[:22]
-                    if bool(command.right_enable):
-                        received["right"] = values[22:]
+                left_enable = bool(command.left_enable)
+                right_enable = bool(command.right_enable)
+                with self._sdk_lock:
+                    if self._stopped:
+                        raise RuntimeError("hardware stop asserted")
+                    if command_source == Source.BIAS and self._floating:
+                        # Reset/homing is an active machine operation and therefore
+                        # uses the same POSITION mode as normal running.
+                        self._set_position_control()
+                    decision = arbitrate(
+                        self._sharpa_state, self._active_source, command_source
+                    )
+                    if not decision:
+                        result.success = False
+                        result.failure_code = "arbitration_rejected"
+                        result.failure_message = decision.reason
+                        self.result.publish(result)
+                        return
+                    if self._driver_error:
+                        raise RuntimeError(
+                            f"hardware unavailable: {self._driver_error}"
+                        )
+                    if left_enable or right_enable:
+                        # Invalidate before the SDK call. A partial command or
+                        # any SDK failure must not leave an older full command
+                        # looking like the command paired with future state.
+                        self._command_cache.invalidate()
+                    dispatched = self.driver.command(
+                        values[:22], values[22:],
+                        left_enable=left_enable,
+                        right_enable=right_enable,
+                    )
                     self._command_cache.record(
-                        received,
+                        dispatched,
                         source=int(command.source),
                         timestamp_ns=time.time_ns(),
                     )
-
-                if self._stopped: raise RuntimeError("hardware stop asserted")
-                decision = arbitrate(self._sharpa_state, self._active_source, command_source)
-                if not decision:
-                    result.success = False; result.failure_code = "arbitration_rejected"; result.failure_message = decision.reason; self.result.publish(result); return
-                if self._driver_error: raise RuntimeError(f"hardware unavailable: {self._driver_error}")
-                self.driver.command(
-                    values[:22], values[22:],
-                    left_enable=bool(command.left_enable),
-                    right_enable=bool(command.right_enable),
-                )
                 result.success = True
             except Exception as exc:
                 result.success = False; result.failure_code = "sharpa_command_failed"; result.failure_message = str(exc)

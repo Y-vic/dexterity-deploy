@@ -24,6 +24,7 @@ def test_resolve_targets_rejects_before_joint_clipping():
     node.enable_joint_step_limit = True
     node.enable_joint_clip = True
     node.max_joint_step_rad = 0.35
+    node.max_abs_joint_rad = 6.28
     node.driver = FakeDriver()
     message = SimpleNamespace(
         left_joint=np.full(6, 1.2),
@@ -42,6 +43,7 @@ def test_resolve_targets_passes_through_when_joint_step_and_clip_are_disabled():
     node.enable_joint_step_limit = False
     node.enable_joint_clip = False
     node.max_joint_step_rad = 0.35
+    node.max_abs_joint_rad = 6.28
     node.driver = FakeDriver()
     message = SimpleNamespace(
         left_joint=np.full(6, 1.2),
@@ -54,6 +56,25 @@ def test_resolve_targets_passes_through_when_joint_step_and_clip_are_disabled():
 
     np.testing.assert_array_equal(left, message.left_joint)
     np.testing.assert_array_equal(right, message.right_joint)
+
+
+def test_resolve_targets_rejects_absolute_joint_limit():
+    node = UrNode.__new__(UrNode)
+    node.enable_motion_limits = True
+    node.enable_joint_step_limit = False
+    node.enable_joint_clip = False
+    node.max_joint_step_rad = 0.35
+    node.max_abs_joint_rad = 1.0
+    node.driver = FakeDriver()
+    message = SimpleNamespace(
+        left_joint=[1.01, 0.0, 0.0, 0.0, 0.0, 0.0],
+        right_joint=np.zeros(6),
+        left_enable=True,
+        right_enable=False,
+    )
+
+    with pytest.raises(ValueError, match="absolute limit"):
+        node.resolve_targets(message)
 
 
 def test_safety_signature_ignores_live_wrench_changes():

@@ -129,7 +129,8 @@ def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
-    from ur_msgs.msg import ArmCommand, ExecutionDone, ExecutableAction, HandCommand
+    from std_msgs.msg import String
+    from ur_msgs.msg import ArmCommand, ControlStatus, ExecutionDone, ExecutableAction, HandCommand
     from ur_msgs.msg import HandStateFrame, UrStateFrame
     from ur_common.kinematics import UrCommonKinematics
     from ur_common.geometry import CANONICAL_EEF_FRAME
@@ -151,13 +152,77 @@ def main(args=None) -> None:
             self._pending = {}
             self._active = None
             self._scheduled = None
-            self.create_subscription(ExecutableAction, "/policy/executable_action", self._action, 10)
+            self._execution_provider = "policy"
+            self._machine_running = False
+            self.create_subscription(
+                ExecutableAction,
+                "/policy/executable_action",
+                lambda message: self._action(message, "policy"),
+                10,
+            )
+            self.create_subscription(
+                ExecutableAction,
+                "/replay/executable_action",
+                lambda message: self._action(message, "replay"),
+                10,
+            )
+            self.create_subscription(
+                String,
+                "/control/execution_provider",
+                self._provider_update,
+                10,
+            )
+            self.create_subscription(
+                ControlStatus, "/control/status", self._control_status, 10
+            )
             self.create_subscription(UrStateFrame, "/ur/state", self._ur_state, 10)
             self.create_subscription(HandStateFrame, "/sharpa/state", self._hand_state, 10)
             from ur_msgs.msg import HardwareCommandResult
-            self.create_subscription(HardwareCommandResult, "/ur/command_result", self._ack, 10)
-            self.create_subscription(HardwareCommandResult, "/sharpa/command_result", self._ack, 10)
+            self.create_subscription(
+                HardwareCommandResult,
+                "/ur/command_result",
+                lambda message: self._ack(message, "ur"),
+                10,
+            )
+            self.create_subscription(
+                HardwareCommandResult,
+                "/sharpa/command_result",
+                lambda message: self._ack(message, "sharpa"),
+                10,
+            )
             self._watchdog = self.create_timer(0.005, self._process)
+
+        def _provider_update(self, message):
+            provider = str(message.data).strip().lower()
+            if provider in {"policy", "replay"}:
+                if provider != self._execution_provider and self._active is not None:
+                    self._abort_active("execution provider changed")
+                self._execution_provider = provider
+
+        def _control_status(self, message):
+            running = bool(
+                message.ur_state == ControlStatus.UR_RUNNING
+                and message.sharpa_state == ControlStatus.SHARPA_RUNNING
+            )
+            if self._machine_running and not running:
+                self._abort_active("machine execution gate closed")
+            self._machine_running = running
+
+        def _abort_active(self, error):
+            action = None
+            step = 0
+            if self._scheduled is not None:
+                action = self._scheduled["action"]
+                step = int(self._scheduled["step"])
+            elif self._pending:
+                pending = next(iter(self._pending.values()))
+                action = pending["action"]
+                step = int(pending["step"])
+            self._scheduled = None
+            self._pending.clear()
+            self._active = None
+            if action is not None:
+                self._done(action, False, int(action.execute_start) + step, error)
 
         def _ur_state(self, message):
             left = np.asarray(message.left_joint, dtype=np.float32)
@@ -198,7 +263,15 @@ def main(args=None) -> None:
             message.timestamp_ns = self.get_clock().now().nanoseconds
             self._done_pub.publish(message)
 
-        def _ack(self, message):
+        def _ack(self, message, expected_device):
+            if int(message.source) != int(ArmCommand.SOURCE_ACTOR):
+                return
+            if str(message.device) != expected_device:
+                self.get_logger().warning(
+                    f"ignoring command result from {message.device!r} on "
+                    f"{expected_device} result topic"
+                )
+                return
             key = (message.action_id, int(message.revision), int(message.step_index))
             pending = self._pending.get(key)
             if pending is None:
@@ -293,10 +366,24 @@ def main(args=None) -> None:
             self._arm_pub.publish(arm)
             self._hand_pub.publish(hand)
 
-        def _action(self, action):
+        def _action(self, action, provider="policy"):
             try:
+                if provider != self._execution_provider:
+                    self.get_logger().warning(
+                        f"ignoring {provider} action while provider is "
+                        f"{self._execution_provider}"
+                    )
+                    self._done(
+                        action,
+                        False,
+                        int(action.execute_start),
+                        f"execution provider is {self._execution_provider}",
+                    )
+                    return
+                if not self._machine_running:
+                    raise ActorIkError("machine execution gate is not running")
                 if self._active is not None:
-                    raise ActorIkError("another policy action is still executing")
+                    raise ActorIkError("another actor action is still executing")
                 if not self._ur_valid or not self._hand_valid:
                     raise ActorIkError("valid UR and SharpA state are required")
                 if action.eef_frame != CANONICAL_EEF_FRAME:

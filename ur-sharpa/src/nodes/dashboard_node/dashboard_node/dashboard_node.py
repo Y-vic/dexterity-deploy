@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,7 +15,17 @@ from urllib.request import Request, urlopen
 from .model_manager import ModelManagerError, RemoteModelManager
 
 
-DASHBOARD_ACTIONS = frozenset({"reset_both", "start_deploy", "stop_deploy"})
+DASHBOARD_ACTIONS = frozenset(
+    {
+        "reset_both",
+        "start_deploy",
+        "stop_deploy",
+        "select_policy",
+        "select_replay",
+    }
+)
+REPLAY_ACTIONS = frozenset({"load", "start", "pause", "resume", "stop"})
+LIVE_REPLAY_TIMEOUT_S = 6.0
 
 
 class DashboardState:
@@ -29,6 +40,28 @@ class DashboardState:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._values)
+
+
+def wait_for_dashboard_state(
+    state: DashboardState,
+    predicate: Any,
+    *,
+    timeout_s: float = LIVE_REPLAY_TIMEOUT_S,
+    failure: Any = None,
+) -> dict[str, Any]:
+    """Wait for an asynchronous ROS status transition from an HTTP worker."""
+    deadline = time.monotonic() + timeout_s
+    snapshot = state.snapshot()
+    while time.monotonic() < deadline:
+        snapshot = state.snapshot()
+        if failure is not None:
+            reason = failure(snapshot)
+            if reason:
+                raise ModelManagerError(str(reason))
+        if predicate(snapshot):
+            return snapshot
+        time.sleep(0.05)
+    raise ModelManagerError("Replay 状态切换超时，请检查节点日志和硬件状态")
 
 
 def forward_action(url: str, action: str, timeout_s: float = 2.0) -> dict[str, Any]:
@@ -46,6 +79,262 @@ def forward_action(url: str, action: str, timeout_s: float = 2.0) -> dict[str, A
         raise RuntimeError(f"status API unavailable: {exc.reason}") from exc
 
 
+def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
+    action = str(payload.get("action", "")).strip().lower()
+    if action not in REPLAY_ACTIONS:
+        raise ValueError(f"unsupported replay action: {action}")
+    result: dict[str, Any] = {"action": action}
+    if action != "load":
+        return result
+    sample_dir = str(payload.get("sample_dir", "")).strip()
+    if not sample_dir:
+        raise ValueError("replay sample_dir is required")
+    execution_steps = payload.get("execution_steps")
+    frequency_hz = payload.get("frequency_hz")
+    if isinstance(execution_steps, bool) or not isinstance(execution_steps, int):
+        raise ValueError("replay execution_steps must be an integer")
+    if execution_steps <= 0 or execution_steps > 1000:
+        raise ValueError("replay execution_steps must be in [1, 1000]")
+    if isinstance(frequency_hz, bool):
+        raise ValueError("replay frequency_hz must be a number")
+    try:
+        frequency_hz = float(frequency_hz)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("replay frequency_hz must be a number") from exc
+    if not math.isfinite(frequency_hz) or not 5.0 <= frequency_hz <= 125.0:
+        raise ValueError("replay frequency_hz must be in [5, 125]")
+    joint_source = str(payload.get("joint_source", "measured")).strip().lower()
+    if joint_source not in {"measured", "commanded"}:
+        raise ValueError("replay joint_source must be measured or commanded")
+    for field in ("loop", "dry_run"):
+        if not isinstance(payload.get(field), bool):
+            raise ValueError(f"replay {field} must be boolean")
+    result.update(
+        sample_dir=sample_dir,
+        execution_steps=execution_steps,
+        frequency_hz=frequency_hz,
+        joint_source=joint_source,
+        loop=payload["loop"],
+        dry_run=payload["dry_run"],
+    )
+    return result
+
+
+def validate_live_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate a live launch and force it out of preview mode."""
+    return validate_replay_command(
+        {
+            **payload,
+            "action": "load",
+            "dry_run": False,
+        }
+    )
+
+
+def replay_config_matches_status(
+    replay: dict[str, Any], command: dict[str, Any]
+) -> bool:
+    """Whether a loaded live sample can be started without resetting its cursor."""
+    try:
+        return bool(
+            replay.get("state") in {"ready", "paused", "complete"}
+            and replay.get("dry_run") is False
+            and str(replay.get("sample_dir") or "")
+            == str(command.get("sample_dir") or "")
+            and int(replay.get("execution_steps"))
+            == int(command.get("execution_steps"))
+            and math.isclose(
+                float(replay.get("frequency_hz")),
+                float(command.get("frequency_hz")),
+                rel_tol=0.0,
+                abs_tol=1.0e-6,
+            )
+            and str(replay.get("joint_source") or "")
+            == str(command.get("joint_source") or "")
+            and bool(replay.get("loop")) == bool(command.get("loop"))
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def launch_live_replay(
+    state: DashboardState,
+    status_api_url: str,
+    publish_replay_command: Any,
+    command: dict[str, Any],
+    *,
+    forward: Any = forward_action,
+) -> dict[str, Any]:
+    """Synchronously arm and start Replay while observing every async gate."""
+    before = state.snapshot()
+    control = before.get("control") or {}
+    replay_before = before.get("replay") or {}
+    if int(control.get("ur_state", -1)) != 1:
+        raise ModelManagerError(
+            "真实启动前请先完成机器复位，确认 UR 状态为初始位置"
+        )
+    if int(control.get("sharpa_state", -1)) != 0:
+        raise ModelManagerError("真实启动前 SharpA 必须处于停止状态")
+    if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
+        raise ModelManagerError("Replay 仍在执行或预览，请先停止")
+
+    previous_execution_id = str(replay_before.get("execution_id") or "")
+    gate_opened = False
+    try:
+        if replay_config_matches_status(replay_before, command):
+            loaded = before
+        else:
+            publish_replay_command(command)
+
+            def replay_load_failure(snapshot: dict[str, Any]) -> str:
+                replay = snapshot.get("replay") or {}
+                if (
+                    str(replay.get("execution_id") or "")
+                    != previous_execution_id
+                    and replay.get("state") == "fault"
+                ):
+                    return str(replay.get("error") or "Replay 加载失败")
+                return ""
+
+            loaded = wait_for_dashboard_state(
+                state,
+                lambda snapshot: (
+                    str((snapshot.get("replay") or {}).get("execution_id") or "")
+                    != previous_execution_id
+                    and (snapshot.get("replay") or {}).get("state") == "ready"
+                    and (snapshot.get("replay") or {}).get("dry_run") is False
+                ),
+                failure=replay_load_failure,
+            )
+        execution_id = str(
+            (loaded.get("replay") or {}).get("execution_id") or ""
+        )
+
+        selected = forward(status_api_url, "select_replay")
+        if not selected.get("accepted"):
+            raise ModelManagerError(
+                str(selected.get("gate_reason") or "无法切换到 Replay 执行来源")
+            )
+        state.update("execution_provider", "replay")
+        wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
+                (snapshot.get("replay") or {}).get("provider") == "replay"
+            ),
+        )
+
+        started = forward(status_api_url, "start_deploy")
+        if not started.get("accepted"):
+            raise ModelManagerError(
+                str(started.get("gate_reason") or "机器执行门无法开启")
+            )
+        gate_opened = True
+        wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
+                (snapshot.get("replay") or {}).get("machine_running") is True
+                and (snapshot.get("replay") or {}).get("provider") == "replay"
+            ),
+        )
+
+        publish_replay_command({"action": "start"})
+
+        def replay_start_failure(snapshot: dict[str, Any]) -> str:
+            replay = snapshot.get("replay") or {}
+            if (
+                str(replay.get("execution_id") or "") == execution_id
+                and replay.get("state") == "fault"
+            ):
+                return str(replay.get("error") or "Replay 启动失败")
+            return ""
+
+        running = wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
+                str((snapshot.get("replay") or {}).get("execution_id") or "")
+                == execution_id
+                and (snapshot.get("replay") or {}).get("state")
+                in {"aligning", "playing", "complete"}
+            ),
+            failure=replay_start_failure,
+        )
+    except Exception:
+        if gate_opened:
+            publish_replay_command({"action": "stop"})
+            try:
+                forward(status_api_url, "stop_deploy")
+            except RuntimeError:
+                pass
+        raise
+    return {
+        "accepted": True,
+        "replay_action": "live_start",
+        "execution_id": execution_id,
+        "replay": running.get("replay") or {},
+    }
+
+
+def launch_replay_preview(
+    state: DashboardState,
+    publish_replay_command: Any,
+    command: dict[str, Any],
+) -> dict[str, Any]:
+    """Load a preview-only sample and wait until preview playback begins."""
+    before = state.snapshot()
+    control = before.get("control") or {}
+    replay_before = before.get("replay") or {}
+    if int(control.get("ur_state", 0)) == 2:
+        raise ModelManagerError("机器运行时不能启动 Replay 预览")
+    if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
+        raise ModelManagerError("Replay 仍在执行或预览，请先停止")
+    previous_execution_id = str(replay_before.get("execution_id") or "")
+    publish_replay_command(command)
+
+    loaded = wait_for_dashboard_state(
+        state,
+        lambda snapshot: (
+            str((snapshot.get("replay") or {}).get("execution_id") or "")
+            != previous_execution_id
+            and (snapshot.get("replay") or {}).get("state") == "ready"
+            and (snapshot.get("replay") or {}).get("dry_run") is True
+        ),
+        failure=lambda snapshot: (
+            str((snapshot.get("replay") or {}).get("error") or "Replay 加载失败")
+            if (
+                str((snapshot.get("replay") or {}).get("execution_id") or "")
+                != previous_execution_id
+                and (snapshot.get("replay") or {}).get("state") == "fault"
+            )
+            else ""
+        ),
+    )
+    execution_id = str((loaded.get("replay") or {}).get("execution_id") or "")
+    publish_replay_command({"action": "start"})
+    running = wait_for_dashboard_state(
+        state,
+        lambda snapshot: (
+            str((snapshot.get("replay") or {}).get("execution_id") or "")
+            == execution_id
+            and (snapshot.get("replay") or {}).get("preview_active") is True
+        ),
+        failure=lambda snapshot: (
+            str((snapshot.get("replay") or {}).get("error") or "Replay 预览失败")
+            if (
+                str((snapshot.get("replay") or {}).get("execution_id") or "")
+                == execution_id
+                and (snapshot.get("replay") or {}).get("state") == "fault"
+            )
+            else ""
+        ),
+    )
+    return {
+        "accepted": True,
+        "replay_action": "preview_start",
+        "execution_id": execution_id,
+        "replay": running.get("replay") or {},
+    }
+
+
 def action_visualization(message: Any) -> dict[str, Any]:
     count = int(message.execute_length)
 
@@ -58,19 +347,25 @@ def action_visualization(message: Any) -> dict[str, Any]:
             for index in range(count)
         ]
 
-    left_eef = rows(message.left_eef, 9)
-    right_eef = rows(message.right_eef, 9)
-    hand = rows(message.hand_joint, 44)
+    left_eef = rows(getattr(message, "left_eef", []), 9)
+    right_eef = rows(getattr(message, "right_eef", []), 9)
+    left_joint = rows(getattr(message, "left_arm_joint", []), 6)
+    right_joint = rows(getattr(message, "right_arm_joint", []), 6)
+    hand = rows(getattr(message, "hand_joint", []), 44)
+    eef_complete = bool(left_eef and right_eef and hand)
+    joint_complete = bool(left_joint and right_joint and hand)
     frames = []
     for index in range(count):
         hand_frame = hand[index] if hand else []
         frames.append(
             {
                 "step": int(message.execute_start) + index,
-                "left_eef": left_eef[index] if left_eef else [],
-                "right_eef": right_eef[index] if right_eef else [],
-                "left_hand": hand_frame[:22] if hand_frame else [],
-                "right_hand": hand_frame[22:] if hand_frame else [],
+                "left_eef": left_eef[index] if eef_complete else [],
+                "right_eef": right_eef[index] if eef_complete else [],
+                "left_arm_joint": left_joint[index] if joint_complete else [],
+                "right_arm_joint": right_joint[index] if joint_complete else [],
+                "left_hand": hand_frame[:22] if (eef_complete or joint_complete) else [],
+                "right_hand": hand_frame[22:] if (eef_complete or joint_complete) else [],
             }
         )
     return {
@@ -140,6 +435,7 @@ def make_handler(
     state: DashboardState,
     status_api_url: str,
     model_manager: RemoteModelManager,
+    publish_replay_command: Any,
 ):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -166,17 +462,72 @@ def make_handler(
                 if self.path == "/api/action":
                     action = str(payload.get("action", ""))
                     if action == "start_deploy":
-                        if model_manager.snapshot()["phase"] != "running":
-                            raise ModelManagerError("请先启动并等待模型服务就绪")
-                        policy = state.snapshot().get("policy") or {}
-                        if not policy.get("model_identity_ok"):
-                            raise ModelManagerError(
-                                str(policy.get("model_identity_error") or "正在校验模型 task / run")
-                            )
+                        snapshot = state.snapshot()
+                        provider = snapshot.get("execution_provider", "policy")
+                        if provider == "policy":
+                            if model_manager.snapshot()["phase"] != "running":
+                                raise ModelManagerError("请先启动并等待模型服务就绪")
+                            policy = snapshot.get("policy") or {}
+                            if not policy.get("model_identity_ok"):
+                                raise ModelManagerError(
+                                    str(policy.get("model_identity_error") or "正在校验模型 task / run")
+                                )
+                        else:
+                            replay = snapshot.get("replay") or {}
+                            if replay.get("state") not in {"ready", "paused", "complete"}:
+                                raise ModelManagerError("请先加载有效的 replay 样本")
+                            if replay.get("dry_run", True):
+                                raise ModelManagerError("Replay 仍处于 Dry run；取消勾选后重新加载")
                     result = forward_action(
                         status_api_url, action
                     )
+                    if result.get("accepted") and action in {
+                        "select_policy",
+                        "select_replay",
+                    }:
+                        state.update(
+                            "execution_provider",
+                            "policy" if action == "select_policy" else "replay",
+                        )
                     self._send_json(result)
+                    return
+                if self.path == "/api/replay":
+                    command = validate_replay_command(payload)
+                    publish_replay_command(command)
+                    self._send_json(
+                        {
+                            "accepted": True,
+                            "replay_action": command["action"],
+                        },
+                        202,
+                    )
+                    return
+                if self.path == "/api/replay/live/start":
+                    command = validate_live_replay_command(payload)
+                    self._send_json(
+                        launch_live_replay(
+                            state,
+                            status_api_url,
+                            publish_replay_command,
+                            command,
+                        )
+                    )
+                    return
+                if self.path == "/api/replay/preview/start":
+                    command = validate_replay_command(
+                        {
+                            **payload,
+                            "action": "load",
+                            "dry_run": True,
+                        }
+                    )
+                    self._send_json(
+                        launch_replay_preview(
+                            state,
+                            publish_replay_command,
+                            command,
+                        )
+                    )
                     return
                 if self.path == "/api/model/start":
                     result = model_manager.start(
@@ -248,6 +599,7 @@ def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     from ur_msgs.msg import (
         CameraSet,
@@ -274,6 +626,9 @@ def main(args=None) -> None:
             self._model_status_pub = self.create_publisher(
                 String, "/model/status", 10
             )
+            self._replay_command_pub = self.create_publisher(
+                String, "/replay/command", 10
+            )
             self.model_manager = RemoteModelManager(
                 ssh_host=str(self.get_parameter("model_ssh_host").value),
                 remote_root=str(self.get_parameter("model_remote_root").value),
@@ -287,6 +642,7 @@ def main(args=None) -> None:
                 state,
                 str(self.get_parameter("status_api_url").value),
                 self.model_manager,
+                self._publish_replay_command,
             )
             self.server = ThreadingHTTPServer(
                 ("127.0.0.1", int(self.get_parameter("port").value)), handler
@@ -301,6 +657,13 @@ def main(args=None) -> None:
                 ControlStatus, "/control/status", self._control, 10
             )
             self.create_subscription(String, "/policy/status", self._policy, 10)
+            self.create_subscription(String, "/replay/status", self._replay, 10)
+            self.create_subscription(
+                String,
+                "/control/execution_provider",
+                self._provider,
+                10,
+            )
             self.create_subscription(
                 String, "/robot_states/status", self._buffers, 10
             )
@@ -308,8 +671,13 @@ def main(args=None) -> None:
             self.create_subscription(
                 HandStateFrame, "/sharpa/state", self._sharpa, 10
             )
+            camera_qos = QoSProfile(
+                depth=1,
+                history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+            )
             self.create_subscription(
-                CameraSet, "/camera/set", self._camera, 10
+                CameraSet, "/camera/set", self._camera, camera_qos
             )
             self.create_subscription(
                 String, "/control/bias_status", self._bias, 10
@@ -320,10 +688,30 @@ def main(args=None) -> None:
                 self._prediction,
                 10,
             )
+            self.create_subscription(
+                ExecutableAction,
+                "/replay/executable_action",
+                self._prediction,
+                10,
+            )
+            self.create_subscription(
+                ExecutableAction,
+                "/replay/preview_action",
+                self._prediction,
+                10,
+            )
             self._visual_ur: dict[str, Any] = {}
             self._visual_hand: dict[str, Any] = {}
             self._motion_sample_count = 0
             self._last_motion_update = 0.0
+            self._prediction_kin = None
+
+        def _publish_replay_command(self, payload: dict[str, Any]) -> None:
+            message = String()
+            message.data = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":")
+            )
+            self._replay_command_pub.publish(message)
 
         def _model_event(self, payload: dict[str, Any]) -> None:
             state.update("model", payload)
@@ -354,6 +742,12 @@ def main(args=None) -> None:
 
         def _policy(self, message: String) -> None:
             state.update("policy", self._json(message))
+
+        def _replay(self, message: String) -> None:
+            state.update("replay", self._json(message))
+
+        def _provider(self, message: String) -> None:
+            state.update("execution_provider", message.data.strip().lower() or "policy")
 
         def _buffers(self, message: String) -> None:
             state.update("buffers", self._json(message))
@@ -394,6 +788,21 @@ def main(args=None) -> None:
             payload["received_at_unix_ms"] = int(time.time() * 1000)
             for frame in payload["frames"]:
                 try:
+                    if (
+                        not frame["left_eef"]
+                        and frame["left_arm_joint"]
+                        and frame["right_arm_joint"]
+                    ):
+                        if self._prediction_kin is None:
+                            from ur_common.kinematics import UrCommonKinematics
+
+                            self._prediction_kin = UrCommonKinematics()
+                        frame["left_eef"] = self._prediction_kin.arm_fk_eef9(
+                            frame["left_arm_joint"], "left"
+                        ).tolist()
+                        frame["right_eef"] = self._prediction_kin.arm_fk_eef9(
+                            frame["right_arm_joint"], "right"
+                        ).tolist()
                     frame.update(
                         hand_motion_visualization(
                             frame["left_eef"],
@@ -446,6 +855,17 @@ def main(args=None) -> None:
                     "ego": bool(message.ego_valid),
                     "left_wrist": bool(message.left_wrist_valid),
                     "right_wrist": bool(message.right_wrist_valid),
+                    "ego_timestamp_ns": int(message.ego_timestamp_ns),
+                    "left_wrist_timestamp_ns": int(
+                        message.left_wrist_timestamp_ns
+                    ),
+                    "right_wrist_timestamp_ns": int(
+                        message.right_wrist_timestamp_ns
+                    ),
+                    "publish_timestamp_ns": (
+                        int(message.header.stamp.sec) * 1_000_000_000
+                        + int(message.header.stamp.nanosec)
+                    ),
                 },
             )
 

@@ -49,6 +49,9 @@ if ROS_AVAILABLE:
                 reliability=ReliabilityPolicy.BEST_EFFORT,
             )
             self.status_pub = self.create_publisher(ControlStatus, "/control/status", qos)
+            self.provider_pub = self.create_publisher(
+                String, "/control/execution_provider", qos
+            )
             self.bias_pub = self.create_publisher(String, "/control/bias_request", qos)
             self.record_pub = self.create_publisher(String, "/control/record_command", qos)
             self.stop_pub = self.create_publisher(Bool, "/hardware/stop", qos)
@@ -161,6 +164,8 @@ if ROS_AVAILABLE:
                 "discard_record": self.machine.attempt_discard_recording,
                 "start_deploy": self.machine.attempt_start_deploy,
                 "stop_deploy": self.machine.attempt_stop_deploy,
+                "select_policy": lambda: self.machine.attempt_set_execution_provider("policy"),
+                "select_replay": lambda: self.machine.attempt_set_execution_provider("replay"),
                 "pause": self.machine.attempt_pause,
                 "stop": self.machine.attempt_pause,
             }
@@ -202,6 +207,7 @@ if ROS_AVAILABLE:
             msg.gate_reason = state.gate_reason or state.camera_gate_reason()
             msg.session_id = state.session_id
             self.status_pub.publish(msg)
+            self._publish_string(self.provider_pub, state.execution_provider)
 
         def destroy_node(self):
             if self.http is not None:

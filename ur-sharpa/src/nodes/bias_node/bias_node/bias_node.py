@@ -358,13 +358,21 @@ class BiasNode(Node):
             start = SHARPA_HOME_Q44 if measured is None else measured
             if measured is None:
                 run.detail = "sharpa state unavailable; ramping from zeros"
-            run.hand_target = SHARPA_HOME_Q44.copy()
+            saved_hand_target = self._load_bias_hand_target_locked()
+            run.hand_target = (
+                SHARPA_HOME_Q44.copy()
+                if saved_hand_target is None
+                else saved_hand_target
+            )
             run.hand_plan = interpolate(start, run.hand_target, self.sharpa_steps)
 
     def _save_current_bias_locked(self) -> None:
         measured = self._measured_arm_joints()
         if measured is None:
             raise RuntimeError("no fresh /ur/state; cannot save bias")
+        measured_hands = self._measured_hand_joints()
+        if measured_hands is None:
+            raise RuntimeError("no fresh /sharpa/state; cannot save SharpA bias")
         payload = {
             "schema": "ur_sharpa_bias.v1",
             "saved_at": time.time(),
@@ -373,6 +381,8 @@ class BiasNode(Node):
             "left_eef": [float(v) for v in getattr(self._ur_state, "left_eef", [])],
             "right_eef": [float(v) for v in getattr(self._ur_state, "right_eef", [])],
             "eef_frame": str(getattr(self._ur_state, "eef_frame", "canonical")),
+            "left_hand_joint": [float(v) for v in measured_hands[:22]],
+            "right_hand_joint": [float(v) for v in measured_hands[22:]],
         }
         if len(payload["left_eef"]) != 9 or len(payload["right_eef"]) != 9:
             raise ValueError("/ur/state canonical EEF pose is incomplete")
@@ -383,6 +393,23 @@ class BiasNode(Node):
         self._last_result = {"request": "save_current", "phase": PHASE_DONE,
                              "detail": f"saved {self.bias_file}",
                              "max_error_rad": None, "finished_at": time.time()}
+
+    def _load_bias_hand_target_locked(self) -> np.ndarray | None:
+        try:
+            payload = json.loads(self.bias_file.read_text(encoding="utf-8"))
+            left = np.asarray(payload["left_hand_joint"], dtype=np.float64)
+            right = np.asarray(payload["right_hand_joint"], dtype=np.float64)
+            if left.shape != (22,) or right.shape != (22,):
+                raise ValueError("saved SharpA bias joints must be 22D per hand")
+            target = np.concatenate((left, right))
+            if not np.all(np.isfinite(target)):
+                raise ValueError("saved SharpA bias joints must be finite")
+            return target
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            self.get_logger().warning(f"ignoring invalid SharpA bias in {self.bias_file}: {exc}")
+            return None
 
     def _load_bias_targets_locked(self) -> dict | None:
         try:

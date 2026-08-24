@@ -10,7 +10,6 @@ import subprocess
 import threading
 import time
 import sys
-from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -192,29 +191,6 @@ class ManusHealthTracker:
         return ""
 
 
-class RestartLimiter:
-    """Maximum restart budget for one continuous failure episode."""
-
-    def __init__(self, maximum=3, window_s=60.0):
-        self.maximum = max(1, int(maximum))
-        self.window_s = max(1.0, float(window_s))
-        self._attempts = deque()
-
-    def reserve(self, now=None):
-        now = time.monotonic() if now is None else float(now)
-        if len(self._attempts) >= self.maximum:
-            return False, 0.0
-        self._attempts.append(now)
-        return True, 0.0
-
-    def clear(self):
-        self._attempts.clear()
-
-    @property
-    def attempts(self):
-        return len(self._attempts)
-
-
 def _process_tree_groups(root_process_id: int) -> set[int]:
     children = {}
     groups = {}
@@ -295,11 +271,6 @@ def main(args=None) -> None:
             self.declare_parameter("start_hardware", True)
             self.declare_parameter("client_use_sudo", False)
             self.declare_parameter("retarget_command", "")
-            self.declare_parameter("restart_enabled", True)
-            self.declare_parameter("restart_cooldown_s", 3.0)
-            self.declare_parameter("restart_max_attempts", 3)
-            self.declare_parameter("restart_window_s", 60.0)
-            self.declare_parameter("restart_slow_interval_s", 30.0)
             self.declare_parameter("startup_grace_s", 8.0)
             self.declare_parameter("raw_timeout_s", 2.0)
             self.declare_parameter("incomplete_hand_timeout_s", 1.0)
@@ -308,9 +279,7 @@ def main(args=None) -> None:
             self._zmq = None; self._mocap_zmq = None; self._proto = None; self._hardware_error = ""
             self._hardware_started = False; self._last_action_monotonic = 0.0
             self._last_side_action_monotonic = {"left": 0.0, "right": 0.0}
-            self._destroying = False; self._restart_due = 0.0; self._restart_reason = ""
-            self._restart_failed = False
-            self._restart_slow_retry = False
+            self._destroying = False
             command = str(self.get_parameter("retarget_command").value).strip()
             self._hardware_requested = bool(
                 self.get_parameter("start_hardware").value
@@ -321,10 +290,6 @@ def main(args=None) -> None:
                 self.get_parameter("incomplete_hand_timeout_s").value,
                 self.get_parameter("action_timeout_s").value,
             )
-            self._restart_limiter = RestartLimiter(
-                self.get_parameter("restart_max_attempts").value,
-                self.get_parameter("restart_window_s").value,
-            )
             self.pub = self.create_publisher(HandCommand, "/sharpa/command", 10)
             self.status = self.create_publisher(String, "/teleop/manus_status", 10)
             self.create_subscription(String, "/manus/retargeted_json", self._input, 10)
@@ -334,7 +299,6 @@ def main(args=None) -> None:
                 self._start_hardware()
             self._poll_timer = self.create_timer(0.01, self._poll_hardware)
             self._status_timer = self.create_timer(0.5, self._publish_status)
-            self._watchdog_timer = self.create_timer(0.5, self._watchdog)
 
         def _start_process(self, command):
             self._process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
@@ -385,7 +349,6 @@ def main(args=None) -> None:
                 self._proto = sharpa_hand_pb2
                 self._hardware_started = True; self._hardware_error = ""
                 self._last_action_monotonic = 0.0; self._health.reset()
-                self._restart_due = 0.0; self._restart_reason = ""
                 self.get_logger().info("Manus client and retarget pipeline started")
             except Exception as exc:
                 self._stop_hardware()
@@ -404,14 +367,7 @@ def main(args=None) -> None:
                         complete = self._health.observe_raw(
                             len(mocap.left_mocap_pose), len(mocap.right_mocap_pose), now
                         )
-                        if complete:
-                            # Both gloves recovered: begin a fresh three-attempt
-                            # budget for any later, independent outage.
-                            self._restart_limiter.clear()
-                            self._restart_failed = False
-                            self._restart_slow_retry = False
-                            self._restart_reason = ""
-                        else:
+                        if not complete:
                             self._hardware_error = (
                                 "Manus incomplete mocap frame: "
                                 f"left={self._health.side_keypoint_count('left', now)}, "
@@ -425,7 +381,7 @@ def main(args=None) -> None:
                     except zmq.Again: break
                     action = self._proto.HandAction(); action.ParseFromString(payload)
                     self._health.observe_action()
-                    published = []
+                    commands = {}
                     side_errors = []
                     for side in ("left", "right"):
                         if not self._health.side_complete(side):
@@ -435,7 +391,17 @@ def main(args=None) -> None:
                         except Exception as exc:
                             side_errors.append(str(exc))
                             continue
-                        self._publish_side(side, q_side); published.append(side)
+                        commands[side] = q_side
+                    if set(commands) == {"left", "right"}:
+                        self._publish_q(
+                            np.concatenate((commands["left"], commands["right"]))
+                        )
+                    else:
+                        # Preserve one-hand teleoperation when a glove is
+                        # unavailable. SharpA deliberately marks these partial
+                        # commands invalid for the paired q_state/q_cmd dataset.
+                        for side, q_side in commands.items():
+                            self._publish_side(side, q_side)
                     incomplete = [
                         side for side in ("left", "right")
                         if not self._health.side_complete(side)
@@ -461,68 +427,6 @@ def main(args=None) -> None:
             self._hardware_started = False; self._last_action_monotonic = 0.0
             self._last_side_action_monotonic = {"left": 0.0, "right": 0.0}
 
-        def _schedule_restart(self, reason):
-            if self._destroying or self._restart_due > 0.0:
-                return
-            now = time.monotonic()
-            allowed, _ = self._restart_limiter.reserve(now)
-            cooldown = max(0.1, float(self.get_parameter("restart_cooldown_s").value))
-            self._restart_reason = str(reason)
-            self._hardware_error = self._restart_reason
-            if not allowed:
-                self._restart_failed = True
-                self._restart_slow_retry = True
-                slow_interval = max(
-                    1.0,
-                    float(
-                        self.get_parameter("restart_slow_interval_s").value
-                    ),
-                )
-                self._restart_due = time.monotonic() + slow_interval
-                self._hardware_error = (
-                    f"{reason}; automatic recovery failed after "
-                    f"{self._restart_limiter.maximum} restart attempts; "
-                    f"retrying every {slow_interval:.0f}s"
-                )
-                self.get_logger().error(self._hardware_error)
-                return
-            self._restart_failed = False
-            self._restart_slow_retry = False
-            self._stop_hardware()
-            self._restart_due = time.monotonic() + cooldown
-            self.get_logger().warning(
-                f"{reason}; restarting Manus pipeline in {cooldown:.1f}s "
-                f"({self._restart_limiter.attempts}/"
-                f"{self._restart_limiter.maximum})"
-            )
-
-        def _watchdog(self):
-            if self._destroying or not self._hardware_requested:
-                return
-            now = time.monotonic()
-            if self._restart_due > 0.0:
-                if now >= self._restart_due:
-                    self._restart_due = 0.0
-                    if self._restart_slow_retry:
-                        # Keep the healthy glove running during the 30-second
-                        # wait. Tear down the shared vendor pipeline only when
-                        # the next low-frequency retry is actually due.
-                        self._restart_slow_retry = False
-                        self._restart_failed = False
-                        self._stop_hardware()
-                    self._start_hardware()
-                return
-            if not bool(self.get_parameter("restart_enabled").value):
-                return
-            if not self._hardware_started:
-                self._schedule_restart(self._hardware_error or "Manus pipeline did not start")
-                return
-            client_alive = bool(self._process is not None and self._process.poll() is None)
-            retarget_alive = bool(self._retarget is not None and self._retarget.poll() is None)
-            fault = self._health.fault(client_alive, retarget_alive, now)
-            if fault:
-                self._schedule_restart(fault)
-
         def _publish_status(self):
             now = time.monotonic()
             data_age = None if self._last_action_monotonic <= 0.0 else max(0.0, now - self._last_action_monotonic)
@@ -538,17 +442,6 @@ def main(args=None) -> None:
                 for side in ("left", "right")
             }
             valid = any(side_valid.values()) if self._hardware_requested else bool(data_age is not None and data_age < 0.5)
-            restart_pending = self._restart_due > 0.0
-            if self._restart_failed and self._restart_slow_retry:
-                restart_phase = "retry_wait"
-            elif self._restart_failed:
-                restart_phase = "failed"
-            elif restart_pending:
-                restart_phase = "restarting"
-            elif self._restart_limiter.attempts > 0 and not all(side_valid.values()):
-                restart_phase = "recovering"
-            else:
-                restart_phase = "idle"
             error = self._hardware_error
             if self._hardware_started and not client_alive:
                 code = None if self._process is None else self._process.poll()
@@ -571,13 +464,6 @@ def main(args=None) -> None:
                 "right_keypoints": self._health.side_keypoint_count("right", now),
                 "left_valid": side_valid["left"],
                 "right_valid": side_valid["right"],
-                "restart_pending": restart_pending,
-                "restart_attempts": self._restart_limiter.attempts,
-                "restart_max_attempts": self._restart_limiter.maximum,
-                "restart_failed": self._restart_failed,
-                "restart_slow_retry": self._restart_slow_retry,
-                "restart_phase": restart_phase,
-                "restart_reason": self._restart_reason,
                 "error": error,
             }, separators=(",", ":"))
             self.status.publish(out)
@@ -597,8 +483,19 @@ def main(args=None) -> None:
 
         def _publish_q(self, q):
             values = ManusCore.parse(q)
-            self._publish_side("left", values[:22])
-            self._publish_side("right", values[22:])
+            now = time.monotonic()
+            self._last_action_monotonic = now
+            self._last_side_action_monotonic["left"] = now
+            self._last_side_action_monotonic["right"] = now
+            command = HandCommand()
+            command.source = HandCommand.SOURCE_VIVE
+            command.action_id = ""
+            command.revision = 0
+            command.step_index = 0
+            command.q_cmd = values.tolist()
+            command.left_enable = True
+            command.right_enable = True
+            self.pub.publish(command)
 
         def _read_process(self):
             if self._process is None or self._process.stdout is None: return

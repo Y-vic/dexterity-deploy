@@ -4,6 +4,7 @@ import pytest
 from policy_client_node.policy_client_node import (
     LegacyServerPoseAdapter,
     PolicyClientCore,
+    completion_belongs_to_session,
     deployment_ready,
     metadata_identity_error,
     summarize_metadata,
@@ -62,6 +63,13 @@ def test_core_rejects_done_identity_mismatch():
     core = PolicyClientCore("s"); request = core.begin(); core.accept_action(action("s", request.request_id))
     with pytest.raises(Exception):
         core.complete({"schema": "sharpa_execution_done.v1", "request_id": 9, "action_id": "a1", "revision": 0, "execute_start": 0, "execute_length": 2, "executed_steps": 2, "success": True, "done": True, "error": None})
+
+
+def test_policy_ignores_completion_from_replay_session():
+    message = type("Done", (), {"session_id": "replay_sample_run"})()
+    assert not completion_belongs_to_session(message, "ur-sharpa")
+    message.session_id = "ur-sharpa"
+    assert completion_belongs_to_session(message, "ur-sharpa")
 
 
 def test_deployment_requires_both_devices_and_actor_source():

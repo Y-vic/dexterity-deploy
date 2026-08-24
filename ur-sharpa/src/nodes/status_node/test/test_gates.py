@@ -82,6 +82,25 @@ def test_start_deploy_requires_deploy_mode_and_complete_reset():
     assert not deploy.attempt_start_deploy()
     assert "reset both" in deploy.gate_reason
 
+
+def test_deploy_provider_switch_is_explicit_and_stopped_only():
+    machine = GateMachine(mode="deploy")
+    assert machine.execution_provider == "policy"
+    assert machine.attempt_set_execution_provider("replay")
+    assert machine.status_payload()["execution_provider"] == "replay"
+
+    machine.ur_state = UrState.RUNNING
+    machine.sharpa_state = SharpaState.RUNNING
+    assert not machine.attempt_set_execution_provider("policy")
+    assert "stop the machine" in machine.gate_reason
+    assert machine.execution_provider == "replay"
+
+
+def test_provider_switch_is_not_available_in_teleop():
+    machine = GateMachine(mode="teleop")
+    assert not machine.attempt_set_execution_provider("replay")
+    assert machine.execution_provider == "policy"
+
 def test_machine_start_pause_is_a_single_toggle():
     m=GateMachine()
     hardware_ready(m)

@@ -64,19 +64,20 @@ class UrNode(Node):
         self.declare_parameter("rtde_frequency_hz", 125.0)
         self.declare_parameter("publish_hz", 30.0)
         self.declare_parameter("reconnect_interval_s", 5.0)
-        # Software motion guards are opt-in. The status/arbitration state
-        # machine remains the single execution gate for arm commands.
-        self.declare_parameter("enable_motion_limits", False)
-        self.declare_parameter("enable_joint_step_limit", False)
+        # The status/arbitration state machine remains the execution gate for
+        # arm commands; these guards constrain every command that passes it.
+        self.declare_parameter("enable_motion_limits", True)
+        self.declare_parameter("enable_joint_step_limit", True)
         self.declare_parameter("max_joint_step_rad", 0.35)
+        self.declare_parameter("max_abs_joint_rad", 6.28)
         self.declare_parameter("enable_payload_configuration", True)
         self.declare_parameter("left_payload_mass_kg", 1.3)
         self.declare_parameter("left_payload_cog_m", [0.0, 0.0, 0.08])
         self.declare_parameter("right_payload_mass_kg", 1.3)
         self.declare_parameter("right_payload_cog_m", [0.0, 0.0, 0.08])
 
-        # --- safety switch (v1 keeps all safety OFF; single knob restores it) ---
-        self.declare_parameter("enable_joint_clip", False)
+        # --- final joint command limits ---
+        self.declare_parameter("enable_joint_clip", True)
         self.declare_parameter("joint_vel_limit", 0.35)
 
         # --- topics: defaults MUST match docs/ur_topics.md ---
@@ -98,15 +99,23 @@ class UrNode(Node):
         self.max_joint_step_rad = float(
             self.get_parameter("max_joint_step_rad").value
         )
+        self.max_abs_joint_rad = float(
+            self.get_parameter("max_abs_joint_rad").value
+        )
+        for name, value in (
+            ("max_joint_step_rad", self.max_joint_step_rad),
+            ("max_abs_joint_rad", self.max_abs_joint_rad),
+        ):
+            if not np.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
 
-        # SWITCH 3. Off by default, so the raw command reaches servoJ unclipped.
-        # On, ur_common.safety.JointLimiter bounds per-frame delta and absolute
-        # range -- and nothing else. It does NOT replace the wrist-flip hold,
-        # which lives upstream in the IK solver.
+        # JointLimiter bounds per-frame delta and absolute range. It does not
+        # replace the wrist-flip hold, which lives upstream in the IK solver.
         self.kinematics = UrCommonKinematics(
             config=SafetyConfig(
                 enable_joint_clip=self.enable_joint_clip,
                 joint_vel_limit=float(self.get_parameter("joint_vel_limit").value),
+                joint_pos_limit=(self.max_abs_joint_rad,) * UR5_NUM_JOINTS,
             )
         )
 
@@ -130,6 +139,7 @@ class UrNode(Node):
                 enable_motion_limits=self.enable_motion_limits,
                 enable_joint_step_limit=self.enable_joint_step_limit,
                 max_joint_step_rad=self.max_joint_step_rad,
+                max_abs_joint_rad=self.max_abs_joint_rad,
                 enable_payload_configuration=bool(
                     self.get_parameter("enable_payload_configuration").value
                 ),
@@ -449,7 +459,11 @@ class UrNode(Node):
                 continue
             if value.shape != (UR5_NUM_JOINTS,) or not np.isfinite(value).all():
                 raise ValueError(f"{side}_joint must contain {UR5_NUM_JOINTS} finite angles")
-        if not self.enable_joint_clip and not self.enable_joint_step_limit:
+        if not (
+            self.enable_motion_limits
+            or self.enable_joint_clip
+            or self.enable_joint_step_limit
+        ):
             return left, right
         snapshot = self.driver.read()
         current_left = np.asarray(snapshot.left_joint, dtype=np.float64).reshape(-1)
@@ -462,6 +476,13 @@ class UrNode(Node):
             targets[side] = targets[side] + np.round(
                 (current[side] - targets[side]) / (2.0 * np.pi)
             ) * (2.0 * np.pi)
+            if self.enable_motion_limits and np.any(
+                np.abs(targets[side]) > self.max_abs_joint_rad + 1.0e-9
+            ):
+                raise ValueError(
+                    f"{side} joint target exceeds absolute limit "
+                    f"{self.max_abs_joint_rad:.3f} rad"
+                )
             if (
                 self.enable_joint_step_limit
                 and np.any(

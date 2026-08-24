@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import sys
 from io import BytesIO
@@ -9,7 +10,11 @@ import numpy as np
 import pytest
 from PIL import Image
 from recording_node.recording_node import RecorderCore
-from recording_node.episode_writer import MIN_VALID_RATE_HZ, _validation_rate
+from recording_node.episode_writer import (
+    MIN_VALID_RATE_HZ,
+    _validation_rate,
+    validate_saved_episode,
+)
 
 
 def jpeg_bytes(color=(32, 64, 96)):
@@ -44,6 +49,16 @@ def start_with_deformation(c):
     assert c.start()
     assert c.update_deformation(c.latest["deform"].msg,received=1_000_000_000)
 
+
+def test_update_rejects_unknown_modality(tmp_path):
+    core = RecorderCore(tmp_path, frequency=30)
+    try:
+        with pytest.raises(KeyError, match="unknown recording modality"):
+            core.update("typo", object())
+    finally:
+        core.writer.close()
+
+
 def test_all_or_nothing_discard(tmp_path):
     c=RecorderCore(tmp_path,frequency=30)
     # Avoid optional pinocchio in this unit test while still testing shape/writer.
@@ -52,6 +67,26 @@ def test_all_or_nothing_discard(tmp_path):
     for k,v in msgset().items(): c.update(k,v,received=1_000_000_000)
     start_with_deformation(c); assert c.sample(now=1_000_000_000)
     out=c.stop(save=False); assert out is None; assert not list(Path(tmp_path).glob("sample_*"))
+
+
+def test_failed_save_keeps_timestamp_only_directory_name(tmp_path):
+    c=RecorderCore(tmp_path,frequency=30)
+    try:
+        assert c.start()
+        assert c.stop(save=True) is None
+        saved=c.writer.last_result_dir
+        assert saved is not None and saved.is_dir()
+        assert re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{6}",
+            saved.name,
+        )
+        assert (saved/"ERROR").is_file()
+        assert (saved/"RECORDING_ERRORS.json").is_file()
+        manifest=json.loads((saved/"manifest.json").read_text())
+        assert manifest["state"] == "error"
+        assert manifest["quality"]["ok"] is False
+    finally:
+        c.writer.close()
 
 def test_output_schema_and_three_color_mapping(tmp_path):
     c=RecorderCore(tmp_path,frequency=30)
@@ -140,7 +175,18 @@ def test_missing_hand_action_is_not_fabricated_from_measured_state(tmp_path):
     for key,value in messages.items(): c.update(key,value,received=1_000_000_000)
     start_with_deformation(c)
     assert not c.sample(now=1_000_000_000)
-    assert "hand action is missing or stale" in c.last_error
+    assert "no complete successful SDK command" in c.last_error
+    assert c.frames == 0 and c.dropped == 1
+
+
+def test_future_hand_action_is_not_paired_with_older_state(tmp_path):
+    c=RecorderCore(tmp_path,frequency=30)
+    messages=msgset()
+    messages["hand"].q_cmd_timestamp_ns = messages["hand"].timestamp_ns + 1
+    for key,value in messages.items(): c.update(key,value,received=1_000_000_000)
+    start_with_deformation(c)
+    assert not c.sample(now=1_000_000_000)
+    assert "newer than its paired hand state" in c.last_error
     assert c.frames == 0 and c.dropped == 1
 
 def test_repeated_camera_source_timestamp_is_reused_without_duplicate_video_frame(tmp_path):
@@ -200,13 +246,44 @@ def test_partial_tactile_frame_is_saved_and_reports_finger_percentages(tmp_path)
     by_key={item["key"]:item for item in validation["items"]}
     assert "左无名指 100.00%" in by_key["wrench"]["details"]
     assert "右拇指 100.00%" in by_key["deform"]["details"]
+    assert by_key["wrench"]["frames"] == 1
+    assert by_key["wrench"]["missing"] == 0
+    assert by_key["deform"]["frames"] == 1
+    assert by_key["deform"]["missing"] == 0
     assert by_key["wrench"]["finger_missing"] == [{
         "finger":"左无名指", "missing_frames":1, "total_frames":1,
         "ratio_percent":100.0,
     }]
 
 
-def test_classification_moves_sample_and_next_id_stays_global(tmp_path):
+def test_missing_whole_tactile_frame_reduces_frame_rate(tmp_path):
+    c=RecorderCore(tmp_path,frequency=30)
+    import recording_node.recording_node as mod
+    mod._fk=lambda q: ([0.0]*15,[0.0]*15)
+    for key,value in msgset().items(): c.update(key,value,received=1_000_000_000)
+    start_with_deformation(c); assert c.sample(now=1_000_000_000)
+    out=c.stop(save=True); assert out
+
+    force_path=out/"sharpa"/"tactile"/"force6d.npz"
+    with np.load(force_path,allow_pickle=False) as force:
+        force_payload={key:force[key] for key in force.files}
+        force_payload["valid"]=np.zeros_like(force_payload["valid"],dtype=bool)
+        np.savez_compressed(force_path,**force_payload)
+
+    deform_path=out/"sharpa"/"tactile"/"deform_index.npz"
+    with np.load(deform_path,allow_pickle=False) as deform:
+        np.savez_compressed(deform_path,**{key:deform[key][:0] for key in deform.files})
+
+    validation=validate_saved_episode(out,30,{"ok":True,"errors":[]})
+    by_key={item["key"]:item for item in validation["items"]}
+    for key in ("wrench","deform"):
+        assert by_key[key]["frames"] == 0
+        assert by_key[key]["missing"] == 1
+        assert by_key[key]["hz"] == 0.0
+        assert by_key[key]["rate_ok"] is False
+
+
+def test_classification_preserves_timestamp_name(tmp_path):
     c=RecorderCore(tmp_path,frequency=30)
     import recording_node.recording_node as mod
     mod._fk=lambda q: ([0.0]*15,[0.0]*15)
@@ -214,11 +291,15 @@ def test_classification_moves_sample_and_next_id_stays_global(tmp_path):
     start_with_deformation(c); assert c.sample(now=1_000_000_000)
     root_sample=c.stop(save=True); assert root_sample.parent == tmp_path
     destination=c.classify("success")
-    assert destination == tmp_path/"success"/"sample_0000"
+    assert re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{6}",
+        root_sample.name,
+    )
+    assert destination == tmp_path/"success"/root_sample.name
     assert destination.is_dir() and not root_sample.exists()
     assert c.status()["validation"]["category"] == "success"
     assert c.start()
-    assert c.writer.episode_id == 1
+    assert c.writer.episode_id != root_sample.name
     c.stop(save=False)
 
 

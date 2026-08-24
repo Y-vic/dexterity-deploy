@@ -38,6 +38,8 @@ def _common_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
         _argument("hardware_python_paths", str(external_root / "realsense-python")),
         _argument("sharpa_sdk_root", str(external_root / "sharpa-wave-sdk-5.0.7")),
         _argument("sharpa_skip_tactile", "false"),
+        _argument("ur_max_abs_joint_rad", "6.28"),
+        _argument("ur_max_joint_step_rad", "0.35"),
         _argument("enable_payload_configuration", "true"),
         _argument("left_payload_mass_kg", "1.3"),
         _argument("left_payload_cog_m", "[0.0, 0.0, 0.08]"),
@@ -98,6 +100,22 @@ def _environment() -> list[SetEnvironmentVariable]:
     ]
 
 
+def _ur_motion_parameters(mode: str) -> dict:
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}, received {mode!r}")
+    return {
+        "enable_motion_limits": True,
+        "enable_joint_step_limit": True,
+        "enable_joint_clip": True,
+        "max_abs_joint_rad": ParameterValue(
+            LaunchConfiguration("ur_max_abs_joint_rad"), value_type=float
+        ),
+        "max_joint_step_rad": ParameterValue(
+            LaunchConfiguration("ur_max_joint_step_rad"), value_type=float
+        ),
+    }
+
+
 def _shared_nodes(mode: str) -> list:
     camera = Node(
         package="camera_node",
@@ -137,9 +155,7 @@ def _shared_nodes(mode: str) -> list:
             name="ur_node",
             output="screen",
             parameters=[{
-                "enable_motion_limits": True,
-                "enable_joint_step_limit": mode == "deploy",
-                "enable_joint_clip": mode == "deploy",
+                **_ur_motion_parameters(mode),
                 "enable_payload_configuration": ParameterValue(
                     LaunchConfiguration("enable_payload_configuration"), value_type=bool
                 ),
@@ -197,7 +213,7 @@ def _shared_nodes(mode: str) -> list:
 def _teleop_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
     external_root = workspace_root / "external"
     return [
-        _argument("recording_root", str(workspace_root / "episodes")),
+        _argument("recording_root", "/media/yns/T9/0824_yns_unscrew_cap"),
         _argument("monitor_port", "8080"),
         _argument("vive_zmq_address", "tcp://172.16.13.167:5555"),
         _argument("vive_pose_filter_enabled", "true"),
@@ -215,11 +231,6 @@ def _teleop_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
         _argument("manus_retarget_python", "/usr/bin/python3"),
         _argument("manus_start_hardware", "true"),
         _argument("manus_client_use_sudo", "false"),
-        _argument("manus_restart_enabled", "true"),
-        _argument("manus_restart_cooldown_s", "3.0"),
-        _argument("manus_restart_max_attempts", "3"),
-        _argument("manus_restart_window_s", "60.0"),
-        _argument("manus_restart_slow_interval_s", "30.0"),
         _argument("manus_startup_grace_s", "8.0"),
         _argument("manus_raw_timeout_s", "2.0"),
         _argument("manus_incomplete_hand_timeout_s", "1.0"),
@@ -272,6 +283,9 @@ def _teleop_nodes() -> list[Node]:
                 "max_rotation_delta_rad": ParameterValue(
                     LaunchConfiguration("vive_max_rotation_delta_rad"), value_type=float
                 ),
+                "max_joint_step_rad": ParameterValue(
+                    LaunchConfiguration("ur_max_joint_step_rad"), value_type=float
+                ),
             }],
         ),
         Node(
@@ -286,11 +300,6 @@ def _teleop_nodes() -> list[Node]:
                 "retarget_python": LaunchConfiguration("manus_retarget_python"),
                 "start_hardware": ParameterValue(LaunchConfiguration("manus_start_hardware"), value_type=bool),
                 "client_use_sudo": ParameterValue(LaunchConfiguration("manus_client_use_sudo"), value_type=bool),
-                "restart_enabled": ParameterValue(LaunchConfiguration("manus_restart_enabled"), value_type=bool),
-                "restart_cooldown_s": ParameterValue(LaunchConfiguration("manus_restart_cooldown_s"), value_type=float),
-                "restart_max_attempts": ParameterValue(LaunchConfiguration("manus_restart_max_attempts"), value_type=int),
-                "restart_window_s": ParameterValue(LaunchConfiguration("manus_restart_window_s"), value_type=float),
-                "restart_slow_interval_s": ParameterValue(LaunchConfiguration("manus_restart_slow_interval_s"), value_type=float),
                 "startup_grace_s": ParameterValue(LaunchConfiguration("manus_startup_grace_s"), value_type=float),
                 "raw_timeout_s": ParameterValue(LaunchConfiguration("manus_raw_timeout_s"), value_type=float),
                 "incomplete_hand_timeout_s": ParameterValue(LaunchConfiguration("manus_incomplete_hand_timeout_s"), value_type=float),
@@ -330,6 +339,16 @@ def _deploy_arguments() -> list[DeclareLaunchArgument]:
         _argument("dashboard_port", "8088"),
         _argument("policy_server_url", "ws://127.0.0.1:5500/infer"),
         _argument("policy_prompt", ""),
+        _argument(
+            "replay_sample_dir",
+            "/media/yns/T9/0824_yns_unscrew_cap/success/"
+            "2026-08-24_16-01-44.683076",
+        ),
+        _argument("replay_execution_steps", "40"),
+        _argument("replay_frequency_hz", "30.0"),
+        _argument("replay_joint_source", "measured"),
+        _argument("replay_loop", "false"),
+        _argument("replay_dry_run", "true"),
     ]
 
 
@@ -365,6 +384,28 @@ def _deploy_nodes() -> list[Node]:
             executable="actor_ik_node",
             name="actor_ik_node",
             output="screen",
+        ),
+        Node(
+            package="replay_node",
+            executable="replay_node",
+            name="replay_node",
+            output="screen",
+            parameters=[{
+                "sample_dir": LaunchConfiguration("replay_sample_dir"),
+                "execution_steps": ParameterValue(
+                    LaunchConfiguration("replay_execution_steps"), value_type=int
+                ),
+                "frequency_hz": ParameterValue(
+                    LaunchConfiguration("replay_frequency_hz"), value_type=float
+                ),
+                "joint_source": LaunchConfiguration("replay_joint_source"),
+                "loop": ParameterValue(
+                    LaunchConfiguration("replay_loop"), value_type=bool
+                ),
+                "dry_run": ParameterValue(
+                    LaunchConfiguration("replay_dry_run"), value_type=bool
+                ),
+            }],
         ),
     ]
 

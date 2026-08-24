@@ -30,8 +30,8 @@ bool right_valid
 
 # Last full 44D target successfully handed to the SharpA SDK. This is the
 # executed-command cache used by recording; it is not inferred from measured q.
-# q_cmd_valid is false after a stop, command failure, partial-hand command, or
-# when the cache is stale. q_cmd_source uses HandCommand.SOURCE_* values.
+# q_cmd_valid is false after a stop/source transition, SDK command failure, or
+# partial-hand command. q_cmd_source uses HandCommand.SOURCE_* values.
 float32[44] q_cmd
 bool q_cmd_valid
 uint64 q_cmd_timestamp_ns

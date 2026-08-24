@@ -393,6 +393,8 @@ class UrRtdePair:
             raise ValueError("UR control ready poll interval must be positive")
         if self.max_joint_step_rad <= 0.0:
             raise ValueError("UR max joint step must be positive")
+        if not np.isfinite(self.max_abs_joint_rad) or self.max_abs_joint_rad <= 0.0:
+            raise ValueError("UR absolute joint limit must be finite and positive")
         if not np.isfinite(self.servo_speed) or self.servo_speed <= 0.0:
             raise ValueError("UR servo speed must be positive")
         if not np.isfinite(self.servo_acceleration) or self.servo_acceleration <= 0.0:
@@ -1242,6 +1244,32 @@ class SharpADevicePair:
         # action with the dispatched target rather than the pre-limit request.
         return {side: targets[side].copy() for side in active}
 
+    def set_control_mode(self, mode: Any) -> None:
+        """Set a control mode on each connected hand."""
+        if not self.enable_control:
+            return
+        if self.sdk is None:
+            raise HardwareCommandError("SharpA SDK is unavailable")
+        for side in SIDES:
+            hand = self.hands.get(side)
+            if hand is None:
+                continue
+            error = hand.set_control_mode(mode)
+            if getattr(error, "code", -1) != 0:
+                raise HardwareCommandError(
+                    f"SharpA {side} control mode failed: {getattr(error, 'message', '')}"
+                )
+
+    def set_floating(self) -> None:
+        """Enable gravity compensation for manual hand adjustment."""
+        if self.sdk is not None:
+            self.set_control_mode(self.sdk.ControlMode.FLOATING)
+
+    def set_position_control(self) -> None:
+        """Restore SDK position control before a commanded trajectory."""
+        if self.sdk is not None:
+            self.set_control_mode(self.sdk.ControlMode.POSITION)
+
     def move_joint_ramp(
         self,
         left_joint: Any,
@@ -1366,21 +1394,25 @@ class _ThreadedCamera:
     def __init__(
         self,
         jpeg_quality: int = 90,
-        raw_queue_size: int = 8,
-        process_encode: bool = True,
+        raw_queue_size: int = 0,
+        process_encode: bool = False,
+        encode_workers: int = 1,
     ) -> None:
         self.jpeg_quality = int(jpeg_quality)
         self.raw_queue_size = int(raw_queue_size)
-        if self.raw_queue_size <= 0:
-            raise ValueError("camera raw queue size must be positive")
+        if self.raw_queue_size < 0:
+            raise ValueError("camera raw queue size must be non-negative")
         self.process_encode = bool(process_encode)
+        self.encode_workers = int(encode_workers)
+        if self.encode_workers <= 0:
+            raise ValueError("camera encode worker count must be positive")
         self._latest: CameraSnapshot | None = None
         self._lock = threading.Lock()
         self._raw_ready = threading.Condition(self._lock)
         self._raw_queue: deque[tuple[int, np.ndarray]] = deque()
         self._stop = threading.Event()
         self._capture_thread: threading.Thread | None = None
-        self._encode_thread: threading.Thread | None = None
+        self._encode_threads: list[threading.Thread] = []
         self._encode_executor: ProcessPoolExecutor | None = None
         self.last_capture_error = ""
         self.last_encode_error = ""
@@ -1397,7 +1429,7 @@ class _ThreadedCamera:
         self._stop.clear()
         if self.process_encode:
             self._encode_executor = ProcessPoolExecutor(
-                max_workers=1,
+                max_workers=self.encode_workers,
                 mp_context=multiprocessing.get_context("spawn"),
             )
             self._encode_executor.submit(
@@ -1408,12 +1440,16 @@ class _ThreadedCamera:
         self._capture_thread = threading.Thread(
             target=self._capture_loop, name=self.thread_name, daemon=True
         )
-        self._encode_thread = threading.Thread(
-            target=self._encode_loop,
-            name=f"{self.thread_name}-jpeg",
-            daemon=True,
-        )
-        self._encode_thread.start()
+        self._encode_threads = [
+            threading.Thread(
+                target=self._encode_loop,
+                name=f"{self.thread_name}-jpeg-{index}",
+                daemon=True,
+            )
+            for index in range(self.encode_workers)
+        ]
+        for thread in self._encode_threads:
+            thread.start()
         self._capture_thread.start()
 
     def _capture_loop(self) -> None:
@@ -1426,7 +1462,10 @@ class _ThreadedCamera:
                 sampled_at_ns = self._sample_timestamp_ns()
                 raw = np.asarray(bgr, dtype=np.uint8).copy()
                 with self._raw_ready:
-                    if len(self._raw_queue) >= self.raw_queue_size:
+                    if (
+                        self.raw_queue_size > 0
+                        and len(self._raw_queue) >= self.raw_queue_size
+                    ):
                         self._raw_queue.popleft()
                         self.dropped_raw_count += 1
                     self._raw_queue.append((sampled_at_ns, raw))
@@ -1466,7 +1505,13 @@ class _ThreadedCamera:
                     jpeg=jpeg,
                 )
                 with self._lock:
-                    self._latest = snapshot
+                    # Parallel Ego encoders may finish a neighbouring pair in
+                    # reverse order. Never move the published stream backward.
+                    if (
+                        self._latest is None
+                        or snapshot.timestamp_ns > self._latest.timestamp_ns
+                    ):
+                        self._latest = snapshot
                     self.encoded_count += 1
                 self.last_encode_error = ""
             except Exception as exc:
@@ -1485,12 +1530,12 @@ class _ThreadedCamera:
             self._raw_ready.notify_all()
         if self._capture_thread is not None:
             self._capture_thread.join(timeout=2.0)
-        if self._encode_thread is not None:
-            self._encode_thread.join(timeout=2.0)
+        for thread in self._encode_threads:
+            thread.join(timeout=2.0)
         if self._encode_executor is not None:
             self._encode_executor.shutdown(wait=False, cancel_futures=True)
         self._capture_thread = None
-        self._encode_thread = None
+        self._encode_threads = []
         self._encode_executor = None
 
 
@@ -1513,7 +1558,10 @@ class ZedEgoCamera(_ThreadedCamera):
         serial_number: int | None = None,
         jpeg_quality: int = 90,
     ) -> None:
-        super().__init__(jpeg_quality=jpeg_quality)
+        # HD720 JPEG encoding was the Ego bottleneck (~22 delivered Hz while
+        # capture remained ~28-30 Hz). Two ordered latest-frame workers keep
+        # encoding capacity above capture rate without changing wrist cameras.
+        super().__init__(jpeg_quality=jpeg_quality, encode_workers=2)
         self.resolution = str(resolution)
         self.frequency_hz = int(frequency_hz)
         self.serial_number = serial_number

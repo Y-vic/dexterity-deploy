@@ -7,7 +7,10 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("port", default_value="8080"),
-        DeclareLaunchArgument("recording_root", default_value="./episodes"),
+        DeclareLaunchArgument(
+            "recording_root",
+            default_value="/media/yns/T9/0824_yns_unscrew_cap",
+        ),
         DeclareLaunchArgument("upload_host", default_value="BAAI"),
         DeclareLaunchArgument(
             "upload_path",

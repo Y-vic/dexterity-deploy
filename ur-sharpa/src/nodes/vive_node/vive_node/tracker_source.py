@@ -389,6 +389,26 @@ def limit_pose_delta(
     return limited
 
 
+def limit_ur_tcp_target(
+    kinematics: Any,
+    side: str,
+    measured_joint: Any,
+    desired_capture_tcp: Any,
+    max_translation_delta_m: float,
+    max_rotation_delta_rad: float,
+) -> np.ndarray:
+    measured_ur_tcp = kinematics.arm_fk(measured_joint)
+    desired_ur_tcp = kinematics.geometry.capture_tcp_to_ur_base_tcp(
+        desired_capture_tcp, side
+    )
+    return limit_pose_delta(
+        measured_ur_tcp,
+        desired_ur_tcp,
+        max_translation_delta_m,
+        max_rotation_delta_rad,
+    )
+
+
 class TrackerLatch:
     def __init__(self) -> None:
         self._lock = threading.Lock()

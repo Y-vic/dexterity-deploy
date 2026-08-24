@@ -10,7 +10,7 @@ from .tracker_source import (
     DEFAULT_ZMQ_ADDRESS,
     ZmqTrackerReceiver,
     apply_relative_pose_delta,
-    limit_pose_delta,
+    limit_ur_tcp_target,
     retarget_vive_wrist,
 )
 
@@ -19,6 +19,22 @@ VIVE_PUBLISHER_HINT = (
     r"Windows: cd D:\project\DexCap\STEP1_collect_data_202408updates "
     r"&& python .\vive_process_send.py"
 )
+
+
+def validate_ik_joint_step(current, target, max_delta, side):
+    current_array = np.asarray(current, dtype=np.float64).reshape(-1)
+    target_array = np.asarray(target, dtype=np.float64).reshape(-1)
+    limit = float(max_delta)
+    if current_array.shape != (6,) or target_array.shape != (6,):
+        raise ValueError("IK joint vectors must have shape (6,)")
+    if not np.isfinite(current_array).all() or not np.isfinite(target_array).all():
+        raise ValueError("IK joint vectors must be finite")
+    if not np.isfinite(limit) or limit <= 0.0:
+        raise ValueError("max_delta must be finite and positive")
+    delta = (target_array - current_array + np.pi) % (2.0 * np.pi) - np.pi
+    if np.any(np.abs(delta) > limit + 1.0e-9):
+        raise RuntimeError(f"{side} IK joint step exceeds {limit:.3f} rad")
+    return delta
 
 
 def vive_side_validity(frame, stale_topics):
@@ -60,6 +76,7 @@ def main(args=None):
             self.declare_parameter("derivative_cutoff_hz", 1.0)
             self.declare_parameter("max_translation_delta_m", 0.03)
             self.declare_parameter("max_rotation_delta_rad", 0.12)
+            self.declare_parameter("max_joint_step_rad", 0.35)
             self.declare_parameter("initial_joint_tolerance_rad", 0.05)
             self.address = str(self.get_parameter("zmq_address").value)
             self.stale_timeout_s = float(
@@ -105,6 +122,9 @@ def main(args=None):
             self.max_rotation_delta_rad = float(
                 self.get_parameter("max_rotation_delta_rad").value
             )
+            self.max_joint_step_rad = float(
+                self.get_parameter("max_joint_step_rad").value
+            )
             self.initial_joint_tolerance_rad = float(
                 self.get_parameter("initial_joint_tolerance_rad").value
             )
@@ -120,6 +140,8 @@ def main(args=None):
                 raise ValueError("max_rotation_delta_rad must be finite and positive")
             if self.initial_joint_tolerance_rad <= 0.0:
                 raise ValueError("initial_joint_tolerance_rad must be positive")
+            if not np.isfinite(self.max_joint_step_rad) or self.max_joint_step_rad <= 0.0:
+                raise ValueError("max_joint_step_rad must be finite and positive")
             self.pose_filters = {
                 side: AdaptivePoseFilter(**pose_filter_config)
                 for side in ("left", "right")
@@ -151,13 +173,10 @@ def main(args=None):
             self._head_origin = None
             self._tracker_origin = {}
             self._robot_origin = {}
-            self._robot_joint_origin = {}
-            self._last_tcp_targets = {}
             self._calibrated = {"left": False, "right": False}
             self._first_command_pending = {"left": True, "right": True}
             self._motion_ready = {"left": False, "right": False}
             self._last_wrist_sequence = {"left": 0, "right": 0}
-            self._last_solutions = {}
             self._last_command_monotonic = 0.0
             self._last_command_monotonic_by_side = {"left": 0.0, "right": 0.0}
             self._last_ik_error = {"left": "", "right": ""}
@@ -219,9 +238,6 @@ def main(args=None):
                 self._motion_ready[current_side] = False
                 self._tracker_origin.pop(current_side, None)
                 self._robot_origin.pop(current_side, None)
-                self._robot_joint_origin.pop(current_side, None)
-                self._last_tcp_targets.pop(current_side, None)
-                self._last_solutions.pop(current_side, None)
                 self._last_wrist_sequence[current_side] = 0
                 self.pose_filters[current_side].reset()
                 self.kinematics.reset(side=current_side)
@@ -245,11 +261,7 @@ def main(args=None):
                     )
                 self._tracker_origin[side] = target.copy()
                 self._robot_origin[side] = self.measured_capture_tcp[side].copy()
-                self._robot_joint_origin[side] = self.measured_joint[side].copy()
-                self.seeds[side] = self._robot_joint_origin[side].copy()
-                self._last_solutions[side] = self._robot_joint_origin[side].astype(
-                    np.float32
-                )
+                self.seeds[side] = self.measured_joint[side].copy()
                 self.pose_filters[side].reset(
                     self._robot_origin[side], time.monotonic()
                 )
@@ -261,13 +273,6 @@ def main(args=None):
                 self._robot_origin[side],
                 self.translation_scale,
             )
-
-        @staticmethod
-        def _joint_delta(target, origin):
-            delta = np.asarray(target, dtype=np.float64) - np.asarray(
-                origin, dtype=np.float64
-            )
-            return (delta + np.pi) % (2.0 * np.pi) - np.pi
 
         def _tick(self):
             frame = self.receiver.latch.peek()
@@ -308,18 +313,13 @@ def main(args=None):
                             target = self.pose_filters[side].update(
                                 target, time.monotonic()
                             )
-                        target = (
-                            target.copy()
-                            if side not in self._last_tcp_targets
-                            else limit_pose_delta(
-                                self._last_tcp_targets[side],
-                                target,
-                                self.max_translation_delta_m,
-                                self.max_rotation_delta_rad,
-                            )
-                        )
-                        ur_base_target = self.kinematics.geometry.capture_tcp_to_ur_base_tcp(
-                            target, side
+                        ur_base_target = limit_ur_tcp_target(
+                            self.kinematics,
+                            side,
+                            self.measured_joint[side],
+                            target,
+                            self.max_translation_delta_m,
+                            self.max_rotation_delta_rad,
                         )
                         solution = np.asarray(
                             self.kinematics.arm_ik(
@@ -330,25 +330,16 @@ def main(args=None):
                             ),
                             dtype=np.float32,
                         )
-                        if self._first_command_pending[side]:
-                            max_delta = float(
-                                np.max(
-                                    np.abs(
-                                        self._joint_delta(
-                                            solution, self._robot_joint_origin[side]
-                                        )
-                                    )
-                                )
-                            )
-                            if max_delta > self.initial_joint_tolerance_rad:
-                                raise RuntimeError(
-                                    f"initial {side} IK differs from measured joints "
-                                    f"by {max_delta:.4f} rad"
-                                )
-                            self._first_command_pending[side] = False
-                        self._last_solutions[side] = solution
+                        joint_limit = (
+                            self.initial_joint_tolerance_rad
+                            if self._first_command_pending[side]
+                            else self.max_joint_step_rad
+                        )
+                        validate_ik_joint_step(
+                            self.measured_joint[side], solution, joint_limit, side
+                        )
+                        self._first_command_pending[side] = False
                         self.seeds[side] = solution
-                        self._last_tcp_targets[side] = target.copy()
                         self._motion_ready[side] = True
                         command = ArmCommand()
                         command.source = ArmCommand.SOURCE_VIVE

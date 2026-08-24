@@ -9,12 +9,13 @@ from vive_node.tracker_source import (
     TrackerLatch,
     apply_relative_pose_delta,
     limit_pose_delta,
+    limit_ur_tcp_target,
     parse_tracker_message,
     retarget_vive_frame,
     retarget_vive_wrist,
 )
-from ur_common.geometry import matrix_to_rotvec, rotvec_to_matrix
-from vive_node.vive_node import vive_side_validity
+from ur_common.geometry import UrSharpAWireGeometry, matrix_to_rotvec, rotvec_to_matrix
+from vive_node.vive_node import validate_ik_joint_step, vive_side_validity
 
 
 def message(topic, position, orientation=None):
@@ -305,3 +306,45 @@ def test_pose_delta_rejects_invalid_limits(
         limit_pose_delta(
             np.eye(4), np.eye(4), translation_limit, rotation_limit
         )
+
+
+def test_ur_tcp_delta_is_limited_after_capture_frame_conversion():
+    class FakeKinematics:
+        geometry = UrSharpAWireGeometry()
+
+        @staticmethod
+        def arm_fk(_joint):
+            return np.eye(4)
+
+    kinematics = FakeKinematics()
+    measured_ur_tcp = np.eye(4)
+    measured_capture_tcp = kinematics.geometry.ur_base_tcp_to_capture_tcp(
+        measured_ur_tcp, "left"
+    )
+    desired_capture_tcp = measured_capture_tcp.copy()
+    desired_capture_tcp[:3, 3] += (0.10, -0.04, 0.02)
+    desired_capture_tcp[:3, :3] = (
+        desired_capture_tcp[:3, :3]
+        @ rotvec_to_matrix((0.0, 0.0, 0.6))
+    )
+
+    limited = limit_ur_tcp_target(
+        kinematics, "left", np.zeros(6), desired_capture_tcp, 0.03, 0.12
+    )
+
+    assert np.linalg.norm(limited[:3, 3] - measured_ur_tcp[:3, 3]) == pytest.approx(0.03)
+    relative_rotation = measured_ur_tcp[:3, :3].T @ limited[:3, :3]
+    assert np.linalg.norm(matrix_to_rotvec(relative_rotation)) == pytest.approx(0.12)
+
+
+def test_vive_rejects_ik_branch_jump_against_measured_joints():
+    with pytest.raises(RuntimeError, match="left IK joint step exceeds"):
+        validate_ik_joint_step(np.zeros(6), [0.0, 0.0, 0.0, 0.0, 0.36, 0.0], 0.35, "left")
+
+
+def test_vive_joint_step_treats_full_turn_as_equivalent():
+    delta = validate_ik_joint_step(
+        np.zeros(6), [2.0 * np.pi + 0.1, 0.0, 0.0, 0.0, 0.0, 0.0], 0.35, "left"
+    )
+
+    assert delta[0] == pytest.approx(0.1)

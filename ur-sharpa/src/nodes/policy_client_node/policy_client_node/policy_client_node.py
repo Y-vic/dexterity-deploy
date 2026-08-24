@@ -105,6 +105,11 @@ class PolicyClientCore:
         self.gate.reset()
 
 
+def completion_belongs_to_session(message: Any, session_id: str) -> bool:
+    """Keep another execution provider's terminal events out of the policy gate."""
+    return bool(session_id) and str(message.session_id) == str(session_id)
+
+
 def deployment_ready(ur_state: int, sharpa_state: int, active_source: int) -> bool:
     return int(ur_state) == 2 and int(sharpa_state) == 1 and int(active_source) == 3
 
@@ -205,6 +210,8 @@ def main(args=None) -> None:
             self._client = ServerClient(self._server_config)
             self._metadata = None; self._started = False; self._busy = False; self._pending = None
             self._control_ready = False
+            self._machine_control_ready = False
+            self._execution_provider = "policy"
             self._model_available = False
             self._model_generation = -1
             self._model_phase = "stopped"
@@ -230,6 +237,12 @@ def main(args=None) -> None:
             self.create_subscription(String, "/policy/execution_done_json", self._done, 10)
             self.create_subscription(ExecutionDone, "/policy/execution_done", self._done_msg, 10)
             self.create_subscription(ControlStatus, "/control/status", self._control_status, 10)
+            self.create_subscription(
+                String,
+                "/control/execution_provider",
+                self._provider_status,
+                10,
+            )
             self.create_subscription(String, "/model/status", self._model_status, 10)
             self._timer = self.create_timer(0.1, self._tick)
             self._status_timer = self.create_timer(1.0, lambda: self._publish({}))
@@ -251,6 +264,7 @@ def main(args=None) -> None:
                 "model_port": self._model_port,
                 "model_identity_ok": self._model_identity_ok,
                 "model_identity_error": self._model_identity_error,
+                "execution_provider": self._execution_provider,
                 "inference_count": self._inference_count,
                 "last_request_id": self._last_request_id,
                 "latency_s": self._last_latency_s,
@@ -307,17 +321,38 @@ def main(args=None) -> None:
                 self._publish({"phase": "fault", "error": str(exc)})
 
         def _control_status(self, message):
-            self._control_ready = deployment_ready(
+            self._machine_control_ready = deployment_ready(
                 message.ur_state, message.sharpa_state, message.active_source
             )
-            reason = "" if self._control_ready else "waiting for UR and SharpA actor control"
+            self._control_ready = bool(
+                self._machine_control_ready and self._execution_provider == "policy"
+            )
+            reason = "" if self._control_ready else (
+                "policy disabled: replay provider selected"
+                if self._execution_provider != "policy"
+                else "waiting for UR and SharpA actor control"
+            )
             if reason and reason != self._last_waiting_reason:
                 self._publish({"phase": "waiting", "reason": reason})
             self._last_waiting_reason = reason
 
+        def _provider_status(self, message):
+            provider = str(message.data).strip().lower()
+            if provider not in {"policy", "replay"}:
+                return
+            self._execution_provider = provider
+            self._control_ready = bool(
+                self._machine_control_ready and provider == "policy"
+            )
+            if provider != "policy":
+                self._publish(
+                    {"phase": "waiting", "reason": "policy disabled: replay provider selected"}
+                )
+
         def _tick(self):
             if self._busy or not self._core.ready: return
             try:
+                if self._execution_provider != "policy": return
                 if not self._model_available: return
                 if not self._started:
                     self._metadata = self._client.connect()
@@ -357,7 +392,7 @@ def main(args=None) -> None:
                 response = future.result()
                 if not response.success:
                     self._core.cancel_request(); self._publish({"phase": "waiting", "error": response.error_message}); return
-                if not self._control_ready:
+                if not self._control_ready or self._execution_provider != "policy":
                     self._core.cancel_request(); self._publish({"phase": "waiting", "reason": "control state changed before inference"}); return
                 payload = unpackb(bytes(response.observation_msgpack), max_size=int(self._metadata.get("max_message_size", 64 * 1024 * 1024)))
                 server_payload = self._server_pose.observation_to_server(payload)
@@ -397,6 +432,8 @@ def main(args=None) -> None:
                 self._publish({"phase": "fault", "error": str(exc)})
 
         def _done_msg(self, message):
+            if not completion_belongs_to_session(message, self._core.session_id):
+                return
             self._done(String(data=json.dumps({"schema": "sharpa_execution_done.v1", "session_id": message.session_id, "request_id": int(message.request_id), "action_id": message.action_id, "revision": int(message.revision), "execute_start": int(message.execute_start), "execute_length": int(message.execute_length), "executed_steps": int(message.executed_steps), "success": bool(message.success), "done": True, "error": message.error or None})))
 
     rclpy.init(args=args); node = RosPolicyClientNode()

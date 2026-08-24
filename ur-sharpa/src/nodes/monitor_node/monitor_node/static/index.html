@@ -208,7 +208,7 @@
         <div class="section-head"><h2>Bias 校准</h2><span class="hint" id="bias-phase">idle</span></div>
         <div class="panel bias-panel">
           <p class="bias-copy">先在 UR 上位机把双臂调整到合适位置，再保存为新的复位基准。之后每次“机器复位”都会使用该 Bias。</p>
-          <button class="secondary" data-action="save_bias">保存当前位置为 Bias</button>
+          <button class="secondary" id="save-bias" data-action="save_bias">保存当前位置为 Bias</button>
           <div class="bias-result" id="bias-detail">尚未执行 Bias 操作</div>
         </div>
       </div>
@@ -240,6 +240,7 @@
             </div>
             <div class="remote-path-display" title=""><strong>远端模型路径</strong><code id="remote-model-path">—</code></div>
             <div class="path-actions"><button class="secondary" id="save-paths">保存路径</button><button id="upload-data">上传最新 Sample</button></div>
+            <div class="state-line"><span class="pill">成功<strong id="saved-success">0</strong></span><span class="pill">失败<strong id="saved-fail">0</strong></span><span class="pill">未定义<strong id="saved-undefined">0</strong></span></div>
           </div>
         </div>
         <div class="validation-wrap" id="record-validation" hidden>
@@ -342,76 +343,62 @@
       setDevice('vive', viveOk ? ((viveArms.left && viveArms.right) ? 'ok' : 'warn') : (vive.receiver_running ? 'warn' : 'bad'), viveOk ? 'Tracker Online' : (vive.receiver_running ? 'Windows 数据桥未启动' : 'ROS 节点离线'), viveDetail);
       const manusOk = Boolean(manus.online && manus.valid);
       const manusSides = `${manus.left_valid ? 'L✓' : 'L×'} ${manus.right_valid ? 'R✓' : 'R×'}`;
-      const manusRestartAttempts = Math.max(0, finite(manus.restart_attempts));
-      const manusRestartMax = Math.max(1, finite(manus.restart_max_attempts, 3));
-      let manusState;
-      let manusValue;
-      let manusDetail;
-      if (manus.restart_slow_retry) {
-        manusState = 'warn';
-        manusValue = `30秒重试 ${manusRestartAttempts}/${manusRestartMax}`;
-        manusDetail = `${manusSides} · ${manus.error || manus.restart_reason || 'Manus 后台持续恢复中'}`;
-      } else if (manus.restart_failed) {
-        manusState = 'bad';
-        manusValue = `恢复失败 ${manusRestartAttempts}/${manusRestartMax}`;
-        manusDetail = `${manusSides} · ${manus.error || manus.restart_reason || '请检查手套连接并重启 Teleop'}`;
-      } else if (manus.restart_pending || manus.restart_phase === 'restarting') {
-        manusState = 'warn';
-        manusValue = `正在重启 ${manusRestartAttempts}/${manusRestartMax}`;
-        manusDetail = `${manusSides} · ${manus.restart_reason || manus.error || '正在重启 Manus 链路'}`;
-      } else if (manus.restart_phase === 'recovering') {
-        manusState = 'warn';
-        manusValue = `恢复检查 ${manusRestartAttempts}/${manusRestartMax}`;
-        manusDetail = `${manusSides} · ${manus.error || manus.restart_reason || '等待双手恢复'}`;
-      } else {
-        manusState = manusOk ? ((manus.left_valid && manus.right_valid) ? 'ok' : 'warn') : (manus.client_alive || manus.retarget_alive ? 'warn' : 'bad');
-        manusValue = manusOk ? 'Online' : 'Offline';
-        manusDetail = `${manusSides} · ${manus.error || (manus.hardware_started ? '等待手套数据' : '硬件未启动')}`;
-      }
+      const manusState = manusOk ? ((manus.left_valid && manus.right_valid) ? 'ok' : 'warn') : (manus.client_alive || manus.retarget_alive ? 'warn' : 'bad');
+      const manusValue = manusOk ? 'Online' : 'Offline';
+      const manusDetail = `${manusSides} · ${manus.error || (manus.hardware_started ? '等待手套数据；不会自动重启' : '硬件未启动；请重启 Teleop')}`;
       setDevice('manus', manusState, manusValue, manusDetail);
 
       const cameraOnline = cameraNames.filter(name => cameraStatus[name] && cameraStatus[name].online).length;
       setDevice('camera', cameraOnline === 3 ? 'ok' : (cameraOnline ? 'warn' : 'bad'), `${cameraOnline} / 3 Online`, cameraOnline === 3 ? '三路画面正常' : '查看下方各路画面状态');
       const recorderOnline = Boolean(recorder.online);
       const isRecording = Boolean(recorder.recording || status.record_state === 1);
-      setDevice('recorder', recorderOnline ? 'ok' : 'bad', isRecording ? 'Recording' : (recorderOnline ? 'Ready' : 'Offline'), isRecording ? `${finite(recorder.achieved_rate_hz).toFixed(1)} Hz · ${finite(recorder.frame_count)} frames` : '等待记录命令');
+      const isSaving = Boolean(recorder.saving);
+      setDevice('recorder', recorderOnline ? (isSaving ? 'warn' : 'ok') : 'bad', isSaving ? 'Saving' : (isRecording ? 'Recording' : (recorderOnline ? 'Ready' : 'Offline')), isSaving ? '正在封装视频、写入校验数据…' : (isRecording ? `${finite(recorder.achieved_rate_hz).toFixed(1)} Hz · ${finite(recorder.frame_count)} frames` : '等待记录命令'));
 
       byId('ur-machine-state').textContent = controlOnline ? (urStates[status.ur_state] || '未知') : '控制器离线';
       byId('sharpa-machine-state').textContent = controlOnline ? (sharpaStates[status.sharpa_state] || '未知') : '控制器离线';
       byId('active-source').textContent = sourceNames[status.active_source] || '未知';
-      byId('bias-phase').textContent = bias.phase || 'idle';
-      const biasError = bias.max_error_rad === null || bias.max_error_rad === undefined ? '—' : bias.max_error_rad;
-      byId('bias-detail').textContent = bias.detail || (bias.phase === 'done' ? `完成 · 最大误差 ${biasError} rad` : '尚未执行 Bias 操作');
+      const biasResult = bias.last_result || {};
+      const displayedBiasPhase = bias.active ? bias.phase : (biasResult.phase || bias.phase || 'idle');
+      const biasError = biasResult.max_error_rad === null || biasResult.max_error_rad === undefined ? '—' : biasResult.max_error_rad;
+      byId('bias-phase').textContent = displayedBiasPhase;
+      byId('bias-detail').textContent = bias.detail || biasResult.detail || (displayedBiasPhase === 'done' ? `完成 · 最大误差 ${biasError} rad` : '尚未执行 Bias 操作');
 
       const machineRunning = status.ur_state === 2 && status.sharpa_state === 1;
       const machineReady = status.ur_state === 1 && status.sharpa_state === 0;
       const biasActive = Boolean(bias.active || ['requested', 'homing_ur', 'homing_sharpa'].includes(bias.phase));
+      byId('save-bias').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
       byId('reset-machine').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
       byId('start-machine').disabled = !controlOnline || !urOk || !sharpaOk || !viveOk || !manusOk || machineRunning || !machineReady || biasActive;
       byId('pause-machine').disabled = !controlOnline || !machineRunning;
 
-      byId('record-state').textContent = controlOnline ? (recordStates[status.record_state] || '未知') : '离线';
+      byId('record-state').textContent = isSaving ? '正在保存' : (controlOnline ? (recordStates[status.record_state] || '未知') : '离线');
       byId('sample-id').textContent = recorder.episode_id || status.session_id || '—';
       byId('record-frames').textContent = finite(recorder.frame_count);
       byId('record-rate').textContent = `${finite(recorder.achieved_rate_hz).toFixed(1)} Hz`;
       byId('record-dropped').textContent = finite(recorder.dropped_frames);
       const sampleDuration = recorder.validation && recorder.validation.duration_s !== undefined ? recorder.validation.duration_s : recorder.duration_s;
       byId('record-timeline').textContent = `${finite(sampleDuration).toFixed(1)} s`;
-      renderValidation(recorder.validation, isRecording);
+      renderValidation(recorder.validation, isRecording || isSaving);
       const validationAvailable = Boolean(recorder.validation && recorder.validation.available);
       const category = validationAvailable ? String(recorder.validation.category || '') : '';
-      byId('classification-row').hidden = isRecording || !validationAvailable;
+      byId('classification-row').hidden = isRecording || isSaving || !validationAvailable;
       byId('classification-state').textContent = category ? `已放入 ${category}` : '当前在根目录';
-      byId('mark-success').disabled = isRecording || !validationAvailable || category === 'success';
-      byId('mark-fail').disabled = isRecording || !validationAvailable || category === 'fail';
-      byId('drop-sample').disabled = isRecording || !validationAvailable;
-      byId('start-record').disabled = isRecording;
-      byId('stop-record').disabled = !isRecording;
-      byId('discard-record').disabled = !isRecording;
-      byId('upload-data').disabled = isRecording || payload.uploading;
+      byId('mark-success').disabled = isRecording || isSaving || !validationAvailable || category === 'success';
+      byId('mark-fail').disabled = isRecording || isSaving || !validationAvailable || category === 'fail';
+      byId('drop-sample').disabled = isRecording || isSaving || !validationAvailable;
+      byId('start-record').disabled = isRecording || isSaving;
+      byId('stop-record').disabled = !isRecording || isSaving;
+      byId('stop-record').textContent = isSaving ? '正在保存…' : '停止并保存';
+      byId('discard-record').disabled = !isRecording || isSaving;
+      byId('upload-data').disabled = isRecording || isSaving || payload.uploading;
       byId('upload-data').textContent = payload.uploading ? '正在上传…' : '上传最新 Sample';
 
       if (!pathDirty.local && payload.recording_root !== undefined) byId('local-path').value = payload.recording_root;
+      const recordingCounts = payload.recording_counts || {};
+      byId('saved-success').textContent = finite(recordingCounts.success);
+      byId('saved-fail').textContent = finite(recordingCounts.fail);
+      byId('saved-undefined').textContent = finite(recordingCounts.undefined);
       if (!pathDirty.remote && payload.upload_path !== undefined) byId('remote-path').value = payload.upload_path;
       byId('upload-prefix').textContent = `${payload.upload_host || 'BAAI'}:`;
       const remoteModelPath = String(payload.upload_path || '—');

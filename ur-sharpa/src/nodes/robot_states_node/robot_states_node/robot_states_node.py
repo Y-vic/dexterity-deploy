@@ -125,6 +125,7 @@ def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     from ur_msgs.msg import CameraSet, DeformationFrame, HandStateFrame, PolicyObs, TauFrame, UrStateFrame, WrenchFrame
     from ur_msgs.srv import BuildObservation
@@ -147,7 +148,12 @@ def main(args=None) -> None:
             self._status_pub = self.create_publisher(String, "/robot_states/status", 10)
             self.create_subscription(UrStateFrame, "/ur/state", self._ur, 10)
             self.create_subscription(HandStateFrame, "/sharpa/state", self._hand, 10)
-            self.create_subscription(CameraSet, "/camera/set", self._camera, 10)
+            camera_qos = QoSProfile(
+                depth=1,
+                history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+            )
+            self.create_subscription(CameraSet, "/camera/set", self._camera, camera_qos)
             self.create_subscription(TauFrame, "/sharpa/tau", self._tau, 10)
             self.create_subscription(WrenchFrame, "/sharpa/wrench", self._wrench, 10)
             self.create_subscription(DeformationFrame, "/sharpa/deformation", self._deformation, 1)

@@ -285,6 +285,7 @@ class GateMachine:
 
     mode: str = "teleop"
     camera_max_age_s: float = 0.25
+    execution_provider: str = "policy"
     ur_state: UrState = UrState.STOPPED
     sharpa_state: SharpaState = SharpaState.STOPPED
     record_state: RecordState = RecordState.IDLE
@@ -303,6 +304,9 @@ class GateMachine:
         self.mode = str(self.mode).strip().lower()
         if self.mode not in MODE_SOURCES:
             raise ValueError(f"mode must be one of {sorted(MODE_SOURCES)}")
+        self.execution_provider = str(self.execution_provider).strip().lower()
+        if self.execution_provider not in {"policy", "replay"}:
+            raise ValueError("execution_provider must be policy or replay")
         if self.camera_max_age_s <= 0:
             raise ValueError("camera_max_age_s must be positive")
 
@@ -438,6 +442,30 @@ class GateMachine:
             )
         return self.attempt_run_ur()
 
+    def attempt_set_execution_provider(self, provider: str) -> Outcome:
+        """Select the only executable-action producer actor may accept.
+
+        The selector can only change while the machine gate is closed. This
+        makes a provider change an explicit stopped-state operation instead of
+        allowing policy and replay trajectories to race at the actor input.
+        """
+        requested = str(provider).strip().lower()
+        if self.mode != "deploy":
+            return self._set_reason(
+                f"provider switch blocked: launch mode is {self.mode}, expected deploy"
+            )
+        if requested not in {"policy", "replay"}:
+            return self._set_reason(
+                f"provider switch blocked: unsupported provider {requested!r}"
+            )
+        if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
+            return self._set_reason(
+                "provider switch blocked: stop the machine before switching"
+            )
+        self.execution_provider = requested
+        self._clear_reason()
+        return _ok()
+
     def attempt_pause(self) -> Outcome:
         """Freeze both robots while keeping every teleop process connected."""
         if self.ur_state != UrState.RUNNING or self.sharpa_state != SharpaState.RUNNING:
@@ -530,6 +558,7 @@ class GateMachine:
             "record_state": int(self.record_state),
             "active_source": int(self.active_source),
             "mode": self.mode,
+            "execution_provider": self.execution_provider,
             "machine_ready": self.machine_ready,
             "machine_running": self.ur_state == UrState.RUNNING and self.sharpa_state == SharpaState.RUNNING,
             "ur_hardware_ready": self.ur_hardware_ready,

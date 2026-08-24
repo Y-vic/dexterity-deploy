@@ -106,10 +106,11 @@ SafetyConfig.from_env()      # 读 v1 环境变量，默认按 v1（即全开）
 
 > `SafetyConfig()` 默认全关，`from_env()` 默认全开（对齐 v1 的 `TELEOP_JUMP_GATE=1`）。极性不同，别混。
 
-当前 Vive Teleop 不使用 `enable_jump_gate` 或 `enable_joint_clip`：对齐后的 TCP
-target 会在 IK 前按每帧 `0.03 m` 平移范数和 `0.12 rad` 相对旋转角做 clip，IK
-输出只保留绝对关节范围、多解最近选择和 `enable_flip_hold` 换腕保护。Deploy 与
-Bias 的关节限制保持独立，不受 Teleop 参数影响。
+当前 Vive Teleop 不使用 `enable_jump_gate`，但最终 `ur_node` 出口始终启用关节
+绝对范围与逐命令步长保护。对齐后的 target 会先转换为实际 UR base/TCP，再以
+实时测量 TCP 为基准按 `0.03 m` 平移范数和 `0.12 rad` 相对旋转角做 clip；IK
+结果若相对实测关节超过 `0.35 rad` 也会拒绝。Deploy、Teleop 与 Bias 最终都经过
+同一个 UR 出口，不能绕过这些限制。
 
 ### `enable_flip_hold` 为什么必须留意
 
@@ -130,6 +131,8 @@ v1 `robot_control/ik_solver.py` 明确记录过：曾把 `soft_flip_limit` 设�
 | `flip_threshold` | `None` → 6× vel limit | 换腕判定阈值 |
 | `joint_vel_limit` | 0.35 rad/帧 | |
 | `joint_pos_limit` | ±6.28 ×6 | |
+| `ur_max_joint_step_rad` | 0.35 rad/命令 | `ur_node` 最终出口与 Vive IK 后检查共用 |
+| `ur_max_abs_joint_rad` | ±6.28 rad | `ur_node` 最终出口绝对范围，可由 launch 调整 |
 | `frequency` | 30 Hz | 阈值按速度定义再按频率折算；固定"每帧 5cm"在 30Hz 和 60Hz 含义差一倍 |
 
 阈值取得比人手更宽是刻意的：3.5 m/s 远超正常遥操作（快速挥动约 1.5–2.5 m/s），只拦真毛刺。v1 早期用 0.05m/帧（@30Hz 仅 1.5m/s），把正常快动作误判成坏帧而 hold，导致"快动作卡顿、慢动作正常"。

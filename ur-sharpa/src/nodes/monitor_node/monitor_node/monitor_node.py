@@ -41,6 +41,10 @@ DEFAULT_REMOTE_DATA_PATH = (
 
 
 class MonitorController:
+    RECORDING_NAME = re.compile(
+        r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{6}"
+    )
+
     def __init__(self, recording_root="./episodes", upload_host="BAAI", upload_path=DEFAULT_REMOTE_DATA_PATH, publish_command=None, publish_bias=None, publish_config=None, publish_label=None, status_timeout_s=2.0):
         self.recording_root = str(Path(recording_root).expanduser())
         self.upload_host = str(upload_host)
@@ -65,6 +69,25 @@ class MonitorController:
         self.message = ""
         self._lock = threading.RLock()
         self._camera_condition = threading.Condition(self._lock)
+
+    @staticmethod
+    def _recording_counts(recording_root):
+        root = Path(recording_root)
+
+        def count(parent):
+            try:
+                return sum(
+                    1 for path in parent.iterdir()
+                    if path.is_dir() and MonitorController.RECORDING_NAME.fullmatch(path.name)
+                )
+            except OSError:
+                return 0
+
+        return {
+            "success": count(root / "success"),
+            "fail": count(root / "fail"),
+            "undefined": count(root),
+        }
 
     def snapshot(self):
         with self._lock:
@@ -104,6 +127,7 @@ class MonitorController:
                     "camera_status": camera_status,
                     "recording_root": self.recording_root, "upload_host": self.upload_host,
                     "upload_path": self.upload_path, "uploading": self._uploading,
+                    "recording_counts": self._recording_counts(self.recording_root),
                     "message": self.message}
 
     def camera_frame(self, name):
@@ -227,11 +251,15 @@ class MonitorController:
         samples = []
         for category in ("", "success", "fail"):
             parent = root if not category else root / category
-            for path in parent.glob("sample_*"):
-                match = re.fullmatch(r"sample_(\d+)", path.name)
-                if path.is_dir() and match:
-                    samples.append((int(match.group(1)), path.stat().st_mtime_ns, category, path))
-        samples = [(category, path) for _, _, category, path in sorted(samples, reverse=True)]
+            if not parent.is_dir():
+                continue
+            for path in parent.iterdir():
+                if (
+                    path.is_dir()
+                    and self.RECORDING_NAME.fullmatch(path.name)
+                ):
+                    samples.append((path.stat().st_mtime_ns, category, path))
+        samples = [(category, path) for _, category, path in sorted(samples, reverse=True)]
         if not samples: return "upload failed: no completed sample"
         category, sample = samples[0]; manifest = sample / "manifest.json"
         try:
@@ -336,7 +364,7 @@ if ROS_AVAILABLE:
     class MonitorNode(Node):
         def __init__(self):
             super().__init__("monitor_node")
-            for name, default in (("port", 8080), ("recording_root", "./episodes"), ("upload_host", "BAAI"), ("upload_path", DEFAULT_REMOTE_DATA_PATH), ("status_timeout_s", 2.0)):
+            for name, default in (("port", 8080), ("recording_root", "/media/yns/T9/0824_yns_unscrew_cap"), ("upload_host", "BAAI"), ("upload_path", DEFAULT_REMOTE_DATA_PATH), ("status_timeout_s", 2.0)):
                 self.declare_parameter(name, default)
             self.declare_parameter("shared_memory_prefix", "ur_sharpa_camera_v1")
             qos = QoSProfile(depth=10); camera_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT)

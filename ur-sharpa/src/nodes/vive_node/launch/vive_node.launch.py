@@ -19,6 +19,7 @@ def generate_launch_description():
         DeclareLaunchArgument("derivative_cutoff_hz", default_value="1.0"),
         DeclareLaunchArgument("max_translation_delta_m", default_value="0.03"),
         DeclareLaunchArgument("max_rotation_delta_rad", default_value="0.12"),
+        DeclareLaunchArgument("max_joint_step_rad", default_value="0.35"),
         Node(
             package="vive_node",
             executable="vive_node",
@@ -58,6 +59,9 @@ def generate_launch_description():
                 ),
                 "max_rotation_delta_rad": ParameterValue(
                     LaunchConfiguration("max_rotation_delta_rad"), value_type=float
+                ),
+                "max_joint_step_rad": ParameterValue(
+                    LaunchConfiguration("max_joint_step_rad"), value_type=float
                 ),
             }],
         ),

@@ -1,7 +1,7 @@
 import signal
 import subprocess
 
-from manus_node.manus_node import ManusHealthTracker, RestartLimiter, terminate_process_group
+from manus_node.manus_node import ManusHealthTracker, terminate_process_group
 
 
 class FakeProcess:
@@ -101,7 +101,7 @@ def test_incomplete_glove_timeout_is_not_delayed_by_startup_grace():
     assert "right glove" in health.fault(True, True, 11.11)
 
 
-def test_health_tracker_cancels_side_restart_when_both_gloves_recover():
+def test_health_tracker_clears_incomplete_state_when_both_gloves_recover():
     health = ManusHealthTracker(
         startup_grace_s=0.0, raw_timeout_s=2.0,
         incomplete_timeout_s=0.5, action_timeout_s=2.0,
@@ -116,7 +116,6 @@ def test_health_tracker_cancels_side_restart_when_both_gloves_recover():
     assert health.incomplete_since == 0.0
     assert health.fault(True, True, 11.0) == ""
 
-
 def test_health_tracker_requires_fresh_raw_and_action_streams():
     health = ManusHealthTracker(startup_grace_s=0.0, raw_timeout_s=1.0, action_timeout_s=1.0)
     health.reset(10.0)
@@ -126,16 +125,3 @@ def test_health_tracker_requires_fresh_raw_and_action_streams():
     assert health.raw_complete(10.2)
     assert health.fault(True, True, 10.2) == ""
     assert "2044" in health.fault(True, True, 11.2)
-
-
-def test_restart_limiter_stops_after_maximum_until_cleared():
-    limiter = RestartLimiter(maximum=3, window_s=10.0)
-    assert limiter.reserve(1.0)[0]
-    assert limiter.reserve(2.0)[0]
-    assert limiter.reserve(3.0)[0]
-    allowed, retry_after = limiter.reserve(20.0)
-    assert not allowed
-    assert retry_after == 0.0
-    assert limiter.attempts == 3
-    limiter.clear()
-    assert limiter.reserve(21.0)[0]
