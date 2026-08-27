@@ -12,7 +12,22 @@ import numpy as np
 
 
 ACTOR_SOURCE = 3
-BIAS_PREPARE_STEP = (1 << 32) - 1
+
+
+def control_mode_transition(previous_state: int, next_state: int) -> str | None:
+    """Return the one Wave mode trigger required by a lifecycle edge.
+
+    HOMING, HOMED, STARTING, and RUNNING share POSITION mode, so moving among
+    them must not call the trigger-based SDK setter again. Hardware-stop is
+    deliberately absent from this function; it gates commands but does not
+    own mode.
+    """
+    position_states = {1, 2, 3, 4}
+    was_position = int(previous_state) in position_states
+    is_position = int(next_state) in position_states
+    if was_position == is_position:
+        return None
+    return "position" if is_position else "floating"
 
 
 def validate_hand_command(command: Any) -> tuple[np.ndarray, int, bool, bool, bool]:
@@ -139,15 +154,26 @@ def main(args=None) -> None:
                 skip_tactile=bool(self.get_parameter("skip_tactile").value),
             )
             self._driver_error = ""
+            self._control_mode = "unknown"
+            self._control_error = ""
             try:
                 self.driver.connect()
-                self.driver.set_floating()
             except Exception as exc:
                 # Hardware absence is a runtime state, not a reason to kill the
                 # graph. Keep publishing invalid facts so status/recording can
                 # explain why the gate is closed.
                 self._driver_error = str(exc)
+                self._control_error = str(exc)
                 self.get_logger().error(f"SharpA hardware unavailable: {exc}")
+            else:
+                try:
+                    self.driver.set_floating()
+                    self._control_mode = "floating"
+                except Exception as exc:
+                    self._control_error = str(exc)
+                    self.get_logger().error(
+                        f"failed to set initial SharpA floating mode: {exc}"
+                    )
             self.pub = self.create_publisher(HandStateFrame, "/sharpa/state", 10)
             self.tau_pub = self.create_publisher(TauFrame, "/sharpa/tau", 10)
             self.wrench_pub = self.create_publisher(WrenchFrame, "/sharpa/wrench", 10)
@@ -159,7 +185,6 @@ def main(args=None) -> None:
             self._sharpa_state = SharpaState.STOPPED
             self._active_source = Source.UNKNOWN
             self._stopped = False
-            self._floating = True
             self._command_cache = SuccessfulHandCommandCache()
             self.create_subscription(HandCommand, "/sharpa/command", self._command, 10)
             self.create_subscription(ControlStatus, "/control/status", self._status, 10)
@@ -181,16 +206,12 @@ def main(args=None) -> None:
 
                 if self._active_source != previous_source:
                     self._command_cache.invalidate()
-                if (
-                    self._sharpa_state == SharpaState.STOPPED
-                    and previous_state != SharpaState.STOPPED
-                ):
+                transition = control_mode_transition(
+                    int(previous_state), int(self._sharpa_state)
+                )
+                if transition == "floating":
                     self._set_floating()
-                elif (
-                    self._sharpa_state == SharpaState.RUNNING
-                    and previous_state != SharpaState.RUNNING
-                    and not self._stopped
-                ):
+                elif transition == "position":
                     self._set_position_control()
 
         def _set_floating(self):
@@ -198,42 +219,40 @@ def main(args=None) -> None:
                 self._command_cache.invalidate()
                 try:
                     self.driver.set_floating()
-                    self._floating = True
+                    self._control_mode = "floating"
+                    self._control_error = ""
                 except Exception as exc:
                     # A two-hand mode change may have partially succeeded.
                     # Unknown is safer than retaining a stale cached value.
-                    self._floating = None
+                    self._control_mode = "unknown"
+                    self._control_error = str(exc)
                     self.get_logger().error(f"failed to set SharpA floating mode: {exc}")
 
-        def _set_position_control(self, *, required=False):
+        def _set_position_control(self):
             with self._sdk_lock:
                 self._command_cache.invalidate()
                 try:
                     self.driver.set_position_control()
-                    self._floating = False
+                    self._control_mode = "position"
+                    self._control_error = ""
                 except Exception as exc:
-                    self._floating = None
+                    self._control_mode = "unknown"
+                    self._control_error = str(exc)
                     self.get_logger().error(
                         f"failed to restore SharpA position mode: {exc}"
                     )
-                    if required:
-                        raise
 
         def _stop(self, message):
             with self._sdk_lock:
-                was_stopped = self._stopped
                 self._stopped = bool(message.data)
-                if self._stopped and not was_stopped:
-                    self._set_floating()
-                elif (
-                    not self._stopped
-                    and was_stopped
-                    and self._sharpa_state == SharpaState.RUNNING
-                ):
-                    self._set_position_control()
+                if self._stopped:
+                    self._command_cache.invalidate()
 
         def _state(self):
             msg = HandStateFrame(); msg.timestamp_ns = time.time_ns()
+            msg.control_mode = self._control_mode
+            msg.position_control_ready = False
+            msg.control_error = self._control_error
             if self._driver_error:
                 msg.left_valid = False; msg.right_valid = False; self.pub.publish(msg); return
             try:
@@ -250,6 +269,15 @@ def main(args=None) -> None:
             msg.timestamp_ns = stamp
             msg.q = np.concatenate((snapshot["left"], snapshot["right"])).tolist()
             msg.left_valid = snapshot["left_valid"]; msg.right_valid = snapshot["right_valid"]
+            msg.control_mode = self._control_mode
+            msg.control_error = self._control_error
+            msg.position_control_ready = bool(
+                self._control_mode == "position"
+                and not self._control_error
+                and not self._stopped
+                and msg.left_valid
+                and msg.right_valid
+            )
             msg.tau = np.concatenate((raw.left_tau, raw.right_tau)).tolist()
             msg.tau_valid = bool(raw.left_tau_valid and raw.right_tau_valid)
             msg.dq = [0.0] * 44; msg.dq_valid = False
@@ -294,16 +322,6 @@ def main(args=None) -> None:
                 with self._sdk_lock:
                     if self._stopped:
                         raise RuntimeError("hardware stop asserted")
-                    if (
-                        command_source == Source.BIAS
-                        and int(command.step_index) == BIAS_PREPARE_STEP
-                    ):
-                        # This is the reset preflight handshake.  It must
-                        # reassert SDK/POSITION even when the local cache says
-                        # POSITION, then verify both hands by readback.  A
-                        # failure becomes a NACK and bias_node will not start
-                        # either the hand or wrist trajectory.
-                        self._set_position_control(required=True)
                     decision = arbitrate(
                         self._sharpa_state, self._active_source, command_source
                     )

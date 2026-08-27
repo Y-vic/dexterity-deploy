@@ -399,7 +399,7 @@ def test_sharpa_commands_connected_left_without_right_hand():
     np.testing.assert_allclose(driver.hands["left"].commands[-1], 0.4)
 
 
-def test_sharpa_position_preflight_repairs_stale_mode_on_both_hands():
+def test_sharpa_position_transition_triggers_mode_once_on_both_hands():
     driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
     driver.sdk = SimpleNamespace(
         ControlMode=SimpleNamespace(POSITION=13),
@@ -413,22 +413,19 @@ def test_sharpa_position_preflight_repairs_stale_mode_on_both_hands():
     driver.set_position_control()
 
     assert all(hand.mode == 13 for hand in driver.hands.values())
-    assert all(hand.source == 4 for hand in driver.hands.values())
+    assert all(hand.source == 7 for hand in driver.hands.values())
+    assert all(hand.mode_writes == 1 for hand in driver.hands.values())
+    assert all(hand.source_writes == 0 for hand in driver.hands.values())
 
 
-def test_sharpa_position_preflight_does_not_repeat_triggered_settings():
+def test_sharpa_position_transition_does_not_repeat_source_trigger():
     driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
     driver.sdk = SimpleNamespace(
         ControlMode=SimpleNamespace(POSITION=13),
         ControlSource=SimpleNamespace(SDK=4),
     )
     driver.hands = {
-        side: FakeControlledHand(
-            mode=13,
-            source=4,
-            fail_redundant_mode_write=True,
-            fail_redundant_source_write=True,
-        )
+        side: FakeControlledHand(mode=10, source=4, fail_redundant_source_write=True)
         for side in ("left", "right")
     }
 
@@ -436,22 +433,22 @@ def test_sharpa_position_preflight_does_not_repeat_triggered_settings():
 
     assert all(hand.mode == 13 for hand in driver.hands.values())
     assert all(hand.source == 4 for hand in driver.hands.values())
-    assert all(hand.mode_writes == 0 for hand in driver.hands.values())
+    assert all(hand.mode_writes == 1 for hand in driver.hands.values())
     assert all(hand.source_writes == 0 for hand in driver.hands.values())
 
 
-def test_sharpa_position_preflight_rejects_false_success_from_sdk():
+def test_sharpa_position_transition_propagates_sdk_failure():
     driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
     driver.sdk = SimpleNamespace(
         ControlMode=SimpleNamespace(POSITION=13),
         ControlSource=SimpleNamespace(SDK=4),
     )
     driver.hands = {
-        "left": FakeControlledHand(mode=10, source=7, ignore_mode_write=True),
+        "left": FakeControlledHand(mode=13, source=7, fail_redundant_mode_write=True),
         "right": FakeControlledHand(mode=10, source=7),
     }
 
-    with pytest.raises(HardwareCommandError, match="readback mismatch"):
+    with pytest.raises(HardwareCommandError, match="control mode failed"):
         driver.set_position_control()
 
 

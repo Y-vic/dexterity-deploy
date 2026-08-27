@@ -1272,12 +1272,12 @@ class SharpADevicePair:
         return {side: targets[side].copy() for side in active}
 
     def set_control_mode(self, mode: Any) -> None:
-        """Set and verify a control mode on each connected hand.
+        """Trigger one control-mode transition on each connected hand.
 
-        The two SDK calls are not atomic.  In particular, the left hand may
-        accept a mode change before the right hand reports an error.  Never
-        let callers infer the hardware mode from the fact that this method was
-        entered: only a successful readback from every connected hand counts.
+        Wave control-mode setters are edge-triggered operations, not
+        idempotent configuration writes. Lifecycle ownership therefore lives
+        in sharpa_node: this method is called once when its state crosses the
+        FLOATING/POSITION boundary and never as a health probe.
         """
         if not self.enable_control:
             return
@@ -1292,10 +1292,9 @@ class SharpADevicePair:
                 raise HardwareCommandError(
                     f"SharpA {side} control mode failed: {getattr(error, 'message', '')}"
                 )
-        self._verify_control_setting("mode", mode)
 
     def set_control_source(self, source: Any) -> None:
-        """Set and verify the command source on each connected hand."""
+        """Trigger one command-source transition on each connected hand."""
         if not self.enable_control:
             return
         if self.sdk is None:
@@ -1310,78 +1309,6 @@ class SharpADevicePair:
                     f"SharpA {side} control source failed: "
                     f"{getattr(error, 'message', '')}"
                 )
-        self._verify_control_setting("source", source)
-
-    def ensure_control_source(self, source: Any) -> None:
-        """Verify the source and write it only when the firmware reports drift.
-
-        Wave SDK 5.x can return ``FAILURE_TO_CONNECT_TO_SERVER`` when
-        ``set_control_source(SDK)`` is repeated while a hand is leaving
-        zero-force mode. Stopping does not change the source, so the correct
-        recovery is an idempotent read/repair operation rather than an
-        unconditional write. A failed read or a failed repair still closes the
-        reset gate.
-        """
-        self._ensure_control_setting("source", source)
-
-    def ensure_control_mode(self, mode: Any) -> None:
-        """Verify the mode and trigger a transition only when it differs."""
-        self._ensure_control_setting("mode", mode)
-
-    def _ensure_control_setting(self, setting: str, expected: Any) -> None:
-        if not self.enable_control:
-            return
-        if self.sdk is None:
-            raise HardwareCommandError("SharpA SDK is unavailable")
-        getter_name = f"get_control_{setting}"
-        setter_name = f"set_control_{setting}"
-        for side in SIDES:
-            hand = self.hands.get(side)
-            if hand is None:
-                continue
-            try:
-                error, actual = getattr(hand, getter_name)()
-            except Exception as exc:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} readback failed: {exc}"
-                ) from exc
-            if getattr(error, "code", -1) != 0:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} readback failed: "
-                    f"{getattr(error, 'message', '')}"
-                )
-            if actual == expected:
-                continue
-            error = getattr(hand, setter_name)(expected)
-            if getattr(error, "code", -1) != 0:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} failed: "
-                    f"{getattr(error, 'message', '')}"
-                )
-        self._verify_control_setting(setting, expected)
-
-    def _verify_control_setting(self, setting: str, expected: Any) -> None:
-        getter_name = f"get_control_{setting}"
-        for side in SIDES:
-            hand = self.hands.get(side)
-            if hand is None:
-                continue
-            try:
-                error, actual = getattr(hand, getter_name)()
-            except Exception as exc:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} readback failed: {exc}"
-                ) from exc
-            if getattr(error, "code", -1) != 0:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} readback failed: "
-                    f"{getattr(error, 'message', '')}"
-                )
-            if actual != expected:
-                raise HardwareCommandError(
-                    f"SharpA {side} control {setting} readback mismatch: "
-                    f"expected {expected!r}, got {actual!r}"
-                )
 
     def set_floating(self) -> None:
         """Enable gravity compensation for manual hand adjustment."""
@@ -1389,13 +1316,9 @@ class SharpADevicePair:
             self.set_control_mode(self.sdk.ControlMode.FLOATING)
 
     def set_position_control(self) -> None:
-        """Restore and verify the complete SDK position-control chain."""
+        """Enter POSITION once; the SDK source was established at connect."""
         if self.sdk is not None:
-            # Both settings are trigger-based. Read first and transition only
-            # when the reported state differs; repeated setter calls are not a
-            # valid health check and are unreliable in Wave SDK 5.x.
-            self.ensure_control_mode(self.sdk.ControlMode.POSITION)
-            self.ensure_control_source(self.sdk.ControlSource.SDK)
+            self.set_control_mode(self.sdk.ControlMode.POSITION)
 
     def move_joint_ramp(
         self,

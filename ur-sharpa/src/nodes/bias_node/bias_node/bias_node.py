@@ -1,12 +1,12 @@
-"""bias_node -- the ONLY producer allowed to move the arms while UR is `homed`.
+"""bias_node -- the ONLY producer allowed to move hardware during reset.
 
 Subscribes `/control/bias_request` (`home_ur` / `home_sharpa` / `home_both`),
 streams an interpolated trajectory to `/ur/command` with
 `source=ArmCommand.SOURCE_BIAS` and to `/sharpa/command`, and reports progress on
 `/control/bias_status` as a JSON string.
 
-WHY THIS NODE HAS THE HOMED-STATE MONOPOLY (ur_node/arbitration.py): in `homed`
-the arbiter accepts SOURCE_BIAS and nothing else. That is what makes power-on
+WHY THIS NODE HAS THE HOMING-STATE MONOPOLY (ur_node/arbitration.py): in
+`homing` the arbiter accepts SOURCE_BIAS and nothing else. That makes power-on
 safe -- a stale actor plan or a live vive stream cannot start the robot moving
 just because a node came up. Publishing anything here with a source other than
 SOURCE_BIAS silently breaks that property, so the source is set in exactly one
@@ -31,6 +31,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,12 +69,12 @@ REQUEST_HOME_BOTH = "home_both"
 VALID_REQUESTS = (REQUEST_HOME_UR, REQUEST_HOME_SHARPA, REQUEST_HOME_BOTH)
 
 PHASE_IDLE = "idle"
+PHASE_PREPARING = "preparing"
 PHASE_UR = "homing_ur"
 PHASE_SHARPA = "homing_sharpa"
 PHASE_VERIFY = "verifying"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
-BIAS_PREPARE_STEP = (1 << 32) - 1
 
 
 @dataclass
@@ -81,7 +82,9 @@ class BiasRun:
     """One in-flight homing run."""
 
     request: str
+    action_id: str
     started_at: float
+    started_wall_ns: int = field(default_factory=time.time_ns)
     arm_plan: np.ndarray | None = None      # (steps, 12): left 6 then right 6
     arm_target: dict = field(default_factory=dict)
     hand_plan: np.ndarray | None = None     # (steps, 44)
@@ -91,9 +94,10 @@ class BiasRun:
     detail: str = ""
     verify_deadline: float = 0.0
     steps_sent: int = 0
-    hand_prepare_target: np.ndarray | None = None
-    hand_prepare_sent_at: float = 0.0
-    hand_ready: bool = False
+    pending_step: int | None = None
+    pending_devices: set[str] = field(default_factory=set)
+    pending_since: float = 0.0
+    next_step_at: float = 0.0
 
     @property
     def wants_ur(self) -> bool:
@@ -136,6 +140,8 @@ class BiasNode(Node):
         # Grace period after the last step before the arrival check gives up.
         # Expires -> FAILURE, never success. See module docstring.
         self.declare_parameter("arrival_timeout_s", 3.0)
+        self.declare_parameter("prepare_timeout_s", 5.0)
+        self.declare_parameter("command_ack_timeout_s", 1.0)
         self.declare_parameter("state_timeout_s", 0.5)
         self.declare_parameter("status_rate_hz", 5.0)
         self.declare_parameter("bias_file", "~/.config/ur_sharpa/teleop_bias.json")
@@ -168,6 +174,8 @@ class BiasNode(Node):
         self.sharpa_step_delay_s = max(1e-3, float(gp("sharpa_step_delay_s").value))
         self.sharpa_tolerance_rad = float(gp("sharpa_tolerance_rad").value)
         self.arrival_timeout_s = float(gp("arrival_timeout_s").value)
+        self.prepare_timeout_s = float(gp("prepare_timeout_s").value)
+        self.command_ack_timeout_s = float(gp("command_ack_timeout_s").value)
         self.state_timeout_s = float(gp("state_timeout_s").value)
         self.bias_file = Path(str(gp("bias_file").value)).expanduser()
 
@@ -196,6 +204,7 @@ class BiasNode(Node):
         self._hand_state: HandStateFrame | None = None
         self._hand_state_time: float | None = None
         self._ur_active_state: int | None = None
+        self._sharpa_active_state: int | None = None
         self._last_nack: str = ""
 
         # ---- ROS interfaces. QoS: depth=10 reliable, per docs/ur_topics.md ----
@@ -246,34 +255,55 @@ class BiasNode(Node):
     def _on_control_status(self, msg: ControlStatus) -> None:
         with self._lock:
             self._ur_active_state = int(msg.ur_state)
+            self._sharpa_active_state = int(msg.sharpa_state)
 
     def _on_command_result(self, msg: HardwareCommandResult) -> None:
-        """A NACK on a bias step is a real failure: the arm did not take it."""
+        """Advance only after every device ACKs this run's exact step."""
         if int(msg.source) != ArmCommand.SOURCE_BIAS:
             return
         with self._lock:
             run = self._run
+            if run is None or run.pending_step is None:
+                return
             if (
-                msg.success
-                and str(msg.device) == "sharpa"
-                and int(msg.step_index) == BIAS_PREPARE_STEP
-                and run is not None
-                and run.wants_sharpa
-                and run.hand_prepare_sent_at > 0.0
-                and not run.hand_ready
+                str(msg.action_id) != run.action_id
+                or int(msg.revision) != 0
+                or int(msg.step_index) != run.pending_step
+                or str(msg.device) not in run.pending_devices
             ):
-                run.hand_ready = True
-                run.detail = "SharpA SDK/POSITION preflight verified"
                 return
-            if msg.success:
-                return
-            self._counts["nacks"] += 1
-            self._last_nack = f"{msg.device}:{msg.failure_code}"
-            if run is not None and run.phase in (PHASE_UR, PHASE_SHARPA):
+            device = str(msg.device)
+            if not msg.success:
+                self._counts["nacks"] += 1
+                self._last_nack = f"{device}:{msg.failure_code}"
                 self._fail_locked(
-                    f"{msg.device} rejected a bias step: {msg.failure_code} "
+                    f"{device} rejected bias step {run.pending_step}: {msg.failure_code} "
                     f"{msg.failure_message}".strip()
                 )
+                return
+            run.pending_devices.remove(device)
+            if run.pending_devices:
+                run.detail = (
+                    f"step {run.pending_step} waiting for "
+                    f"{','.join(sorted(run.pending_devices))} ACK"
+                )
+                return
+            run.step += 1
+            run.steps_sent += 1
+            run.pending_step = None
+            run.pending_since = 0.0
+            run.detail = ""
+            delays = []
+            if run.arm_plan is not None:
+                delays.append(self.ur_step_delay_s)
+            if run.hand_plan is not None:
+                delays.append(self.sharpa_step_delay_s)
+            run.next_step_at = time.monotonic() + max(delays or [self._tick_period])
+            if run.step >= run.total_steps:
+                run.phase = PHASE_VERIFY
+                run.verify_deadline = time.monotonic() + self.arrival_timeout_s
+            elif run.arm_plan is not None and run.step >= len(run.arm_plan):
+                run.phase = PHASE_SHARPA
 
     def _measured_arm_joints(self) -> dict | None:
         """Fresh measured joints, or None when the state is stale/invalid."""
@@ -299,9 +329,19 @@ class BiasNode(Node):
 
     # ----------------------------------------------------------------- request
     def _on_request(self, msg: String) -> None:
-        self.handle_request((msg.data or "").strip())
+        raw = (msg.data or "").strip()
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {"request": raw}
+        if isinstance(payload, str):
+            payload = {"request": payload}
+        self.handle_request(
+            str(payload.get("request", "")).strip(),
+            action_id=str(payload.get("action_id", "")).strip() or None,
+        )
 
-    def handle_request(self, request: str) -> bool:
+    def handle_request(self, request: str, action_id: str | None = None) -> bool:
         """Start a homing run. Returns False and reports why when refused."""
         with self._lock:
             self._counts["requests"] += 1
@@ -324,27 +364,23 @@ class BiasNode(Node):
                 self.publish_status()
                 return False
             if self._run is not None and self._run.phase in (
-                    PHASE_UR, PHASE_SHARPA, PHASE_VERIFY):
+                    PHASE_PREPARING, PHASE_UR, PHASE_SHARPA, PHASE_VERIFY):
                 self._counts["rejected"] += 1
                 self._record_result(request, PHASE_FAILED,
                                     f"a {self._run.request} run is already active")
                 self.publish_status()
                 return False
 
-            run = BiasRun(request=request, started_at=time.monotonic())
-            try:
-                self._build_plans_locked(run)
-            except (HomePoseError, ValueError, RuntimeError) as exc:
-                self._counts["rejected"] += 1
-                self._counts["failed"] += 1
-                self._record_result(request, PHASE_FAILED, f"plan failed: {exc}")
-                self.publish_status()
-                return False
-
-            run.phase = PHASE_UR if run.arm_plan is not None else PHASE_SHARPA
+            run = BiasRun(
+                request=request,
+                action_id=action_id or uuid.uuid4().hex,
+                started_at=time.monotonic(),
+                phase=PHASE_PREPARING,
+                detail="waiting for reset state and fresh hardware readiness",
+            )
             self._run = run
             self.get_logger().info(
-                f"bias {request}: {run.total_steps} steps, phase={run.phase}"
+                f"bias {request} [{run.action_id}]: preparing"
             )
             self.publish_status()
             return True
@@ -378,11 +414,58 @@ class BiasNode(Node):
             start = measured
             run.hand_target = self._load_hand_bias_target_locked()
             run.hand_plan = interpolate(start, run.hand_target, self.sharpa_steps)
-            # Before either device moves, send the measured pose as a hold
-            # command.  sharpa_node treats its reserved step index as a
-            # mandatory SDK/POSITION set+readback handshake.  Only its ACK
-            # unlocks the real hand and wrist ramps.
-            run.hand_prepare_target = np.asarray(start, dtype=np.float64).copy()
+
+    def _prepare_locked(self, run: BiasRun) -> None:
+        """Wait for lifecycle readiness, then sample starts and build ramps."""
+        if time.monotonic() - run.started_at > self.prepare_timeout_s:
+            self._fail_locked(
+                "reset preparation timeout: " + (run.detail or "hardware not ready")
+            )
+            return
+        waiting = []
+        if run.wants_ur:
+            if self._ur_active_state != int(ControlStatus.UR_HOMING):
+                waiting.append("UR HOMING state")
+            if (
+                self._ur_state_time is None
+                or self._ur_state_time < run.started_at
+                or int(getattr(self._ur_state, "timestamp_ns", 0)) <= run.started_wall_ns
+                or self._measured_arm_joints() is None
+            ):
+                waiting.append("fresh valid UR state")
+        if run.wants_sharpa:
+            if self._sharpa_active_state != int(ControlStatus.SHARPA_HOMING):
+                waiting.append("SharpA HOMING state")
+            hand = self._hand_state
+            hand_after_request = bool(
+                hand is not None
+                and self._hand_state_time is not None
+                and self._hand_state_time >= run.started_at
+                and int(getattr(hand, "timestamp_ns", 0)) > run.started_wall_ns
+            )
+            if hand_after_request and str(hand.control_error):
+                self._fail_locked(
+                    f"SharpA POSITION transition failed: {hand.control_error}"
+                )
+                return
+            if not hand_after_request or self._measured_hand_joints() is None:
+                waiting.append("fresh valid two-hand state")
+            if not hand_after_request or not bool(hand.position_control_ready):
+                waiting.append("SharpA POSITION readiness")
+        if waiting:
+            run.detail = "waiting for " + ", ".join(waiting)
+            return
+        try:
+            self._build_plans_locked(run)
+        except (HomePoseError, ValueError, RuntimeError) as exc:
+            self._fail_locked(f"plan failed: {exc}")
+            return
+        run.phase = PHASE_UR if run.arm_plan is not None else PHASE_SHARPA
+        run.detail = ""
+        run.next_step_at = time.monotonic()
+        self.get_logger().info(
+            f"bias {run.request} [{run.action_id}]: {run.total_steps} steps"
+        )
 
     def _save_current_bias_locked(self) -> None:
         measured = self._measured_arm_joints()
@@ -463,61 +546,71 @@ class BiasNode(Node):
             run = self._run
             if run is None or run.phase in (PHASE_IDLE, PHASE_DONE, PHASE_FAILED):
                 return
+            if run.phase == PHASE_PREPARING:
+                self._prepare_locked(run)
+                return
             if run.phase == PHASE_VERIFY:
                 self._verify_locked(run)
                 return
-            self._stream_step_locked(run)
+            try:
+                self._stream_step_locked(run)
+            except Exception as exc:
+                self._fail_locked(f"failed to publish bias step: {exc}")
 
     def _stream_step_locked(self, run: BiasRun) -> None:
-        """Emit one sample of each active ramp, then move to verification."""
-        if run.hand_plan is not None and not run.hand_ready:
-            now = time.monotonic()
-            if run.hand_prepare_sent_at <= 0.0:
-                self._publish_hand_step(
-                    run.hand_prepare_target, BIAS_PREPARE_STEP
+        """Publish one paired step and wait for its complete ACK barrier."""
+        now = time.monotonic()
+        if run.pending_step is not None:
+            if now - run.pending_since > self.command_ack_timeout_s:
+                self._fail_locked(
+                    f"bias step {run.pending_step} ACK timeout waiting for "
+                    f"{','.join(sorted(run.pending_devices))}"
                 )
-                run.hand_prepare_sent_at = now
-                run.detail = "waiting for SharpA SDK/POSITION preflight"
-            elif now - run.hand_prepare_sent_at > self.arrival_timeout_s:
-                self._fail_locked("SharpA control-mode preflight ACK timeout")
+            return
+        if now < run.next_step_at:
             return
 
         idx = run.step
-        emitted = False
-
+        devices = set()
         if run.arm_plan is not None and idx < len(run.arm_plan):
-            row = run.arm_plan[idx]
-            self._publish_arm_step(row[:6], row[6:], idx)
-            self._counts["arm_steps"] += 1
-            emitted = True
-
+            devices.add("ur")
         if run.hand_plan is not None and idx < len(run.hand_plan):
-            self._publish_hand_step(run.hand_plan[idx], idx)
-            self._counts["hand_steps"] += 1
-            emitted = True
-
-        if emitted:
-            run.steps_sent += 1
-        run.step = idx + 1
-
-        if run.step >= run.total_steps:
+            devices.add("sharpa")
+        if not devices:
             run.phase = PHASE_VERIFY
-            run.verify_deadline = time.monotonic() + self.arrival_timeout_s
-        elif run.arm_plan is not None and run.step >= len(run.arm_plan):
-            run.phase = PHASE_SHARPA
+            run.verify_deadline = now + self.arrival_timeout_s
+            return
 
-    def _publish_arm_step(self, left: Any, right: Any, step_index: int) -> None:
+        # Install the barrier before publishing. Result callbacks can arrive
+        # immediately on a multi-threaded executor and must see this step.
+        run.pending_step = idx
+        run.pending_devices = devices
+        run.pending_since = now
+        run.detail = f"step {idx} waiting for {','.join(sorted(devices))} ACK"
+
+        if "ur" in devices:
+            row = run.arm_plan[idx]
+            self._publish_arm_step(row[:6], row[6:], idx, run.action_id)
+            self._counts["arm_steps"] += 1
+
+        if "sharpa" in devices:
+            self._publish_hand_step(run.hand_plan[idx], idx, run.action_id)
+            self._counts["hand_steps"] += 1
+
+    def _publish_arm_step(
+        self, left: Any, right: Any, step_index: int, action_id: str
+    ) -> None:
         """The ONE place an ArmCommand leaves this node.
 
         `source = ArmCommand.SOURCE_BIAS` is set here and nowhere else, so the
         arbitration monopoly in the `homed` state cannot be lost to a second code
-        path drifting. `action_id` stays empty: identity passthrough belongs to
-        the policy sources only (see ArmCommand.msg).
+        path drifting. `action_id` identifies the reset transaction so stale
+        ACKs from an older run cannot advance a new one.
         """
         msg = ArmCommand()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.source = ArmCommand.SOURCE_BIAS
-        msg.action_id = ""
+        msg.action_id = action_id
         msg.revision = 0
         msg.step_index = int(step_index)
         msg.period_s = float(self.ur_step_delay_s)
@@ -527,11 +620,11 @@ class BiasNode(Node):
         msg.right_enable = True
         self.arm_pub.publish(msg)
 
-    def _publish_hand_step(self, q44: Any, step_index: int) -> None:
+    def _publish_hand_step(self, q44: Any, step_index: int, action_id: str) -> None:
         msg = HandCommand()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.source = HandCommand.SOURCE_BIAS
-        msg.action_id = ""
+        msg.action_id = action_id
         msg.revision = 0
         msg.step_index = int(step_index)
         q = np.asarray(q44, dtype=np.float64).reshape(-1)
@@ -590,6 +683,9 @@ class BiasNode(Node):
         if run is not None:
             run.phase = PHASE_FAILED
             run.detail = detail
+            run.pending_step = None
+            run.pending_devices.clear()
+            run.pending_since = 0.0
         self._counts["failed"] += 1
         self._record_result(request, PHASE_FAILED, detail, max_error, errors)
         # Explicit and loud. A silent drop makes a stuck arm indistinguishable
@@ -615,11 +711,14 @@ class BiasNode(Node):
         with self._lock:
             run = self._run
             now = time.monotonic()
-            active = run is not None and run.phase in (PHASE_UR, PHASE_SHARPA, PHASE_VERIFY)
+            active = run is not None and run.phase in (
+                PHASE_PREPARING, PHASE_UR, PHASE_SHARPA, PHASE_VERIFY
+            )
             return {
                 "node": "bias_node",
                 "active": active,
                 "request": run.request if run is not None else "",
+                "action_id": run.action_id if run is not None else "",
                 "phase": run.phase if run is not None else PHASE_IDLE,
                 "detail": run.detail if run is not None else "",
                 "step": run.step if run is not None else 0,
@@ -630,6 +729,11 @@ class BiasNode(Node):
                 "ur_state_fresh": self._measured_arm_joints() is not None,
                 "sharpa_state_fresh": self._measured_hand_joints() is not None,
                 "ur_state_from_control_status": self._ur_active_state,
+                "sharpa_state_from_control_status": self._sharpa_active_state,
+                "pending_step": run.pending_step if run is not None else None,
+                "pending_devices": (
+                    sorted(run.pending_devices) if run is not None else []
+                ),
                 "last_nack": self._last_nack,
                 "last_result": dict(self._last_result),
                 "counts": dict(self._counts),
@@ -642,6 +746,8 @@ class BiasNode(Node):
                     "sharpa_steps": self.sharpa_steps,
                     "sharpa_tolerance_rad": self.sharpa_tolerance_rad,
                     "arrival_timeout_s": self.arrival_timeout_s,
+                    "prepare_timeout_s": self.prepare_timeout_s,
+                    "command_ack_timeout_s": self.command_ack_timeout_s,
                 },
                 "safety": {
                     "enable_jump_gate": self.safety_config.enable_jump_gate,

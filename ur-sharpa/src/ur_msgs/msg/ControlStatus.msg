@@ -4,14 +4,19 @@
 # Published by the control node on every state change and at a low heartbeat
 # rate. Dashboard and recorder observe it; nobody schedules from it.
 
-# --- UR arm state machine (3 states) ---
+# --- UR arm state machine (5 states) ---
 uint8 UR_STOPPED = 0   # controllers idle or protective-stopped, no motion
 uint8 UR_HOMED = 1     # at the bias/home pose, servo loop ready, not streaming
 uint8 UR_RUNNING = 2   # accepting and executing ArmCommand steps
+uint8 UR_HOMING = 3    # accepting only Bias commands for an active reset
+uint8 UR_STARTING = 4  # no commands; waiting for SharpA POSITION readiness
 
-# --- SharpA hand state machine (2 states) ---
+# --- SharpA hand state machine (5 states) ---
 uint8 SHARPA_STOPPED = 0   # hand controller not accepting commands
 uint8 SHARPA_RUNNING = 1   # accepting and executing HandCommand steps
+uint8 SHARPA_HOMING = 2    # POSITION transition in progress; only Bias allowed
+uint8 SHARPA_HOMED = 3     # holding the saved Bias pose; only Bias allowed
+uint8 SHARPA_STARTING = 4  # POSITION transition in progress; no commands
 
 # --- Recording state machine (2 states) ---
 uint8 RECORD_IDLE = 0        # not writing an episode

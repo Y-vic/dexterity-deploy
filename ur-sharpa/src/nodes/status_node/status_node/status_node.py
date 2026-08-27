@@ -66,7 +66,6 @@ if ROS_AVAILABLE:
             self.create_subscription(HardwareCommandResult, "/ur/command_result", self._result("ur"), qos)
             self.create_subscription(HardwareCommandResult, "/sharpa/command_result", self._result("sharpa"), qos)
             self.upstream = {}
-            self._pending_bias = None
             self.http = None
             if bool(self.get_parameter("web_enabled").value):
                 self._start_compat_api(int(self.get_parameter("web_port").value))
@@ -138,17 +137,39 @@ if ROS_AVAILABLE:
 
         def _sharpa_state(self, msg):
             self.machine.update_hardware_readiness(
-                sharpa_ready=bool(msg.left_valid or msg.right_valid)
+                sharpa_ready=bool(msg.left_valid and msg.right_valid)
             )
             self.upstream["sharpa_sides"] = {
                 "left_valid": bool(msg.left_valid),
                 "right_valid": bool(msg.right_valid),
+                "control_mode": str(msg.control_mode),
+                "position_control_ready": bool(msg.position_control_ready),
+                "control_error": str(msg.control_error),
             }
+            outcome = self.machine.on_execution_start_readiness(
+                position_ready=bool(msg.position_control_ready),
+                control_error=str(msg.control_error),
+                state_timestamp_ns=int(msg.timestamp_ns),
+            )
+            if outcome is not None:
+                self._publish()
+                if outcome.hardware_stop is not None:
+                    stop = Bool()
+                    stop.data = bool(outcome.hardware_stop)
+                    self.stop_pub.publish(stop)
 
         def _bias(self, msg):
-            payload = json.loads(msg.data) if msg.data else {}
-            self.machine.on_bias_status(payload)
+            try:
+                payload = json.loads(msg.data) if msg.data else {}
+            except Exception:
+                payload = {"phase": "invalid", "detail": str(msg.data)}
+            outcome = self.machine.on_bias_status(payload)
             self.upstream["bias_status"] = payload
+            self._publish()
+            if outcome.hardware_stop is not None:
+                stop = Bool()
+                stop.data = bool(outcome.hardware_stop)
+                self.stop_pub.publish(stop)
 
         def _record(self, msg):
             try:
@@ -185,12 +206,20 @@ if ROS_AVAILABLE:
                 "stop": self.machine.attempt_pause,
             }
             outcome = actions.get(action, lambda: self.machine._set_reason(f"unknown action: {action}"))()
+            # State is the sole owner of hardware lifecycle. Publish the new
+            # state before releasing the stop latch or announcing a reset;
+            # bias_node then waits for explicit device readiness.
+            self._publish()
             if outcome.hardware_stop is not None:
                 msg = Bool(); msg.data = bool(outcome.hardware_stop); self.stop_pub.publish(msg)
-            if outcome.bias_request and outcome.hardware_stop is False:
-                self._pending_bias = (time.monotonic() + 0.1, outcome.bias_request)
-            elif outcome.bias_request:
-                self._publish_string(self.bias_pub, outcome.bias_request)
+            if outcome.bias_request:
+                self._publish_string(
+                    self.bias_pub,
+                    json.dumps({
+                        "request": outcome.bias_request,
+                        "action_id": self.machine.bias_action_id,
+                    }, separators=(",", ":")),
+                )
             if outcome.record_command:
                 self._publish_string(self.record_pub, outcome.record_command)
             self.upstream["last_action"] = {"action": action, "accepted": bool(outcome), "reason": outcome.reason}
@@ -207,11 +236,8 @@ if ROS_AVAILABLE:
             msg = String(); msg.data = str(value); pub.publish(msg)
 
         def _publish(self):
-            if self._pending_bias is not None and time.monotonic() >= self._pending_bias[0]:
-                _due, request = self._pending_bias
-                self._pending_bias = None
-                self._publish_string(self.bias_pub, request)
             state = self.machine
+            asynchronous = state.poll_async_transitions()
             msg = ControlStatus()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.timestamp_ns = time.time_ns()
@@ -225,6 +251,10 @@ if ROS_AVAILABLE:
             msg.session_id = state.session_id
             self.status_pub.publish(msg)
             self._publish_string(self.provider_pub, state.execution_provider)
+            if asynchronous is not None and asynchronous.hardware_stop is not None:
+                stop = Bool()
+                stop.data = bool(asynchronous.hardware_stop)
+                self.stop_pub.publish(stop)
 
         def destroy_node(self):
             if self.http is not None:

@@ -28,6 +28,13 @@ bool tau_valid
 bool left_valid
 bool right_valid
 
+# Aggregate control lifecycle owned by sharpa_node. Mode changes happen only
+# on ControlStatus state edges. Bias waits for position_control_ready instead
+# of issuing a second, hidden mode-switch command.
+string control_mode              # "floating", "position", or "unknown"
+bool position_control_ready      # both hands accepted the POSITION transition
+string control_error             # transition failure; empty when healthy
+
 # Last full 44D target successfully handed to the SharpA SDK. This is the
 # executed-command cache used by recording; it is not inferred from measured q.
 # q_cmd_valid is false after a stop/source transition, SDK command failure, or

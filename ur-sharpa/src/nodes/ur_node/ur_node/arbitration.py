@@ -5,8 +5,9 @@ which of the three command producers -- bias, vive, actor -- is allowed to
 drive at any moment. That decision follows the UR state machine owned by
 `status_node`:
 
-    stopped  -> ONLY bias accepted (initial homing)
-    homed    -> ONLY bias accepted (homing / reset trajectories)
+    stopped  -> no commands accepted
+    homing   -> ONLY bias accepted (active reset transaction)
+    homed    -> ONLY bias accepted (hold / correction)
     running  -> ONLY the active teleop-or-deploy source accepted
 
 Keeping this as a pure function of (ur_state, active_source, command_source)
@@ -29,6 +30,8 @@ class UrState(IntEnum):
     STOPPED = 0
     HOMED = 1
     RUNNING = 2
+    HOMING = 3
+    STARTING = 4
 
 
 class Source(IntEnum):
@@ -60,20 +63,24 @@ def arbitrate(
     """Decide whether `command_source` may drive the arms right now.
 
     `active_source` is the source `status_node` has designated for the RUNNING
-    state; it is ignored in STOPPED and HOMED.
+    state; it is ignored outside RUNNING.
     """
     if command_source == Source.UNKNOWN:
         return Decision(False, "command has no source; refusing to guess")
 
     if ur_state == UrState.STOPPED:
-        if command_source == Source.BIAS:
-            return ACCEPT
         return Decision(
             False,
             f"UR is stopped; {command_source.name.lower()} command rejected",
         )
 
-    if ur_state == UrState.HOMED:
+    if ur_state == UrState.STARTING:
+        return Decision(
+            False,
+            f"UR is starting; {command_source.name.lower()} command rejected",
+        )
+
+    if ur_state in (UrState.HOMING, UrState.HOMED):
         # Only bias may move the arms before they are declared running. This is
         # what makes "power on" safe: a stale actor plan or a live vive stream
         # cannot start moving the robot just because the node came up.
@@ -81,14 +88,11 @@ def arbitrate(
             return ACCEPT
         return Decision(
             False,
-            f"UR is homed; only bias may command (got {command_source.name.lower()})",
+            f"UR is {ur_state.name.lower()}; only bias may command "
+            f"(got {command_source.name.lower()})",
         )
 
     if ur_state == UrState.RUNNING:
-        if command_source == Source.BIAS:
-            # Bias keeps authority in RUNNING so a reset always lands, even
-            # mid-episode.
-            return ACCEPT
         if command_source == active_source:
             return ACCEPT
         return Decision(

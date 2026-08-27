@@ -36,7 +36,7 @@ canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 | `TauFrame` | 每手 22D 力矩，sensor buffer 路径，按手拆分。 |
 | `WrenchFrame` | 每手 `(5,6)` 指尖力/力矩，行主序展平。 |
 | `DeformationFrame` | 每手 `uint8 (5,240,240)` 指尖形变图，行主序展平。 |
-| `ControlStatus` | UR(3 态)/SharpA(2 态)/Record(2 态) 三个状态机 + `gate_reason`。 |
+| `ControlStatus` | UR(5 态)/SharpA(5 态)/Record(2 态) 三个状态机 + `gate_reason`。 |
 | `HardwareCommandResult` | 单步硬件指令的 ACK / 拒绝原因。 |
 | `ExecutableAction` | 截断后的 action slice，含完整 identity 与执行参数透传。 |
 | `ActorTrajectory` | Actor IK 后的统一 chunk 轨迹；Dashboard 与预览日志的唯一预测来源。 |
@@ -46,8 +46,8 @@ canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 
 | 机 | 取值 |
 | --- | --- |
-| UR | `UR_STOPPED=0` / `UR_HOMED=1` / `UR_RUNNING=2` |
-| SharpA | `SHARPA_STOPPED=0` / `SHARPA_RUNNING=1` |
+| UR | `UR_STOPPED=0` / `UR_HOMED=1` / `UR_RUNNING=2` / `UR_HOMING=3` / `UR_STARTING=4` |
+| SharpA | `SHARPA_STOPPED=0` / `SHARPA_RUNNING=1` / `SHARPA_HOMING=2` / `SHARPA_HOMED=3` / `SHARPA_STARTING=4` |
 | Record | `RECORD_IDLE=0` / `RECORD_RECORDING=1` |
 
 `gate_reason` 是人类可读字符串，说明当前为什么不能进入下一个状态；空串表示无阻塞。

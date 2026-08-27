@@ -1,9 +1,9 @@
-"""The 7-state gate machine, as a pure module.
+"""The hardware lifecycle gate machine, as a pure module.
 
 Three independent machines live here:
 
-    UR      : stopped -> homed -> running        (3 states)
-    SharpA  : stopped -> running                 (2 states)
+    UR      : stopped -> homing -> homed -> running (+ start-pending)
+    SharpA  : stopped -> homing -> homed -> running (+ start-pending)
     Record  : idle    -> recording               (2 states)
 
 Nothing in this file imports rclpy, opens a socket, or touches hardware, so the
@@ -17,11 +17,12 @@ The state values deliberately mirror `ur_msgs/ControlStatus` and
 may drive the arms. So the semantics here must be exactly the ones it assumes:
 
     stopped  -> it accepts nothing
+    homing   -> it accepts ONLY bias
     homed    -> it accepts ONLY bias
-    running  -> it accepts bias + the active source
+    running  -> it accepts ONLY the active source
 
-which is why "start UR" lands in HOMED and not RUNNING: the operator gets one
-state in which only the homing trajectory can move the arms.
+which is why reset first enters HOMING and reaches HOMED only after measured
+arrival succeeds: only the active reset transaction can move the hardware.
 
 Every refusal carries a reason string. A silent refusal makes a stalled arm
 indistinguishable from a disconnected producer, which is exactly the failure
@@ -32,6 +33,7 @@ every rejected transition and surfaced on the web page.
 from __future__ import annotations
 
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable
@@ -43,6 +45,8 @@ class UrState(IntEnum):
     STOPPED = 0
     HOMED = 1
     RUNNING = 2
+    HOMING = 3
+    STARTING = 4
 
 
 class SharpaState(IntEnum):
@@ -50,6 +54,9 @@ class SharpaState(IntEnum):
 
     STOPPED = 0
     RUNNING = 1
+    HOMING = 2
+    HOMED = 3
+    STARTING = 4
 
 
 class RecordState(IntEnum):
@@ -275,7 +282,7 @@ class JogPreview:
 
 @dataclass
 class GateMachine:
-    """Pure seven-state controller used by the ROS node and its HTTP page.
+    """Pure lifecycle controller used by the ROS node and its HTTP page.
 
     The machine deliberately owns no ROS objects.  ``attempt_*`` methods return
     side effects for the shell to publish and always retain a human-readable
@@ -288,6 +295,10 @@ class GateMachine:
     execution_provider: str = "policy"
     execution_paused: bool = False
     execution_dry_run: bool = False
+    execution_start_pending: bool = False
+    execution_start_started_at: float = 0.0
+    execution_start_started_wall_ns: int = 0
+    execution_start_timeout_s: float = 5.0
     ur_state: UrState = UrState.STOPPED
     sharpa_state: SharpaState = SharpaState.STOPPED
     record_state: RecordState = RecordState.IDLE
@@ -295,6 +306,7 @@ class GateMachine:
     session_id: str = ""
     bias_phase: str = "idle"
     bias_request: str = ""
+    bias_action_id: str = ""
     machine_ready: bool = False
     ur_hardware_ready: bool = False
     sharpa_hardware_ready: bool = False
@@ -350,7 +362,72 @@ class GateMachine:
         )
         return f"record blocked: camera views not fresh: {details}"
 
-    def on_bias_status(self, payload: dict | str) -> None:
+    @property
+    def bias_active(self) -> bool:
+        return bool(self.bias_request and self.bias_action_id)
+
+    def _begin_bias(self, request: str) -> Outcome:
+        self.execution_start_pending = False
+        self.execution_start_started_at = 0.0
+        self.execution_start_started_wall_ns = 0
+        self.bias_request = request
+        self.bias_action_id = uuid.uuid4().hex
+        self.bias_phase = "requested"
+        self.machine_ready = False
+        self._clear_reason()
+        return _ok(bias_request=request, hardware_stop=False)
+
+    def on_execution_start_readiness(
+        self, *, position_ready: bool, control_error: str = "",
+        state_timestamp_ns: int | None = None,
+    ) -> Outcome | None:
+        """Complete the stopped->running transition after SharpA is ready."""
+        if not self.execution_start_pending:
+            return None
+        if (
+            state_timestamp_ns is not None
+            and int(state_timestamp_ns) <= self.execution_start_started_wall_ns
+        ):
+            return None
+        if control_error:
+            self.execution_start_pending = False
+            self.execution_start_started_at = 0.0
+            self.execution_start_started_wall_ns = 0
+            self.ur_state = UrState.STOPPED
+            self.sharpa_state = SharpaState.STOPPED
+            self.machine_ready = False
+            self._set_reason(
+                f"machine start failed: SharpA POSITION transition failed: {control_error}"
+            )
+            return _ok(hardware_stop=True)
+        if not position_ready:
+            return None
+        if not self.ur_hardware_ready or not self.sharpa_hardware_ready:
+            return None
+        self.execution_start_pending = False
+        self.execution_start_started_at = 0.0
+        self.execution_start_started_wall_ns = 0
+        self.ur_state = UrState.RUNNING
+        self.sharpa_state = SharpaState.RUNNING
+        self._clear_reason()
+        return _ok(hardware_stop=False)
+
+    def poll_async_transitions(self, now: float | None = None) -> Outcome | None:
+        if not self.execution_start_pending:
+            return None
+        now = time.monotonic() if now is None else float(now)
+        if now - self.execution_start_started_at <= self.execution_start_timeout_s:
+            return None
+        self.execution_start_pending = False
+        self.execution_start_started_at = 0.0
+        self.execution_start_started_wall_ns = 0
+        self.ur_state = UrState.STOPPED
+        self.sharpa_state = SharpaState.STOPPED
+        self.machine_ready = False
+        self._set_reason("machine start failed: SharpA POSITION readiness timeout")
+        return _ok(hardware_stop=True)
+
+    def on_bias_status(self, payload: dict | str) -> Outcome:
         if isinstance(payload, str):
             import json
             try:
@@ -358,30 +435,43 @@ class GateMachine:
             except Exception:
                 payload = {"phase": "invalid", "detail": payload}
         self.last_bias_status = dict(payload or {})
+        action_id = str(self.last_bias_status.get("action_id", ""))
+        if not self.bias_active or action_id != self.bias_action_id:
+            return _ok()
         self.bias_phase = str(self.last_bias_status.get("phase", ""))
         if self.bias_phase in {"failed", "error"}:
-            if self.bias_request == "home_both":
-                self.machine_ready = False
+            request = self.bias_request
+            if request in {"home_ur", "home_both"}:
+                self.ur_state = UrState.STOPPED
+            if request in {"home_sharpa", "home_both"}:
+                self.sharpa_state = SharpaState.STOPPED
+            self.machine_ready = False
+            self.bias_request = ""
+            self.bias_action_id = ""
             self._set_reason(f"bias failed: {self.last_bias_status.get('detail', 'unknown error')}")
-            return
+            return _ok(hardware_stop=True)
         if self.bias_phase == "done":
             request = self.bias_request
             if request in {"home_ur", "home_both"}:
                 self.ur_state = UrState.HOMED
             if request in {"home_sharpa", "home_both"}:
-                self.sharpa_state = SharpaState.STOPPED
+                self.sharpa_state = SharpaState.HOMED
             if request == "home_both":
                 self.machine_ready = True
             self.bias_request = ""
+            self.bias_action_id = ""
             self._clear_reason()
+        return _ok()
 
     def attempt_start_ur(self) -> Outcome:
         if self.ur_state != UrState.STOPPED:
             return self._set_reason(f"start UR blocked: UR is already {self.ur_state.name.lower()}")
-        self.bias_request = "home_ur"
-        self.bias_phase = "requested"
-        self._clear_reason()
-        return _ok(bias_request="home_ur", hardware_stop=False)
+        if self.bias_active:
+            return self._set_reason("start UR blocked: a reset is already active")
+        if not self.ur_hardware_ready:
+            return self._set_reason("start UR blocked: UR is not in Normal mode")
+        self.ur_state = UrState.HOMING
+        return self._begin_bias("home_ur")
 
     def attempt_run_ur(self) -> Outcome:
         if not self.machine_ready:
@@ -398,21 +488,23 @@ class GateMachine:
             return self._set_reason(f"run UR blocked: bias phase is {self.bias_phase}")
         self.ur_state = UrState.RUNNING
         self.sharpa_state = SharpaState.RUNNING
+        self.machine_ready = False
         self._clear_reason()
         return _ok(hardware_stop=False)
 
     def attempt_reset_ur(self) -> Outcome:
         if self.ur_state == UrState.RUNNING:
             return self._set_reason("UR reset blocked: pause the machine first")
-        self.bias_request = "home_ur"
-        self.bias_phase = "requested"
+        if self.bias_active:
+            return self._set_reason("UR reset blocked: a reset is already active")
+        if not self.ur_hardware_ready:
+            return self._set_reason("UR reset blocked: UR is not in Normal mode")
         self.record_state = RecordState.IDLE
         self.session_id = ""
         self.execution_paused = False
         self.execution_dry_run = False
-        self.ur_state = UrState.STOPPED
-        self._clear_reason()
-        return _ok(bias_request="home_ur", hardware_stop=False)
+        self.ur_state = UrState.HOMING
+        return self._begin_bias("home_ur")
 
     def attempt_reset_both(self) -> Outcome:
         """Return both arms and both hands to their deployment home pose."""
@@ -422,26 +514,26 @@ class GateMachine:
             )
         if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
             return self._set_reason("machine reset blocked: pause the machine first")
+        if self.bias_active:
+            return self._set_reason("machine reset blocked: a reset is already active")
         if not self.ur_hardware_ready:
             return self._set_reason("machine reset blocked: UR is not in Normal mode")
         if not self.sharpa_hardware_ready:
             return self._set_reason("machine reset blocked: SharpA state is unavailable")
         record_command = "stop" if self.record_state == RecordState.RECORDING else ""
-        self.bias_request = "home_both"
-        self.bias_phase = "requested"
         self.record_state = RecordState.IDLE
         self.session_id = ""
         self.execution_paused = False
         self.execution_dry_run = False
-        self.ur_state = UrState.STOPPED
-        self.sharpa_state = SharpaState.STOPPED
-        self.machine_ready = False
+        self.ur_state = UrState.HOMING
+        self.sharpa_state = SharpaState.HOMING
         self.jog_preview = None
-        self._clear_reason()
-        return _ok(
-            bias_request="home_both",
+        outcome = self._begin_bias("home_both")
+        return Outcome(
+            accepted=True,
+            bias_request=outcome.bias_request,
             record_command=record_command,
-            hardware_stop=False,
+            hardware_stop=outcome.hardware_stop,
         )
 
     def attempt_start_deploy(self) -> Outcome:
@@ -474,15 +566,26 @@ class GateMachine:
             )
         if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
             return self._set_reason("machine start blocked: machine is already running")
-        if self.bias_phase not in {"done", "idle", ""}:
+        if self.execution_start_pending:
+            return self._set_reason("machine start blocked: start is already pending")
+        if self.bias_active:
             return self._set_reason(
                 f"machine start blocked: bias phase is {self.bias_phase}"
             )
-        self.ur_state = UrState.RUNNING
-        self.sharpa_state = SharpaState.RUNNING
+        self.machine_ready = False
         self.execution_paused = False
         self.execution_dry_run = False
-        self._clear_reason()
+        if self.ur_state == UrState.HOMED and self.sharpa_state == SharpaState.HOMED:
+            self.ur_state = UrState.RUNNING
+            self.sharpa_state = SharpaState.RUNNING
+            self._clear_reason()
+            return _ok(hardware_stop=False)
+        self.ur_state = UrState.STARTING
+        self.sharpa_state = SharpaState.STARTING
+        self.execution_start_pending = True
+        self.execution_start_started_at = time.monotonic()
+        self.execution_start_started_wall_ns = time.time_ns()
+        self.gate_reason = "machine start waiting for SharpA POSITION readiness"
         return _ok(hardware_stop=False)
 
     def attempt_continue_deploy(self) -> Outcome:
@@ -535,7 +638,11 @@ class GateMachine:
             )
         if self.execution_dry_run:
             return self._set_reason("trajectory preview is already active")
-        if self.bias_phase not in {"done", "idle", ""}:
+        if self.execution_start_pending:
+            return self._set_reason(
+                "trajectory preview blocked: machine start is pending"
+            )
+        if self.bias_active:
             return self._set_reason(
                 f"trajectory preview blocked: bias phase is {self.bias_phase}"
             )
@@ -564,6 +671,7 @@ class GateMachine:
             self.ur_state == UrState.RUNNING
             or self.sharpa_state == SharpaState.RUNNING
             or self.execution_dry_run
+            or self.execution_start_pending
         ):
             return self._set_reason(
                 "provider switch blocked: stop the machine before switching"
@@ -577,11 +685,11 @@ class GateMachine:
         if self.ur_state != UrState.RUNNING or self.sharpa_state != SharpaState.RUNNING:
             return self._set_reason("machine pause blocked: machine is not running")
         record_command = "stop" if self.record_state == RecordState.RECORDING else ""
-        # Preserve whether a real reset was completed. A deployment that began
-        # at an arbitrary current pose returns to STOPPED when paused, while a
-        # reset deployment remains HOMED. Both may be continued explicitly.
-        self.ur_state = UrState.HOMED if self.machine_ready else UrState.STOPPED
+        # A hard pause closes the lifecycle gate; a later start performs the
+        # POSITION-readiness transition again before Actor can publish.
+        self.ur_state = UrState.STOPPED
         self.sharpa_state = SharpaState.STOPPED
+        self.machine_ready = False
         self.record_state = RecordState.IDLE
         self.session_id = ""
         self.execution_paused = False
@@ -592,6 +700,15 @@ class GateMachine:
 
     def attempt_stop_deploy(self) -> Outcome:
         """End the deployment session and close the Actor/hardware gate."""
+        if self.execution_start_pending:
+            self.execution_start_pending = False
+            self.execution_start_started_at = 0.0
+            self.execution_start_started_wall_ns = 0
+            self.ur_state = UrState.STOPPED
+            self.sharpa_state = SharpaState.STOPPED
+            self.machine_ready = False
+            self.gate_reason = "deployment start cancelled"
+            return _ok(hardware_stop=True)
         if self.execution_dry_run:
             self.execution_dry_run = False
             self.execution_paused = False
@@ -621,12 +738,16 @@ class GateMachine:
         return _ok()
 
     def attempt_start_sharpa(self) -> Outcome:
-        if self.sharpa_state == SharpaState.RUNNING:
-            return self._set_reason("start SharpA blocked: SharpA is already running")
-        self.bias_request = "home_sharpa"
-        self.bias_phase = "requested"
-        self._clear_reason()
-        return _ok(bias_request="home_sharpa")
+        if self.sharpa_state != SharpaState.STOPPED:
+            return self._set_reason(
+                f"start SharpA blocked: SharpA is already {self.sharpa_state.name.lower()}"
+            )
+        if self.bias_active:
+            return self._set_reason("start SharpA blocked: a reset is already active")
+        if not self.sharpa_hardware_ready:
+            return self._set_reason("start SharpA blocked: SharpA state is unavailable")
+        self.sharpa_state = SharpaState.HOMING
+        return self._begin_bias("home_sharpa")
 
     def attempt_start_recording(self, session_id: str | None = None,
                                 now: float | None = None) -> Outcome:
@@ -699,6 +820,7 @@ class GateMachine:
             "execution_provider": self.execution_provider,
             "execution_paused": self.execution_paused,
             "execution_dry_run": self.execution_dry_run,
+            "execution_start_pending": self.execution_start_pending,
             "machine_ready": self.machine_ready,
             "machine_running": self.ur_state == UrState.RUNNING and self.sharpa_state == SharpaState.RUNNING,
             "ur_hardware_ready": self.ur_hardware_ready,
@@ -706,6 +828,7 @@ class GateMachine:
             "gate_reason": self.gate_reason,
             "session_id": self.session_id,
             "bias_phase": self.bias_phase,
+            "bias_action_id": self.bias_action_id,
             "camera_ages_s": self.cameras.ages(now),
             "camera_gate_reason": self.camera_gate_reason(now),
             "jog_preview": self.jog_preview.payload() if self.jog_preview else None,

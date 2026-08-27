@@ -385,9 +385,12 @@ if ROS_AVAILABLE:
             self.controller.update_upstream("ur_status", {"valid": bool(msg.valid), "normal_mode": bool(msg.normal_mode), "message": msg.status_message})
         def _sharpa(self, msg):
             self.controller.update_upstream("sharpa_status", {
-                "valid": bool(msg.left_valid or msg.right_valid),
+                "valid": bool(msg.left_valid and msg.right_valid),
                 "left_valid": bool(msg.left_valid),
                 "right_valid": bool(msg.right_valid),
+                "control_mode": str(msg.control_mode),
+                "position_control_ready": bool(msg.position_control_ready),
+                "control_error": str(msg.control_error),
             })
         def _upstream(self, key):
             def cb(msg):

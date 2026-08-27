@@ -254,8 +254,8 @@
   </div>
   <script>
     const cameraNames = ['ego', 'left_wrist', 'right_wrist'];
-    const urStates = ['已停止', '已复位', '运行中'];
-    const sharpaStates = ['已停止', '运行中'];
+    const urStates = ['已停止', '已复位', '运行中', '复位中', '启动准备中'];
+    const sharpaStates = ['已停止', '运行中', '复位中', '已复位', '启动准备中'];
     const recordStates = ['待机', '记录中'];
     const sourceNames = ['无', 'Bias', 'Vive', 'Actor'];
     const byId = id => document.getElementById(id);
@@ -365,8 +365,8 @@
       byId('bias-detail').textContent = bias.detail || biasResult.detail || (displayedBiasPhase === 'done' ? `完成 · 最大误差 ${biasError} rad` : '尚未执行 Bias 操作');
 
       const machineRunning = status.ur_state === 2 && status.sharpa_state === 1;
-      const machineReady = status.ur_state === 1 && status.sharpa_state === 0;
-      const biasActive = Boolean(bias.active || ['requested', 'homing_ur', 'homing_sharpa'].includes(bias.phase));
+      const machineReady = status.ur_state === 1 && status.sharpa_state === 3;
+      const biasActive = Boolean(bias.active || ['requested', 'preparing', 'homing_ur', 'homing_sharpa', 'verifying'].includes(bias.phase));
       byId('save-bias').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
       byId('reset-machine').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
       byId('start-machine').disabled = !controlOnline || !urOk || !sharpaOk || !viveOk || !manusOk || machineRunning || !machineReady || biasActive;

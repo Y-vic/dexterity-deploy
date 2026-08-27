@@ -9,6 +9,9 @@ from enum import IntEnum
 class SharpaState(IntEnum):
     STOPPED = 0
     RUNNING = 1
+    HOMING = 2
+    HOMED = 3
+    STARTING = 4
 
 
 class Source(IntEnum):
@@ -37,12 +40,23 @@ def arbitrate(
 ) -> Decision:
     if command_source == Source.UNKNOWN:
         return Decision(False, "command has no source; refusing to guess")
-    if command_source == Source.BIAS:
-        return ACCEPT
-    if sharpa_state != SharpaState.RUNNING:
+    if sharpa_state == SharpaState.STOPPED:
         return Decision(
             False,
             f"SharpA is stopped; {command_source.name.lower()} command rejected",
+        )
+    if sharpa_state == SharpaState.STARTING:
+        return Decision(
+            False,
+            f"SharpA is starting; {command_source.name.lower()} command rejected",
+        )
+    if sharpa_state in (SharpaState.HOMING, SharpaState.HOMED):
+        if command_source == Source.BIAS:
+            return ACCEPT
+        return Decision(
+            False,
+            f"SharpA is {sharpa_state.name.lower()}; only bias may command "
+            f"(got {command_source.name.lower()})",
         )
     if command_source == active_source:
         return ACCEPT

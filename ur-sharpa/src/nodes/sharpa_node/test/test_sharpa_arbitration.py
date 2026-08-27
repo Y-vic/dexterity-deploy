@@ -2,17 +2,31 @@ import numpy as np
 import pytest
 
 from sharpa_node.arbitration import SharpaState, Source, arbitrate
-from sharpa_node.sharpa_node import SuccessfulHandCommandCache, validate_hand_command
+from sharpa_node.sharpa_node import (
+    SuccessfulHandCommandCache,
+    control_mode_transition,
+    validate_hand_command,
+)
 
 
-@pytest.mark.parametrize("state", list(SharpaState))
-def test_bias_is_available_for_homing_and_reset(state):
+@pytest.mark.parametrize("state", [SharpaState.HOMING, SharpaState.HOMED])
+def test_bias_is_available_only_for_homing_and_homed(state):
     assert arbitrate(state, Source.ACTOR, Source.BIAS)
+
+
+@pytest.mark.parametrize(
+    "state", [SharpaState.STOPPED, SharpaState.STARTING, SharpaState.RUNNING]
+)
+def test_bias_is_rejected_outside_reset_states(state):
+    assert not arbitrate(state, Source.ACTOR, Source.BIAS)
 
 
 @pytest.mark.parametrize("source", [Source.VIVE, Source.ACTOR])
 def test_streaming_sources_are_blocked_while_stopped(source):
     assert not arbitrate(SharpaState.STOPPED, source, source)
+    assert not arbitrate(SharpaState.HOMING, source, source)
+    assert not arbitrate(SharpaState.HOMED, source, source)
+    assert not arbitrate(SharpaState.STARTING, source, source)
 
 
 def test_running_accepts_only_active_streaming_source():
@@ -22,6 +36,16 @@ def test_running_accepts_only_active_streaming_source():
 
 def test_unknown_source_is_rejected():
     assert not arbitrate(SharpaState.RUNNING, Source.UNKNOWN, Source.UNKNOWN)
+
+
+def test_mode_is_triggered_only_when_crossing_stopped_boundary():
+    assert control_mode_transition(SharpaState.STOPPED, SharpaState.HOMING) == "position"
+    assert control_mode_transition(SharpaState.STOPPED, SharpaState.STARTING) == "position"
+    assert control_mode_transition(SharpaState.STARTING, SharpaState.RUNNING) is None
+    assert control_mode_transition(SharpaState.HOMING, SharpaState.HOMED) is None
+    assert control_mode_transition(SharpaState.HOMED, SharpaState.RUNNING) is None
+    assert control_mode_transition(SharpaState.RUNNING, SharpaState.STOPPED) == "floating"
+    assert control_mode_transition(SharpaState.STOPPED, SharpaState.STOPPED) is None
 
 
 def test_successful_hand_command_cache_holds_full_command():
