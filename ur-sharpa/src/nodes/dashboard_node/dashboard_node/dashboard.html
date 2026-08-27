@@ -303,7 +303,7 @@
       catch(error){setFeedback(error.message,true)}finally{commandBusy=false;await refresh()}
     }
     async function loadServers(){
-      try{const payload=await requestJson('/api/servers');modelServer.replaceChildren();(payload.servers||[]).forEach(server=>{const option=document.createElement('option');option.value=server.id;option.textContent=`${server.label} · ${server.ssh_host}`;option.selected=server.id===payload.selected;modelServer.append(option)})}
+      try{const payload=await requestJson('/api/servers');modelServer.replaceChildren();(payload.servers||[]).forEach(server=>{const option=document.createElement('option');option.value=server.id;option.textContent=server.label;option.selected=server.id===payload.selected;modelServer.append(option)})}
       catch(error){setFeedback(error.message,true)}
     }
     async function switchServer(){
