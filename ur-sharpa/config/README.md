@@ -23,6 +23,6 @@ profiles only while the current model is stopped or faulted. Its `/model/status`
 message then changes both lifecycle SSH commands and the policy client's SSH
 tunnel target.
 
-On PS the maintained root is `/home/ps/dexterity`: code is under
-`repos/dreamzero`, checkpoints/datasets under `assets`, and machine-specific
+On PS the maintained root is `/home/ps/dexterity`: Dexhand code is under
+`repos/dexhand`, checkpoints/datasets under `assets`, and machine-specific
 runtime variables are in `profile.env`.
