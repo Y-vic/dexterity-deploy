@@ -35,3 +35,7 @@ float32[6] right_joint
 # servoJ command, allowing the other teleop arm to continue independently.
 bool left_enable
 bool right_enable
+
+# Validate and acknowledge this command without writing to the UR controller.
+# Only Actor commands may use dry-run.
+bool dry_run

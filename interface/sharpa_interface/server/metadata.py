@@ -13,7 +13,8 @@ from .serialization import MAX_MESSAGE_SIZE
 
 SERVER_SCHEMA = "sharpa_policy_server.v3"
 OBSERVATION_SCHEMA = "sharpa_policy_observation.v3"
-ACTION_SCHEMA = "sharpa_policy_action.v4"
+ACTION_SCHEMA = "sharpa_policy_action.v5"
+LEGACY_ACTION_SCHEMA = "sharpa_policy_action.v4"
 METADATA_FORMAT_SCHEMA = "sharpa_policy_metadata_format.v1"
 RESET_SCHEMA = "sharpa_policy_reset.v1"
 TRANSPORT = "websocket+binary_msgpack"
@@ -139,7 +140,7 @@ def validate_server_metadata(value: Any) -> dict[str, Any]:
               "max_message_size", "metadata_format")
     obj = _object(value, "metadata", fields)
     must_equal = {"schema": SERVER_SCHEMA, "transport": TRANSPORT,
-                  "observation_schema": OBSERVATION_SCHEMA, "action_schema": ACTION_SCHEMA,
+                  "observation_schema": OBSERVATION_SCHEMA,
                   "infer_path": "/infer", "health_path": "/healthz",
                   "metadata_path": "/metadata", "reset_path": "/reset"}
     normalized: dict[str, Any] = dict(obj)
@@ -151,6 +152,11 @@ def validate_server_metadata(value: Any) -> dict[str, Any]:
     for f, expected in must_equal.items():
         if normalized[f] != expected:
             raise MetadataValidationError(f"metadata.{f} must be {expected}")
+    if normalized["action_schema"] not in {ACTION_SCHEMA, LEGACY_ACTION_SCHEMA}:
+        raise MetadataValidationError(
+            "metadata.action_schema must be "
+            f"{ACTION_SCHEMA} (or transitional {LEGACY_ACTION_SCHEMA})"
+        )
     port = _integer(obj["port"], "metadata.port", minimum=1)
     if port > 65535:
         raise MetadataValidationError("metadata.port must be <= 65535")

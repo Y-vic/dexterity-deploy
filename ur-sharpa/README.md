@@ -29,12 +29,12 @@ python .\vive_process.py
 cd /home/yns/deploy/Deploy-v2/ur-sharpa
 source scripts/setup_env.sh
 ros2 launch ur_launch teleop.launch.py \
-  recording_root:=/media/yns/T9/0824_yns_unscrew_cap
+  recording_root:=/media/yns/T9/0825_0826_wyq_ppp
 ```
 
 Monitor 地址：<http://127.0.0.1:8080/>。
 录制根目录由 ROS launch 参数 `recording_root` 指定，默认为
-`/media/yns/T9/0824_yns_unscrew_cap`。未定义记录直接保存在该根目录，
+`/media/yns/T9/0826_wyq_ppp`。未定义记录直接保存在该根目录，
 已分类记录分别保存在其 `success/` 和 `fail/` 子目录。
 
 Manus 左右手独立控制：一只手无数据时，另一只手仍可使用。Client 和
@@ -49,7 +49,7 @@ Vive 左右 Tracker 和 UR 双臂也独立处理；某侧 Tracker 或 IK 失败�
 在 Monitor 中开始、停止、丢弃或上传录制。默认远端目录：
 
 ```text
-BAAI:/share/project/yenaisheng/dreamzero/datasets/postrain/ur-sharpa/raw_data/
+BAAI:/share/project/yenaisheng/sharpa-deploy/datasets/postrain/ur-sharpa/raw_data/
 ```
 
 录制启动不依赖 UR、SharpA 或 Vive 的运行状态。录制包含 UR、SharpA、触觉和
@@ -81,9 +81,22 @@ Dashboard 的执行来源可选 `Policy` 或 `Replay`。Replay 默认加载：
 /media/yns/T9/0824_yns_unscrew_cap/success/2026-08-24_16-01-44.683076
 ```
 
-默认 `execution steps=40`、`frequency=30 Hz`，且启用 `Dry run`。先在 Dry
-run 下点击“加载”和“开始 / 继续”检查输出预览；需要真实执行时，保持机器停止，
-选择 Replay，取消 Dry run 后重新加载，再依次执行“机器复位”→“机器启动”→
-“开始 / 继续”。Replay 会先从当前关节状态平滑对齐到样本起点，再逐段发送，且每段
-都等待 actor 的 UR 与 SharpA ACK。暂停或停止 Replay 会同时关闭机器执行门；继续前
-需要再次启动机器。
+默认 `execution steps=40`、`frequency=30 Hz`。机器控制区的“预览轨迹”与“启动”
+共用 Actor IK 执行链：预览仍逐步发布 UR/SharpA command 并等待双 ACK，但 command
+携带 `dry_run=true`，两个硬件节点只校验、不写控制器。Dashboard 的输出可视化只订阅
+`/actor_ik/trajectory`，显示 IK 后的最终规划，不再直接显示 Policy/Replay 原始 action。
+
+每次实机执行或预览统一写入仓库下的 `ur-sharpa/log/deploy/<timestamp>/`，包含 manifest、
+逐 chunk 轨迹、Policy 推理、Actor 排程、UR/SharpA SDK、command/ACK 事件、停止时的
+未完成现场和 summary；当前目录会显示在机器控制区。Policy 与 Replay 共用这一目录。
+日志默认保留 7 天、最多 100 次且总量最多 5 GiB，任一限制超出时按时间删除最旧的
+已完成日志，当前执行日志不会被删除；三个限制都可通过 launch 参数修改。Replay
+使用同一预览链路，整个已加载样本是一次性有限 buffer：到末尾保持 `COMPLETE` 并
+关闭执行门，不能循环或自动重启，必须点击“停止”重置进度后才能再次运行。暂停/继续
+保留当前 mode、chunk 和 step；统一“停止”只结束当前执行：Policy 保留已加载模型，
+Replay 保留已加载样本并把 cursor 重置为 0。卡片上的“卸载模型”和“卸载样本”才会
+释放对应资源。
+
+旧版预览日志已经迁移到 `ur-sharpa/log/deploy/legacy_previews/`，也受上述保留策略
+约束。自动清理不会处理 `ur-sharpa/log/` 下的 colcon 构建日志；需要时可由操作者
+单独清除。

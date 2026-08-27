@@ -8,6 +8,7 @@ from vive_node.tracker_source import (
     LEFT_VIVE_TO_WRIST,
     TrackerLatch,
     apply_relative_pose_delta,
+    interpolate_pose,
     limit_pose_delta,
     limit_ur_tcp_target,
     parse_tracker_message,
@@ -15,7 +16,11 @@ from vive_node.tracker_source import (
     retarget_vive_wrist,
 )
 from ur_common.geometry import UrSharpAWireGeometry, matrix_to_rotvec, rotvec_to_matrix
-from vive_node.vive_node import validate_ik_joint_step, vive_side_validity
+from vive_node.vive_node import (
+    solve_ik_with_cartesian_backtracking,
+    validate_ik_joint_step,
+    vive_side_validity,
+)
 
 
 def message(topic, position, orientation=None):
@@ -337,9 +342,134 @@ def test_ur_tcp_delta_is_limited_after_capture_frame_conversion():
     assert np.linalg.norm(matrix_to_rotvec(relative_rotation)) == pytest.approx(0.12)
 
 
+def test_pose_interpolation_uses_translation_and_shortest_rotation_fraction():
+    target = np.eye(4)
+    target[:3, 3] = (0.12, -0.04, 0.08)
+    target[:3, :3] = rotvec_to_matrix((0.0, 0.0, 0.8))
+
+    interpolated = interpolate_pose(np.eye(4), target, 0.25)
+
+    assert np.allclose(interpolated[:3, 3], (0.03, -0.01, 0.02))
+    assert np.allclose(matrix_to_rotvec(interpolated[:3, :3]), (0.0, 0.0, 0.2))
+
+
+@pytest.mark.parametrize("fraction", (-0.01, 1.01, np.nan))
+def test_pose_interpolation_rejects_invalid_fraction(fraction):
+    with pytest.raises(ValueError, match=r"within \[0, 1\]"):
+        interpolate_pose(np.eye(4), np.eye(4), fraction)
+
+
+def test_vive_ik_backtracks_cartesian_target_without_crossing_flip_gate():
+    class FakeSolver:
+        def __init__(self):
+            self.last_target_joint = np.zeros(6)
+            self.last_rejection = None
+
+    class FakeKinematics:
+        def __init__(self):
+            self.fake_solver = FakeSolver()
+            self.requested_x = []
+
+        def solver(self, _side):
+            return self.fake_solver
+
+        @staticmethod
+        def arm_fk(_joint):
+            return np.eye(4)
+
+        def arm_ik(self, target, _near, side, ref_joint):
+            assert side == "left"
+            assert np.allclose(ref_joint, np.zeros(6))
+            x_value = float(target[0, 3])
+            self.requested_x.append(x_value)
+            if x_value > 0.05:
+                self.fake_solver.last_rejection = {
+                    "stage": "WRIST_FLIP_HOLD",
+                    "minimum_max_delta_rad": 2.55,
+                }
+                return self.fake_solver.last_target_joint.copy()
+            self.fake_solver.last_rejection = None
+            candidate = np.full(6, x_value)
+            self.fake_solver.last_target_joint = candidate.copy()
+            return candidate
+
+    kinematics = FakeKinematics()
+    target = np.eye(4)
+    target[0, 3] = 0.10
+
+    solution, rejection, fraction, direct_rejection = (
+        solve_ik_with_cartesian_backtracking(
+            kinematics,
+            "left",
+            np.zeros(6),
+            np.zeros(6),
+            target,
+            0.35,
+        )
+    )
+
+    assert rejection is None
+    assert direct_rejection["stage"] == "WRIST_FLIP_HOLD"
+    assert fraction == pytest.approx(0.5)
+    assert np.allclose(solution, 0.05)
+    assert kinematics.requested_x == pytest.approx([0.10, 0.075, 0.05])
+
+
+def test_vive_ik_backtrack_never_bypasses_joint_step_gate():
+    class FakeSolver:
+        def __init__(self):
+            self.last_target_joint = np.full(6, 0.1)
+            self.last_rejection = None
+
+    class FakeKinematics:
+        def __init__(self):
+            self.fake_solver = FakeSolver()
+
+        def solver(self, _side):
+            return self.fake_solver
+
+        @staticmethod
+        def arm_fk(_joint):
+            return np.eye(4)
+
+        def arm_ik(self, target, _near, side, ref_joint):
+            del side, ref_joint
+            if target[0, 3] >= 0.10:
+                self.fake_solver.last_rejection = {"stage": "WRIST_FLIP_HOLD"}
+                return self.fake_solver.last_target_joint.copy()
+            self.fake_solver.last_rejection = None
+            candidate = np.full(6, 0.5)
+            self.fake_solver.last_target_joint = candidate.copy()
+            return candidate
+
+    kinematics = FakeKinematics()
+    target = np.eye(4)
+    target[0, 3] = 0.10
+
+    solution, rejection, fraction, _ = solve_ik_with_cartesian_backtracking(
+        kinematics,
+        "left",
+        np.zeros(6),
+        np.zeros(6),
+        target,
+        0.35,
+    )
+
+    assert rejection["stage"] == "WRIST_FLIP_HOLD"
+    assert fraction == 0.0
+    assert np.allclose(solution, 0.1)
+    assert np.allclose(kinematics.fake_solver.last_target_joint, 0.1)
+
+
 def test_vive_rejects_ik_branch_jump_against_measured_joints():
-    with pytest.raises(RuntimeError, match="left IK joint step exceeds"):
-        validate_ik_joint_step(np.zeros(6), [0.0, 0.0, 0.0, 0.0, 0.36, 0.0], 0.35, "left")
+    with pytest.raises(RuntimeError, match=r"stage=INITIAL_STEP_LIMIT.*axes=\[4\]"):
+        validate_ik_joint_step(
+            np.zeros(6),
+            [0.0, 0.0, 0.0, 0.0, 0.36, 0.0],
+            0.35,
+            "left",
+            stage="INITIAL_STEP_LIMIT",
+        )
 
 
 def test_vive_joint_step_treats_full_turn_as_equivalent():

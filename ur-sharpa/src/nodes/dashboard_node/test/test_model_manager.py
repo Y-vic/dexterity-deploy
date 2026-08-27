@@ -70,9 +70,8 @@ class FakeRunner:
                 command, 0 if port in self.in_use_ports else 1, "", ""
             )
         if "tmux new-session" in remote:
-            port = int(re.search(r"DZ_DEPLOY_PORT=(\d+)", remote).group(1))
-            self.launched_port = port
-            self.in_use_ports.add(port)
+            self.launched_port = 5500
+            self.in_use_ports.add(self.launched_port)
             self.launch_count += 1
         if "tmux kill-session" in remote and self.launched_port is not None:
             self.in_use_ports.discard(self.launched_port)
@@ -109,6 +108,7 @@ def test_catalog_and_start_use_only_catalog_launcher():
     assert "groot_n17_baseline" in launch
     assert manager.snapshot()["phase"] == "running"
     assert manager.snapshot()["port"] == 5500
+    assert "exec env" not in launch
     assert [event["phase"] for event in events] == [
         "starting",
         "loading",
@@ -140,28 +140,22 @@ def test_start_always_reuses_fixed_default_port():
     launch = next(
         command[-1] for command, _ in runner.commands if "tmux new-session" in command[-1]
     )
-    assert "DZ_DEPLOY_PORT=5500" in launch
+    assert "exec env" not in launch
 
 
-def test_groot_n17_family_uses_compatible_config_key_without_remote_edit():
-    payload = catalog_payload()
-    payload["tasks"][0]["runs"][0]["family"] = "groot_n17"
-    runner = FakeRunner(payload)
+def test_launch_does_not_patch_method_specific_configuration():
+    runner = FakeRunner(catalog_payload())
     manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
 
-    manager.start("ur_pick_place_push", "groot_n17", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
     wait_phase(manager, "running")
 
     launch = next(
         command[-1] for command, _ in runner.commands if "tmux new-session" in command[-1]
     )
-    assert "bash -c" in launch
-    assert "DZ_DEPLOY_TASK=ur_pick_place_push" in launch
-    assert "DZ_DEPLOY_RUN_ID=full-run-id" in launch
-    assert "DZ_DEPLOY_PROMPT=pick" in launch
-    assert "DZ_DEPLOY_CHECKPOINT=/remote/checkpoint" in launch
-    assert "s|^dz_load_task_config groot .*|:|" in launch
-    assert "ROOT=/share/project/yenaisheng/dreamzero" in launch
+    assert "bash scripts/deploy/groot_n17/launch.sh ur_pick_place_push groot_n17_baseline" in launch
+    assert "exec env" not in launch
+    assert "sed -e" not in launch
 
 
 def test_start_retries_once_on_the_same_fixed_port_after_process_failure():
@@ -180,6 +174,29 @@ def test_start_retries_once_on_the_same_fixed_port_after_process_failure():
 
     assert runner.launch_count == 2
     assert manager.snapshot()["port"] == 5500
+
+
+def test_loading_log_is_sanitized_and_kept_in_snapshot():
+    class LogRunner(FakeRunner):
+        def __call__(self, command, timeout_s):
+            if command[-1].startswith("tmux capture-pane"):
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    "\x1b[31mLoading checkpoint\x1b[0m\r\nshard 3/3\n",
+                    "",
+                )
+            return super().__call__(command, timeout_s)
+
+    manager = RemoteModelManager(
+        runner=LogRunner(catalog_payload()), startup_timeout_s=2.0
+    )
+
+    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    wait_phase(manager, "running")
+
+    assert manager.snapshot()["log_tail"] == "Loading checkpoint\nshard 3/3"
+    assert "\x1b" not in manager.snapshot()["log_tail"]
 
 
 def test_stop_kills_managed_server_and_releases_fixed_port():

@@ -36,7 +36,7 @@ HTML = (Path(__file__).with_name("static") / "index.html").read_text(
 )
 
 DEFAULT_REMOTE_DATA_PATH = (
-    "/share/project/yenaisheng/dreamzero/datasets/postrain/ur-sharpa/raw_data"
+    "/share/project/yenaisheng/datasets/postrain/ur-sharpa/raw_data"
 )
 
 

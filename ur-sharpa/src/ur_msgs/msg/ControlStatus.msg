@@ -31,6 +31,15 @@ uint8 record_state
 # SOURCE_UNKNOWN means no producer is gated in and all arm commands are refused.
 uint8 active_source
 
+# Deploy-only soft pause. The actor keeps the current chunk but must not
+# publish another hardware command or ExecutionDone until this becomes false.
+bool execution_paused
+
+# Actor execution is enabled in validation-only preview mode. UR and SharpA
+# remain stopped; Actor commands carry dry_run=true and drivers must not write
+# to hardware.
+bool execution_dry_run
+
 # Human-readable explanation of why the next transition is blocked, e.g.
 # "ur not homed: run bias first" or "sharpa telemetry stale 0.8s".
 # Empty string means nothing is blocked right now.

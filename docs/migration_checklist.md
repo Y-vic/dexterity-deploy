@@ -1,6 +1,8 @@
 # Migration checklist
 
-1. Server metadata 的 `action_schema` 升级为 `sharpa_policy_action.v4`。
+1. Server metadata 的 `action_schema` 升级为 `sharpa_policy_action.v5`，并在每个
+   action response 的 `execution` 中提供必填整数 `rtc`；旧 v4 仅在迁移期按
+   `rtc=0` 兼容。
 2. 每个 model adapter 填满 output 的全部最小 key，将 relative EEF 转为 absolute，
    无预测的 `auxiliary` value 填 `None`。
 3. Workstation ROS 只保留一个 `policy_client`，接入七路 producer 和

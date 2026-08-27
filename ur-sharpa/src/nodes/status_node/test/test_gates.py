@@ -1,5 +1,5 @@
 import time
-from status_node.gates import GateMachine, UrState, SharpaState, RecordState, Source
+from status_node.gates import GateMachine, RecordState, SharpaState, UrState
 
 def fresh(m, now):
     m.update_cameras({"ego":int(now*1e9),"left_wrist":int(now*1e9),"right_wrist":int(now*1e9)}, {"ego":True,"left_wrist":True,"right_wrist":True}, now)
@@ -71,16 +71,87 @@ def test_ur_home_actions_release_hardware_stop_latch():
     assert machine.attempt_start_ur().hardware_stop is False
     assert machine.attempt_reset_ur().hardware_stop is False
 
-def test_start_deploy_requires_deploy_mode_and_complete_reset():
+def test_start_deploy_requires_deploy_mode_and_hardware_but_not_reset():
     teleop=GateMachine(mode="teleop")
     teleop.ur_state=UrState.HOMED; teleop.sharpa_state=SharpaState.RUNNING
     assert not teleop.attempt_start_deploy()
     assert "expected deploy" in teleop.gate_reason
 
     deploy=GateMachine(mode="deploy")
-    deploy.ur_state=UrState.HOMED
     assert not deploy.attempt_start_deploy()
-    assert "reset both" in deploy.gate_reason
+    assert "UR is not in Normal mode" in deploy.gate_reason
+    hardware_ready(deploy)
+    assert deploy.attempt_start_deploy().hardware_stop is False
+    assert deploy.ur_state == UrState.RUNNING
+    assert deploy.sharpa_state == SharpaState.RUNNING
+    assert deploy.machine_ready is False
+
+
+def test_deploy_started_at_current_pose_can_pause_and_continue_without_reset():
+    machine = GateMachine(mode="deploy")
+    hardware_ready(machine)
+
+    assert machine.attempt_start_deploy()
+    paused = machine.attempt_pause_deploy()
+    assert paused.hardware_stop is None
+    assert machine.execution_paused is True
+    assert machine.ur_state == UrState.RUNNING
+    assert machine.sharpa_state == SharpaState.RUNNING
+    assert not machine.attempt_start_deploy()
+    assert "use continue" in machine.gate_reason
+    continued = machine.attempt_continue_deploy()
+    assert continued.hardware_stop is None
+    assert machine.execution_paused is False
+    assert machine.ur_state == UrState.RUNNING
+    assert machine.sharpa_state == SharpaState.RUNNING
+
+
+def test_stop_deploy_aborts_a_soft_paused_policy():
+    machine = GateMachine(mode="deploy")
+    hardware_ready(machine)
+    assert machine.attempt_start_deploy()
+    assert machine.attempt_pause_deploy()
+
+    stopped = machine.attempt_stop_deploy()
+
+    assert stopped.hardware_stop is True
+    assert machine.execution_paused is False
+    assert machine.ur_state == UrState.STOPPED
+    assert machine.sharpa_state == SharpaState.STOPPED
+
+
+def test_preview_deploy_keeps_hardware_stopped_and_resumes_same_mode():
+    machine = GateMachine(mode="deploy")
+    hardware_ready(machine)
+
+    started = machine.attempt_preview_deploy()
+
+    assert started.hardware_stop is None
+    assert machine.execution_dry_run is True
+    assert machine.ur_state == UrState.STOPPED
+    assert machine.sharpa_state == SharpaState.STOPPED
+    assert not machine.attempt_start_deploy()
+    assert "stop trajectory preview" in machine.gate_reason
+
+    assert machine.attempt_pause_deploy()
+    assert machine.execution_paused is True
+    assert not machine.attempt_start_deploy()
+    assert machine.attempt_continue_deploy()
+    assert machine.execution_paused is False
+    assert machine.execution_dry_run is True
+
+    stopped = machine.attempt_stop_deploy()
+    assert stopped.hardware_stop is None
+    assert machine.execution_dry_run is False
+    assert machine.execution_paused is False
+
+
+def test_preview_blocks_provider_switch_until_stopped():
+    machine = GateMachine(mode="deploy")
+    hardware_ready(machine)
+    assert machine.attempt_preview_deploy()
+    assert not machine.attempt_set_execution_provider("replay")
+    assert machine.execution_provider == "policy"
 
 
 def test_deploy_provider_switch_is_explicit_and_stopped_only():

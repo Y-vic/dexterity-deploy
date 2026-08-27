@@ -274,6 +274,9 @@ def test_flip_hold_on_holds_instead_of_flipping() -> None:
     assert np.allclose(out, ref)  # held
     assert solver.stats["flip_held"] == 1
     assert solver.stats["no_feasible"] == 1
+    assert solver.last_rejection["stage"] == "WRIST_FLIP_HOLD"
+    assert solver.last_rejection["dominant_axis"] == 4
+    assert solver.last_rejection["minimum_max_delta_rad"] == pytest.approx(2.4)
 
 
 def test_flip_hold_on_still_follows_normal_fast_motion() -> None:
@@ -338,6 +341,8 @@ def test_limit_filter_applies_regardless_of_flip_switch() -> None:
         out = solver.solve(IDENTITY_CART, ref, ref_joint=ref)
         assert np.allclose(out, ref)  # held, out of limit
         assert solver.stats["no_feasible"] == 1
+        assert solver.last_rejection["stage"] == "JOINT_POSITION_LIMIT"
+        assert solver.last_rejection["over_limit_axes"] == [0]
 
 
 def test_unwrap_rescues_an_equivalent_angle_within_limits() -> None:
@@ -354,12 +359,25 @@ def test_unwrap_rescues_an_equivalent_angle_within_limits() -> None:
     assert solver.stats["solved"] == 1
 
 
-def test_no_solution_holds_previous_target() -> None:
+def test_no_solution_holds_previous_target(capfd) -> None:
+    class NoisyNoSolutionKinematics(FakeKinematics):
+        def inverse(self, _pose):
+            import os
+
+            os.write(
+                2,
+                b"Error: (inverse kinematics) failed to get ik solution\n",
+            )
+            return []
+
     ref = np.array([0.1, -1.0, 1.0, -0.5, 0.5, 0.0])
-    solver = FastIKSolver(FakeKinematics([]), config=SafetyConfig())
+    solver = FastIKSolver(NoisyNoSolutionKinematics([]), config=SafetyConfig())
     out = solver.solve(IDENTITY_CART, ref, ref_joint=ref)
     assert np.allclose(out, ref)
     assert solver.stats["no_raw_solution"] == 1
+    assert solver.last_rejection["stage"] == "IKFAST_NO_SOLUTION"
+    assert solver.last_rejection["raw_candidates"] == 0
+    assert "failed to get ik solution" not in capfd.readouterr().err
 
 
 def test_unwrap_prefers_in_limit_equivalent_angle() -> None:

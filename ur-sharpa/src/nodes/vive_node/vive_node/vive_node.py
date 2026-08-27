@@ -10,6 +10,7 @@ from .tracker_source import (
     DEFAULT_ZMQ_ADDRESS,
     ZmqTrackerReceiver,
     apply_relative_pose_delta,
+    interpolate_pose,
     limit_ur_tcp_target,
     retarget_vive_wrist,
 )
@@ -19,9 +20,12 @@ VIVE_PUBLISHER_HINT = (
     r"Windows: cd D:\project\DexCap\STEP1_collect_data_202408updates "
     r"&& python .\vive_process_send.py"
 )
+IK_BACKTRACK_FRACTIONS = (0.75, 0.5, 0.25, 0.125, 0.0625)
 
 
-def validate_ik_joint_step(current, target, max_delta, side):
+def validate_ik_joint_step(
+    current, target, max_delta, side, stage="JOINT_STEP_LIMIT"
+):
     current_array = np.asarray(current, dtype=np.float64).reshape(-1)
     target_array = np.asarray(target, dtype=np.float64).reshape(-1)
     limit = float(max_delta)
@@ -32,9 +36,120 @@ def validate_ik_joint_step(current, target, max_delta, side):
     if not np.isfinite(limit) or limit <= 0.0:
         raise ValueError("max_delta must be finite and positive")
     delta = (target_array - current_array + np.pi) % (2.0 * np.pi) - np.pi
-    if np.any(np.abs(delta) > limit + 1.0e-9):
-        raise RuntimeError(f"{side} IK joint step exceeds {limit:.3f} rad")
+    rejected_axes = np.where(np.abs(delta) > limit + 1.0e-9)[0]
+    if rejected_axes.size:
+        raise RuntimeError(
+            f"{side} IK joint step exceeds {limit:.3f} rad; "
+            f"stage={stage} axes={rejected_axes.tolist()} "
+            f"delta={np.round(delta, 4).tolist()} "
+            f"current={np.round(current_array, 4).tolist()} "
+            f"target={np.round(target_array, 4).tolist()}"
+        )
     return delta
+
+
+def solve_ik_with_cartesian_backtracking(
+    kinematics,
+    side,
+    measured_joint,
+    reference_joint,
+    target_tcp,
+    max_joint_step,
+    fractions=IK_BACKTRACK_FRACTIONS,
+):
+    """Keep the current IK branch by shortening a rejected Cartesian step.
+
+    Near a wrist singularity, the full Vive target can temporarily expose only
+    the opposite analytic IK branch.  Moving part-way from the measured TCP
+    normally leaves the current branch available.  Every fallback candidate
+    still goes through FastIK's wrist-flip gate and the measured-joint step
+    gate; this never turns a large branch jump into a clipped robot command.
+
+    Returns ``(solution, active_rejection, used_fraction, direct_rejection)``.
+    A fraction below 1 means a safe fallback was found.  Zero means every
+    fallback was rejected and the returned solution is the solver's hold.
+    """
+    measured = np.asarray(measured_joint, dtype=np.float64).reshape(-1)
+    reference = np.asarray(reference_joint, dtype=np.float64).reshape(-1)
+    target = np.asarray(target_tcp, dtype=np.float64)
+    if measured.shape != (6,) or reference.shape != (6,):
+        raise ValueError("IK joint vectors must have shape (6,)")
+
+    solver = kinematics.solver(side)
+    saved_target = (
+        None
+        if solver.last_target_joint is None
+        else np.asarray(solver.last_target_joint, dtype=np.float64).copy()
+    )
+    solution = np.asarray(
+        kinematics.arm_ik(
+            target,
+            reference,
+            side=side,
+            ref_joint=reference,
+        ),
+        dtype=np.float64,
+    )
+    direct_rejection = solver.last_rejection
+    if (
+        direct_rejection is None
+        or direct_rejection.get("stage") != "WRIST_FLIP_HOLD"
+    ):
+        return solution, direct_rejection, 1.0, direct_rejection
+
+    measured_tcp = kinematics.arm_fk(measured)
+    for fraction in fractions:
+        amount = float(fraction)
+        if not np.isfinite(amount) or amount <= 0.0 or amount >= 1.0:
+            raise ValueError("IK backtrack fractions must be within (0, 1)")
+        fallback_target = interpolate_pose(measured_tcp, target, amount)
+        candidate = np.asarray(
+            kinematics.arm_ik(
+                fallback_target,
+                reference,
+                side=side,
+                ref_joint=reference,
+            ),
+            dtype=np.float64,
+        )
+        if solver.last_rejection is not None:
+            continue
+        try:
+            validate_ik_joint_step(
+                measured,
+                candidate,
+                max_joint_step,
+                side,
+                stage="CARTESIAN_BACKTRACK_STEP_LIMIT",
+            )
+        except RuntimeError:
+            # solve() records an accepted candidate immediately. Do not let a
+            # candidate rejected by the second gate become the next IK branch
+            # reference.
+            solver.last_target_joint = (
+                None if saved_target is None else saved_target.copy()
+            )
+            continue
+        return candidate, None, amount, direct_rejection
+
+    solver.last_target_joint = None if saved_target is None else saved_target.copy()
+    solver.last_rejection = direct_rejection
+    return solution, direct_rejection, 0.0, direct_rejection
+
+
+def compact_ik_diagnostic(diagnostic):
+    """Round numeric diagnostics so one rejection fits on one ROS log line."""
+
+    def compact(value):
+        if isinstance(value, float):
+            return round(value, 4)
+        if isinstance(value, list):
+            return [compact(item) for item in value]
+        if isinstance(value, dict):
+            return {key: compact(item) for key, item in value.items()}
+        return value
+
+    return compact(dict(diagnostic))
 
 
 def vive_side_validity(frame, stale_topics):
@@ -180,6 +295,10 @@ def main(args=None):
             self._last_command_monotonic = 0.0
             self._last_command_monotonic_by_side = {"left": 0.0, "right": 0.0}
             self._last_ik_error = {"left": "", "right": ""}
+            self._ik_rejection_count = {"left": 0, "right": 0}
+            self._ik_rejection_stage = {"left": "", "right": ""}
+            self._last_ik_rejection_log_at = {"left": 0.0, "right": 0.0}
+            self._last_ik_backtrack_log_at = {"left": 0.0, "right": 0.0}
             self.command_pub = self.create_publisher(ArmCommand, "/ur/command", 10)
             self.status_pub = self.create_publisher(
                 String, "/teleop/vive_status", 10
@@ -274,6 +393,46 @@ def main(args=None):
                 self.translation_scale,
             )
 
+        def _report_ik_rejection(self, side, diagnostic):
+            payload = compact_ik_diagnostic(diagnostic)
+            stage = str(payload.get("stage", "IK_REJECTED"))
+            self._ik_rejection_count[side] += 1
+            now = time.monotonic()
+            if (
+                stage != self._ik_rejection_stage[side]
+                or now - self._last_ik_rejection_log_at[side] >= 0.5
+            ):
+                payload["side"] = side
+                payload["consecutive"] = self._ik_rejection_count[side]
+                self.get_logger().warning(
+                    "IK_REJECT "
+                    + json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+                )
+                self._last_ik_rejection_log_at[side] = now
+            self._ik_rejection_stage[side] = stage
+
+        def _clear_ik_rejection(self, side):
+            count = self._ik_rejection_count[side]
+            if count:
+                self.get_logger().info(
+                    f"IK_RECOVER side={side} after={count} rejected frame(s) "
+                    f"last_stage={self._ik_rejection_stage[side]}"
+                )
+            self._ik_rejection_count[side] = 0
+            self._ik_rejection_stage[side] = ""
+
+        def _report_ik_backtrack(self, side, fraction, direct_rejection):
+            now = time.monotonic()
+            if now - self._last_ik_backtrack_log_at[side] < 0.5:
+                return
+            diagnostic = compact_ik_diagnostic(direct_rejection)
+            self.get_logger().info(
+                f"IK_BACKTRACK side={side} fraction={fraction:.4f} "
+                f"direct_min_delta_rad="
+                f"{diagnostic.get('minimum_max_delta_rad', 'unknown')}"
+            )
+            self._last_ik_backtrack_log_at[side] = now
+
         def _tick(self):
             frame = self.receiver.latch.peek()
             stale_topics = (
@@ -321,23 +480,56 @@ def main(args=None):
                             self.max_translation_delta_m,
                             self.max_rotation_delta_rad,
                         )
-                        solution = np.asarray(
-                            self.kinematics.arm_ik(
-                                ur_base_target,
-                                self.seeds[side],
-                                side=side,
-                                ref_joint=self.seeds[side],
-                            ),
-                            dtype=np.float32,
-                        )
                         joint_limit = (
                             self.initial_joint_tolerance_rad
                             if self._first_command_pending[side]
                             else self.max_joint_step_rad
                         )
-                        validate_ik_joint_step(
-                            self.measured_joint[side], solution, joint_limit, side
+                        joint_stage = (
+                            "INITIAL_STEP_LIMIT"
+                            if self._first_command_pending[side]
+                            else "JOINT_STEP_LIMIT"
                         )
+                        (
+                            solution,
+                            solver_rejection,
+                            backtrack_fraction,
+                            direct_rejection,
+                        ) = solve_ik_with_cartesian_backtracking(
+                            self.kinematics,
+                            side,
+                            self.measured_joint[side],
+                            self.seeds[side],
+                            ur_base_target,
+                            joint_limit,
+                        )
+                        solution = np.asarray(solution, dtype=np.float32)
+                        if solver_rejection is not None:
+                            self._report_ik_rejection(side, solver_rejection)
+                        elif backtrack_fraction < 1.0:
+                            self._report_ik_backtrack(
+                                side, backtrack_fraction, direct_rejection
+                            )
+                        try:
+                            validate_ik_joint_step(
+                                self.measured_joint[side],
+                                solution,
+                                joint_limit,
+                                side,
+                                stage=joint_stage,
+                            )
+                        except RuntimeError as exc:
+                            self._report_ik_rejection(
+                                side,
+                                {
+                                    "stage": joint_stage,
+                                    "limit_rad": joint_limit,
+                                    "detail": str(exc),
+                                },
+                            )
+                            raise
+                        if solver_rejection is None:
+                            self._clear_ik_rejection(side)
                         self._first_command_pending[side] = False
                         self.seeds[side] = solution
                         self._motion_ready[side] = True
@@ -355,6 +547,14 @@ def main(args=None):
                         self._last_ik_error[side] = ""
                     except Exception as exc:
                         error = str(exc)
+                        if "stage=" not in error:
+                            self._report_ik_rejection(
+                                side,
+                                {
+                                    "stage": "VIVE_IK_PIPELINE_ERROR",
+                                    "detail": error,
+                                },
+                            )
                         self._reset_alignment(side)
                         self._last_ik_error[side] = error
             self._publish_status(frame, stale_topics, tracking_valid, side_tracking_valid)

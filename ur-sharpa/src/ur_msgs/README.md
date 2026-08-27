@@ -29,9 +29,9 @@ canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 | 类型 | 一句话职责 |
 | --- | --- |
 | `CameraSet` | 三路命名相机 JPEG，每路独立采样时间戳；不提供拼接图字段。 |
-| `ArmCommand` | 双臂 6D joint 目标，`source` 区分 `bias`/`vive`/`actor`（整型常量）。 |
+| `ArmCommand` | 双臂 6D joint 目标，`source` 区分 `bias`/`vive`/`actor`；Actor 可携带 `dry_run`。 |
 | `UrStateFrame` | 双臂 6D joint + 9D EEF（FK 结果）+ ACK/有效性状态。 |
-| `HandCommand` | 44D 手部 joint 指令，含左右手 enable。 |
+| `HandCommand` | 44D 手部 joint 指令，含左右手 enable 与 Actor `dry_run`。 |
 | `HandStateFrame` | 44D 手部 `q`，附 `dq`/`tau`，以及最后收到且仍新鲜的 Manus Teleop `q_cmd/valid/timestamp/source`。 |
 | `TauFrame` | 每手 22D 力矩，sensor buffer 路径，按手拆分。 |
 | `WrenchFrame` | 每手 `(5,6)` 指尖力/力矩，行主序展平。 |
@@ -40,7 +40,8 @@ canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 | `HardwareCommandResult` | 单步硬件指令的 ACK / 拒绝原因。 |
 | `PolicyObs` | FK 之后发布的聚合 observation 引用；内联小状态，大模态只留时间戳。 |
 | `ExecutableAction` | 截断后的 action slice，含完整 identity 与执行参数透传。 |
-| `ExecutionDone` | slice 终态，`executed_steps` 为**累计**语义。 |
+| `ActorTrajectory` | Actor IK 后的统一 chunk 轨迹；Dashboard 与预览日志的唯一预测来源。 |
+| `ExecutionDone` | slice 的 fetch/done 双边沿；只有 `execute_done` 是终态，`executed_steps` 为**累计**语义。 |
 
 ## Service
 

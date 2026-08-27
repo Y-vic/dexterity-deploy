@@ -25,8 +25,10 @@ are generated for UR5 DH parameters.
 
 from __future__ import annotations
 
-import contextlib
 import os
+import sys
+import tempfile
+import threading
 from typing import Any
 
 import numpy as np
@@ -37,6 +39,10 @@ from .safety import SafetyConfig
 # Shoulder-side joints cost more when they deviate: base/shoulder/elbow get a
 # larger weight, wrist joints a smaller one.
 _DEFAULT_JOINT_WEIGHTS = np.array([1.5, 1.5, 1.3, 1.0, 1.0, 0.8])
+_NATIVE_STDERR_LOCK = threading.Lock()
+_GENERIC_IKFAST_ERROR = (
+    b"Error: (inverse kinematics) failed to get ik solution\n"
+)
 
 __all__ = ["FastIKSolver", "cart_to_matrix"]
 
@@ -48,6 +54,41 @@ def cart_to_matrix(cart_pose: Any) -> np.ndarray:
     ee[:3, :3] = rotvec_to_matrix(cart_pose[3:])
     ee[:3, 3] = cart_pose[:3]
     return ee
+
+
+def _inverse_with_filtered_stderr(kinematics: Any, pose: list[float]):
+    """Drop the binding's generic error while preserving unrelated stderr.
+
+    The bundled C++ extension writes directly to file descriptor 2, so Python's
+    redirect_stderr cannot catch it. The redirection is process-wide for the
+    few microseconds spent in IKFast; output from another thread is replayed
+    unchanged after the call.
+    """
+
+    with _NATIVE_STDERR_LOCK:
+        try:
+            sys.stderr.flush()
+        except Exception:
+            pass
+        saved_stderr = os.dup(2)
+        try:
+            with tempfile.TemporaryFile() as captured:
+                os.dup2(captured.fileno(), 2)
+                try:
+                    result = kinematics.inverse(pose)
+                finally:
+                    try:
+                        sys.stderr.flush()
+                    except Exception:
+                        pass
+                    os.dup2(saved_stderr, 2)
+                captured.seek(0)
+                remaining = captured.read().replace(_GENERIC_IKFAST_ERROR, b"")
+                if remaining:
+                    os.write(saved_stderr, remaining)
+                return result
+        finally:
+            os.close(saved_stderr)
 
 
 class FastIKSolver:
@@ -137,16 +178,19 @@ class FastIKSolver:
             "j4_sign_kept": 0,
             "flip_held": 0,         # holds attributable to the flip filter
         }
+        # Populated only when solve() returns a held target. Vive uses this to
+        # distinguish an unreachable Cartesian pose from the two safety gates.
+        self.last_rejection: dict[str, Any] | None = None
+        self._last_filter_rejection: dict[str, Any] | None = None
 
     # ---- internals ----
     def _raw_solutions(self, cart_pose: Any) -> np.ndarray:
         """Call ikfast, return (n,6) analytic solutions; empty array if none."""
         ee = cart_to_matrix(cart_pose)
         try:
-            # ikfast prints to stderr on failure; mute it like v1 calc_fast_IK did.
-            with open(os.devnull, "w") as devnull:
-                with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                    configs = self.kin.inverse(ee.reshape(-1).tolist())
+            configs = _inverse_with_filtered_stderr(
+                self.kin, ee.reshape(-1).tolist()
+            )
         except Exception:
             return np.empty((0, self.n_joints))
         if configs is None or len(configs) == 0:
@@ -207,6 +251,9 @@ class FastIKSolver:
         """
         self.stats["calls"] += 1
         current_joint = np.asarray(current_joint, dtype=np.float64)
+        target = np.asarray(cart_pose, dtype=np.float64).reshape(-1)
+        self.last_rejection = None
+        self._last_filter_rejection = None
 
         if ref_joint is not None:
             ref = np.asarray(ref_joint, dtype=np.float64)
@@ -225,6 +272,20 @@ class FastIKSolver:
             self.stats["no_raw_solution"] += 1
             best = self._try_rtde_fallback(cart_pose, ref, current_joint, allow_large)
             if best is None:
+                rejection = self._last_filter_rejection or {
+                    "stage": "IKFAST_NO_SOLUTION",
+                    "raw_candidates": 0,
+                    "detail": (
+                        "IKFast returned zero analytic solutions; joint-position, "
+                        "wrist-flip and Vive step limits were not evaluated"
+                    ),
+                }
+                self.last_rejection = {
+                    **rejection,
+                    "side": self.name,
+                    "target_tcp": target.tolist(),
+                    "reference_joint": ref.tolist(),
+                }
                 fallback = (self.last_target_joint if self.last_target_joint is not None
                             else current_joint)
                 if self.verbose:
@@ -240,6 +301,15 @@ class FastIKSolver:
         best = self._filter_and_pick(sols, ref, allow_large)
         if best is None:
             self.stats["no_feasible"] += 1
+            self.last_rejection = {
+                **(self._last_filter_rejection or {
+                    "stage": "IK_CANDIDATES_REJECTED",
+                    "detail": "all analytic candidates were rejected",
+                }),
+                "side": self.name,
+                "target_tcp": target.tolist(),
+                "reference_joint": ref.tolist(),
+            }
             fallback = (self.last_target_joint if self.last_target_joint is not None
                         else current_joint)
             if self.verbose:
@@ -268,9 +338,27 @@ class FastIKSolver:
         solution. Both keep the limit filter and the unwrap+nearest pick.
         """
         sols = np.atleast_2d(np.asarray(sols, dtype=np.float64))
+        self._last_filter_rejection = None
         within_pos = np.all(np.abs(sols) <= self.joint_pos_limit[None, :], axis=1)
         cand = sols[within_pos]
         if cand.shape[0] == 0:
+            overflow = np.maximum(
+                np.abs(sols) - self.joint_pos_limit[None, :], 0.0
+            )
+            closest_index = int(np.argmin(np.max(overflow, axis=1)))
+            closest = sols[closest_index]
+            bad_axes = np.where(
+                np.abs(closest) > self.joint_pos_limit + 1.0e-9
+            )[0]
+            self._last_filter_rejection = {
+                "stage": "JOINT_POSITION_LIMIT",
+                "raw_candidates": int(sols.shape[0]),
+                "in_position_limit": 0,
+                "limit_rad": self.joint_pos_limit.tolist(),
+                "closest_candidate": closest.tolist(),
+                "over_limit_axes": [int(axis) for axis in bad_axes],
+                "detail": "all IK candidates exceeded the absolute joint range",
+            }
             return None
 
         # ==== SWITCH 2 applied here: enable_flip_hold ======================
@@ -309,6 +397,19 @@ class FastIKSolver:
                 soft = cand[max_ax <= self.soft_flip_limit]
                 if soft.shape[0] == 0:
                     self.stats["flip_held"] += 1
+                    closest_index = int(np.argmin(max_ax))
+                    per_axis_delta = delta[closest_index]
+                    self._last_filter_rejection = {
+                        "stage": "WRIST_FLIP_HOLD",
+                        "raw_candidates": int(sols.shape[0]),
+                        "in_position_limit": int(cand.shape[0]),
+                        "flip_threshold_rad": float(self.flip_threshold),
+                        "minimum_max_delta_rad": float(max_ax[closest_index]),
+                        "dominant_axis": int(np.argmax(per_axis_delta)),
+                        "per_axis_delta_rad": per_axis_delta.tolist(),
+                        "closest_candidate": cand[closest_index].tolist(),
+                        "detail": "every in-range candidate crossed the flip threshold",
+                    }
                     return None
                 cand = soft
                 self.stats["soft_flip"] += 1
@@ -320,6 +421,22 @@ class FastIKSolver:
             else:
                 # Every candidate is a wrist flip -> hold (crash protection).
                 self.stats["flip_held"] += 1
+                max_delta = np.max(delta, axis=1)
+                closest_index = int(np.argmin(max_delta))
+                closest = cand[closest_index]
+                per_axis_delta = delta[closest_index]
+                dominant_axis = int(np.argmax(per_axis_delta))
+                self._last_filter_rejection = {
+                    "stage": "WRIST_FLIP_HOLD",
+                    "raw_candidates": int(sols.shape[0]),
+                    "in_position_limit": int(cand.shape[0]),
+                    "flip_threshold_rad": float(self.flip_threshold),
+                    "minimum_max_delta_rad": float(max_delta[closest_index]),
+                    "dominant_axis": dominant_axis,
+                    "per_axis_delta_rad": per_axis_delta.tolist(),
+                    "closest_candidate": closest.tolist(),
+                    "detail": "every in-range candidate crossed the flip threshold",
+                }
                 return None
 
         dist = np.sum(self.joint_weights[None, :] * np.abs(cand - ref[None, :]), axis=1)

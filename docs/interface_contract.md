@@ -57,7 +57,7 @@ key 都必须存在，允许添加额外 key；只有标注 `| None` 的 value �
     },
     "execution_feedback": {
         "last_action_id": str | None,
-        "executed_steps": int,
+        "executed_steps": int,  # 当前可执行切片内计数，不包含 execute_start
         "success": bool,
     },
 }
@@ -83,7 +83,7 @@ canonical wrist contract：
 
 ```python
 {
-    "schema": "sharpa_policy_action.v4",
+    "schema": "sharpa_policy_action.v5",
     "session_id": str,
     "request_id": int,
     "action_id": str,
@@ -94,6 +94,7 @@ canonical wrist contract：
         "action_length": int,
         "execute_start": int,
         "execute_length": int,
+        "rtc": int,  # 0=完成时 fetch；N=剩余 N 步时 fetch
     },
     "action": {
         "left_wrist": {
@@ -128,6 +129,10 @@ canonical wrist contract：
 }
 ```
 
+`v5` 的 `execution.rtc` 必填。迁移期 Deploy 可以接受 metadata 声明为
+`sharpa_policy_action.v4` 的 server，并固定按 `rtc=0` 处理；metadata 声明为 v5
+时缺失 `rtc` 必须拒绝。
+
 Server policy 内部可以使用 relative EEF，但发送到 workstation 前必须转换为
 `absolute`；`parse_policy_action()` 默认拒绝 public boundary 上的 relative EEF。
 当前 auxiliary 所有值填 `None`，以后支持预测模态时保留同名 key。
@@ -158,14 +163,21 @@ identity，`action_ik` 只替换或补充 joint plan，不能修改这些字段�
         "action_length": int,   # 原始 chunk 长度
         "execute_start": int,
         "execute_length": int,  # 当前 action arrays 的第一维
+        "rtc": int,
     },
     "action": ActionSlice,
 }
 ```
 
-## ExecutionDone
+## Execution fetch/done
 
-`action_execute` 完成或终止一个 slice 时只发布一次：
+Actor 对每个 slice 发布两个相互独立的状态边沿：`execute_fetch` 允许 Policy
+Client 请求下一块，`execute_done` 才表示当前块完成并允许 Actor 切换执行块。
+
+- `rtc == 0`：最后一步 ACK 后一次发布 `execute_fetch=true, execute_done=true`。
+- `rtc > 0`：剩余 rtc 步时发布 `true,false`，最后一步 ACK 后发布 `false,true`。
+
+只有 `execute_done=true` 才转换成服务端的终态 dict：
 
 ```python
 {
@@ -184,3 +196,6 @@ identity，`action_ik` 只替换或补充 joint plan，不能修改这些字段�
 
 成功时 `executed_steps == execute_start + execute_length`。Policy client 只接受与
 当前 action 完全匹配的 done，随后把它转成下一次 input 的 execution feedback。
+这里的 `ExecutionDone.executed_steps` 是 Actor 内部累计计数；转换到 observation
+wire 的 `execution_feedback.executed_steps` 时必须减去 `execute_start`，因此 RTC
+fetch 时恒为 `execute_length - rtc`。

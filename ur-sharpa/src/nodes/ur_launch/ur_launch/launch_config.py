@@ -238,7 +238,7 @@ def _teleop_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
         _argument("upload_host", "BAAI"),
         _argument(
             "upload_path",
-            "/share/project/yenaisheng/dreamzero/datasets/postrain/ur-sharpa/raw_data",
+            "/share/project/yenaisheng/datasets/postrain/ur-sharpa/raw_data",
         ),
         _argument("status_timeout_s", "2.0"),
     ]
@@ -334,7 +334,7 @@ def _teleop_nodes() -> list[Node]:
     ]
 
 
-def _deploy_arguments() -> list[DeclareLaunchArgument]:
+def _deploy_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
     return [
         _argument("dashboard_port", "8088"),
         _argument("policy_server_url", "ws://127.0.0.1:5500/infer"),
@@ -349,6 +349,10 @@ def _deploy_arguments() -> list[DeclareLaunchArgument]:
         _argument("replay_joint_source", "measured"),
         _argument("replay_loop", "false"),
         _argument("replay_dry_run", "true"),
+        _argument("execution_log_root", str(workspace_root / "log" / "deploy")),
+        _argument("execution_log_retention_days", "7"),
+        _argument("execution_log_max_runs", "100"),
+        _argument("execution_log_max_total_bytes", str(5 * 1024 * 1024 * 1024)),
     ]
 
 
@@ -384,6 +388,20 @@ def _deploy_nodes() -> list[Node]:
             executable="actor_ik_node",
             name="actor_ik_node",
             output="screen",
+            parameters=[{
+                "execution_log_root": LaunchConfiguration("execution_log_root"),
+                "execution_log_retention_days": ParameterValue(
+                    LaunchConfiguration("execution_log_retention_days"),
+                    value_type=int,
+                ),
+                "execution_log_max_runs": ParameterValue(
+                    LaunchConfiguration("execution_log_max_runs"), value_type=int
+                ),
+                "execution_log_max_total_bytes": ParameterValue(
+                    LaunchConfiguration("execution_log_max_total_bytes"),
+                    value_type=int,
+                ),
+            }],
         ),
         Node(
             package="replay_node",
@@ -415,7 +433,9 @@ def build_launch_description(mode: str) -> LaunchDescription:
         raise ValueError(f"mode must be one of {MODES}, received {mode!r}")
     workspace_root = _workspace_root()
     mode_arguments = (
-        _teleop_arguments(workspace_root) if mode == "teleop" else _deploy_arguments()
+        _teleop_arguments(workspace_root)
+        if mode == "teleop"
+        else _deploy_arguments(workspace_root)
     )
     mode_nodes = _teleop_nodes() if mode == "teleop" else _deploy_nodes()
     return LaunchDescription([

@@ -23,6 +23,7 @@ def valid_action() -> dict:
             "action_length": length,
             "execute_start": 4,
             "execute_length": 4,
+            "rtc": 0,
         },
         "action": {
             "left_wrist": {
@@ -55,6 +56,7 @@ def test_action_is_extensible_and_returns_execution_slice() -> None:
     )
 
     assert parsed.execution_slice == slice(4, 8)
+    assert parsed.execution.rtc == 0
     assert parsed.right_wrist.eef_def == "absolute"
     executable = parsed.executable_action()
     assert executable["left_wrist"]["eef"].shape == (4, 9)
@@ -90,6 +92,59 @@ def test_action_rejects_out_of_bounds_execution_slice() -> None:
     response["execution"]["execute_start"] = 14
 
     with pytest.raises(ActionValidationError, match="slice exceeds"):
+        parse_policy_action(
+            response,
+            expected_session_id="episode-trex",
+            expected_request_id=7,
+        )
+
+
+def test_action_accepts_rtc_fetch_window_smaller_than_execution_slice() -> None:
+    response = valid_action()
+    response["execution"]["rtc"] = 2
+
+    parsed = parse_policy_action(
+        response,
+        expected_session_id="episode-trex",
+        expected_request_id=7,
+    )
+
+    assert parsed.execution.rtc == 2
+    assert parsed.execution_command()["execution"]["rtc"] == 2
+
+
+def test_action_rejects_rtc_window_covering_the_whole_execution_slice() -> None:
+    response = valid_action()
+    response["execution"]["rtc"] = 4
+
+    with pytest.raises(ActionValidationError, match="smaller than execute_length"):
+        parse_policy_action(
+            response,
+            expected_session_id="episode-trex",
+            expected_request_id=7,
+        )
+
+
+def test_transitional_v4_defaults_to_synchronous_rtc_zero() -> None:
+    response = valid_action()
+    response["schema"] = "sharpa_policy_action.v4"
+    del response["execution"]["rtc"]
+
+    parsed = parse_policy_action(
+        response,
+        expected_session_id="episode-trex",
+        expected_request_id=7,
+        expected_schema="sharpa_policy_action.v4",
+    )
+
+    assert parsed.execution.rtc == 0
+
+
+def test_v5_requires_rtc() -> None:
+    response = valid_action()
+    del response["execution"]["rtc"]
+
+    with pytest.raises(ActionValidationError, match="missing fields: rtc"):
         parse_policy_action(
             response,
             expected_session_id="episode-trex",

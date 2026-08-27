@@ -91,11 +91,13 @@ class ServerClient:
         expected_session_id: str,
         expected_request_id: int,
     ) -> tuple[ParsedPolicyAction, float]:
+        metadata = self.connect()
         result = self.infer(payload)
         action = parse_policy_action(
             result.payload,
             expected_session_id=expected_session_id,
             expected_request_id=expected_request_id,
+            expected_schema=metadata["action_schema"],
         )
         return action, result.latency_s
 

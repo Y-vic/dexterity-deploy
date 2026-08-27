@@ -34,6 +34,8 @@ class SyncPhase(str, Enum):
     READY = "ready"
     INFERENCE = "inference"
     EXECUTING = "executing"
+    PREFETCHING = "prefetching"
+    BUFFERED = "buffered"
     FAILED = "failed"
     CLOSED = "closed"
 
@@ -146,7 +148,12 @@ def build_execution_done(
 
 
 class SyncExecutionGate:
-    """Allow one inference and one action execution at a time."""
+    """One-request/one-buffer gate shared by sync and RTC execution.
+
+    ``rtc == 0`` follows READY -> INFERENCE -> EXECUTING -> READY.  RTC adds
+    PREFETCHING and BUFFERED while the current action remains authoritative;
+    it never changes the terminal completion semantics of that action.
+    """
 
     def __init__(self, execution_mode: str = "synchronous") -> None:
         mode = execution_mode.strip().lower()
@@ -158,6 +165,7 @@ class SyncExecutionGate:
         self.next_request_id = 0
         self.active_request_id: int | None = None
         self.active_action: ParsedPolicyAction | None = None
+        self.queued_action: ParsedPolicyAction | None = None
         self.feedback = initial_execution_feedback()
 
     def begin_inference(self) -> tuple[int, dict[str, Any]]:
@@ -170,24 +178,89 @@ class SyncExecutionGate:
         return request_id, dict(self.feedback)
 
     def accept_action(self, action: ParsedPolicyAction) -> dict[str, Any]:
-        if self.phase is not SyncPhase.INFERENCE:
+        if self.phase not in {SyncPhase.INFERENCE, SyncPhase.PREFETCHING}:
             raise RuntimeError(f"cannot accept action while phase={self.phase.value}")
         if action.request_id != self.active_request_id:
             raise ExecutionValidationError("action request_id does not match active inference")
-        self.active_action = action
-        self.phase = SyncPhase.EXECUTING
+        self.active_request_id = None
+        if self.phase is SyncPhase.PREFETCHING and self.active_action is not None:
+            if self.queued_action is not None:
+                raise RuntimeError("next action is already buffered")
+            self.queued_action = action
+            self.phase = SyncPhase.BUFFERED
+        else:
+            self.active_action = action
+            self.phase = SyncPhase.EXECUTING
         return action.execution_command()
+
+    def begin_prefetch(
+        self,
+        *,
+        request_id: int,
+        action_id: str,
+        revision: int,
+        execute_start: int,
+        execute_length: int,
+        executed_steps: int,
+    ) -> tuple[int, dict[str, Any]]:
+        """Open one inference request while the current action keeps running."""
+
+        if self.phase is not SyncPhase.EXECUTING or self.active_action is None:
+            raise RuntimeError(f"cannot prefetch while phase={self.phase.value}")
+        action = self.active_action
+        identity = (
+            int(request_id) == action.request_id
+            and str(action_id) == action.action_id
+            and int(revision) == action.revision
+            and int(execute_start) == action.execution.execute_start
+            and int(execute_length) == action.execution.execute_length
+        )
+        if not identity:
+            raise ExecutionValidationError("execute_fetch does not match active action")
+        if action.execution.rtc <= 0:
+            raise ExecutionValidationError(
+                "execute_fetch before done requires action execution.rtc > 0"
+            )
+        progress = _integer(executed_steps, "execute_fetch.executed_steps")
+        if not action.execution.execute_start <= progress < action.execution.execute_stop:
+            raise ExecutionValidationError(
+                "execute_fetch.executed_steps must be inside the active slice"
+            )
+        executed_in_slice = progress - action.execution.execute_start
+        expected_in_slice = action.execution.execute_length - action.execution.rtc
+        if executed_in_slice != expected_in_slice:
+            raise ExecutionValidationError(
+                "execute_fetch must occur with exactly execution.rtc steps remaining"
+            )
+        next_request_id = self.next_request_id
+        self.next_request_id += 1
+        self.active_request_id = next_request_id
+        self.phase = SyncPhase.PREFETCHING
+        feedback = {
+            "last_action_id": action.action_id,
+            "executed_steps": executed_in_slice,
+            "success": True,
+        }
+        return next_request_id, feedback
 
     def cancel_inference(self) -> None:
         """Release an inference slot after transport or validation failure."""
 
-        if self.phase is not SyncPhase.INFERENCE:
+        if self.phase not in {SyncPhase.INFERENCE, SyncPhase.PREFETCHING}:
             raise RuntimeError(f"cannot cancel inference while phase={self.phase.value}")
         self.active_request_id = None
-        self.phase = SyncPhase.READY
+        self.phase = (
+            SyncPhase.EXECUTING
+            if self.active_action is not None
+            else SyncPhase.READY
+        )
 
     def complete(self, value: Any) -> dict[str, Any]:
-        if self.phase is not SyncPhase.EXECUTING or self.active_action is None:
+        if self.phase not in {
+            SyncPhase.EXECUTING,
+            SyncPhase.PREFETCHING,
+            SyncPhase.BUFFERED,
+        } or self.active_action is None:
             raise RuntimeError(f"cannot complete execution while phase={self.phase.value}")
         done = validate_execution_done(value)
         action = self.active_action
@@ -203,6 +276,10 @@ class SyncExecutionGate:
             raise ExecutionValidationError("execution_done does not match the active action")
         if not done.done:
             raise ExecutionValidationError("execution_done.done must be true")
+        if done.executed_steps < action.execution.execute_start:
+            raise ExecutionValidationError(
+                "execution_done.executed_steps precedes the active slice"
+            )
         if done.executed_steps > expected_steps:
             raise ExecutionValidationError("execution_done.executed_steps exceeds the active slice")
         if done.success and done.executed_steps != expected_steps:
@@ -210,12 +287,24 @@ class SyncExecutionGate:
 
         self.feedback = {
             "last_action_id": done.action_id,
-            "executed_steps": done.executed_steps,
+            "executed_steps": done.executed_steps - action.execution.execute_start,
             "success": done.success,
         }
-        self.active_request_id = None
-        self.active_action = None
-        self.phase = SyncPhase.READY if done.success else SyncPhase.FAILED
+        if not done.success:
+            self.active_request_id = None
+            self.active_action = None
+            self.queued_action = None
+            self.phase = SyncPhase.FAILED
+            return dict(self.feedback)
+
+        self.active_action = self.queued_action
+        self.queued_action = None
+        if self.active_request_id is not None:
+            self.phase = SyncPhase.PREFETCHING
+        elif self.active_action is not None:
+            self.phase = SyncPhase.EXECUTING
+        else:
+            self.phase = SyncPhase.READY
         return dict(self.feedback)
 
     def reset(self) -> None:
@@ -223,12 +312,28 @@ class SyncExecutionGate:
         self.next_request_id = 0
         self.active_request_id = None
         self.active_action = None
+        self.queued_action = None
         self.feedback = initial_execution_feedback()
+
+    def resume_after_failure(self) -> None:
+        """Allow an explicit operator restart after a terminal execution failure.
+
+        The failed action feedback and monotonically increasing request id are
+        retained. Callers must only invoke this after the Actor gate has been
+        closed and explicitly reopened; ordinary hardware failures remain
+        terminal until that operator acknowledgement occurs.
+        """
+        if self.phase is not SyncPhase.FAILED:
+            raise RuntimeError(
+                f"cannot resume failed execution while phase={self.phase.value}"
+            )
+        self.phase = SyncPhase.READY
 
     def close(self) -> None:
         self.phase = SyncPhase.CLOSED
         self.active_request_id = None
         self.active_action = None
+        self.queued_action = None
 
 
 def _required(value: Any, path: str, keys: tuple[str, ...]) -> Mapping[str, Any]:

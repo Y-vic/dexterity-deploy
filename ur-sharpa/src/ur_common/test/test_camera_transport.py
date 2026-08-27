@@ -26,6 +26,83 @@ def test_latest_camera_frames_round_trip(tmp_path):
         writer.close()
 
 
+def test_pending_reader_preserves_burst_frames_in_order(tmp_path):
+    writer = SharedCameraWriter(
+        prefix="test_camera",
+        max_payload_bytes=64,
+        directory=tmp_path,
+        slot_count=4,
+    )
+    reader = SharedCameraReader(prefix="test_camera", directory=tmp_path)
+    try:
+        for timestamp in (11, 12, 13):
+            writer.write("ego", timestamp, jpeg(str(timestamp).encode()))
+
+        frames = reader.read_pending()
+
+        assert [frame.ego_timestamp_ns for frame in frames] == [11, 12, 13]
+        assert [frame.ego for frame in frames] == [
+            jpeg(b"11"),
+            jpeg(b"12"),
+            jpeg(b"13"),
+        ]
+        assert reader.read_pending() == []
+        assert reader.read().ego_timestamp_ns == 13
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_pending_reader_reports_ring_overrun(tmp_path):
+    writer = SharedCameraWriter(
+        prefix="test_camera",
+        max_payload_bytes=64,
+        directory=tmp_path,
+        slot_count=2,
+    )
+    reader = SharedCameraReader(prefix="test_camera", directory=tmp_path)
+    try:
+        writer.write("ego", 11, jpeg(b"11"))
+        assert [frame.ego_timestamp_ns for frame in reader.read_pending()] == [11]
+
+        for timestamp in (12, 13, 14):
+            writer.write("ego", timestamp, jpeg(str(timestamp).encode()))
+
+        frames = reader.read_pending()
+        assert [frame.ego_timestamp_ns for frame in frames] == [13, 14]
+        assert reader.dropped_frames["ego"] == 1
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_pending_camera_sets_never_move_another_view_backwards(tmp_path):
+    writer = SharedCameraWriter(
+        prefix="test_camera",
+        max_payload_bytes=64,
+        directory=tmp_path,
+        slot_count=4,
+    )
+    reader = SharedCameraReader(prefix="test_camera", directory=tmp_path)
+    try:
+        writer.write("ego", 20, jpeg(b"ego-20"))
+        writer.write("left_wrist", 10, jpeg(b"left-10"))
+        writer.write("ego", 30, jpeg(b"ego-30"))
+        writer.write("left_wrist", 25, jpeg(b"left-25"))
+
+        frames = reader.read_pending()
+        for name in ("ego", "left_wrist"):
+            timestamps = [
+                getattr(frame, f"{name}_timestamp_ns")
+                for frame in frames
+                if getattr(frame, f"{name}_valid")
+            ]
+            assert timestamps == sorted(timestamps)
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_reader_reopens_restarted_writer(tmp_path):
     writer = SharedCameraWriter(prefix="test_camera", max_payload_bytes=64, directory=tmp_path)
     reader = SharedCameraReader(prefix="test_camera", directory=tmp_path)

@@ -661,6 +661,9 @@ if ROS_AVAILABLE:
             self.camera_reader = SharedCameraReader(shared_memory_prefix)
             self._shared_camera_seen = False
             self._observed_camera_timestamps = None
+            self._transport_camera_dropped = {
+                name: 0 for name in CAMERA_NAMES
+            }
             self.create_timer(
                 1.0 / max(30.0, frequency * 4.0),
                 self._poll_camera,
@@ -702,6 +705,25 @@ if ROS_AVAILABLE:
                 self.core.update_camera(msg)
 
         def _poll_camera(self) -> None:
+            pending = self.camera_reader.read_pending()
+            dropped = self.camera_reader.dropped_frames
+            for name in CAMERA_NAMES:
+                previous = self._transport_camera_dropped[name]
+                current = int(dropped.get(name, 0))
+                if self.core.recording and current > previous:
+                    count = current - previous
+                    self.core.camera_dropped[name] += count
+                    self.core._note_quality_error(
+                        f"{name} camera transport ring overran by {count} frame(s)"
+                    )
+                self._transport_camera_dropped[name] = current
+            if pending:
+                self._shared_camera_seen = True
+                for msg in pending:
+                    self.core.update_camera(msg)
+                return
+            if self._shared_camera_seen:
+                return
             msg = self.camera_reader.read()
             if msg is None:
                 return

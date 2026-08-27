@@ -196,7 +196,8 @@ namespace robots {
             bool bSuccess = ik(eetrans, eerot, vfree.size() > 0 ? &vfree[0] : NULL, vsolutions);
 #endif
             if( !bSuccess ) {
-                fprintf(stderr,"Error: (inverse kinematics) failed to get ik solution\n");
+                // The Python solver reports a structured IKFAST_NO_SOLUTION
+                // diagnostic with side, target TCP and reference joints.
                 return joint_configs;
             }
 
@@ -262,7 +263,8 @@ namespace robots {
             bool bSuccess = ik(eetrans, eerot, vfree.size() > 0 ? &vfree[0] : NULL, vsolutions);
 #endif
             if( !bSuccess ) {
-                fprintf(stderr,"Error: (inverse kinematics) failed to get ik solution\n");
+                // The Python solver reports a structured IKFAST_NO_SOLUTION
+                // diagnostic with side, target TCP and reference joints.
                 return joint_configs;
             }
 

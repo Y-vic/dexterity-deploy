@@ -163,6 +163,7 @@ def test_threaded_camera_queues_frames_without_blocking_capture(monkeypatch):
         time.sleep(0.001)
     assert camera.encoded_count == 8
     assert camera.read() is not None
+    assert len(camera.read_pending()) == 8
     camera.close()
 
 
@@ -200,4 +201,46 @@ def test_threaded_camera_drops_oldest_frame_when_queue_is_full(monkeypatch):
         time.sleep(0.001)
     assert camera.encoded_count == expected_encoded
     assert camera.encoded_count + camera.dropped_raw_count == camera.capture_count
+    camera.close()
+
+
+def test_parallel_encoders_publish_every_frame_in_capture_order(monkeypatch):
+    release_first = threading.Event()
+    second_finished = threading.Event()
+
+    def out_of_order_encode(rgb, quality):
+        value = int(rgb[0, 0, 0])
+        if value == 0:
+            release_first.wait(timeout=1.0)
+        else:
+            second_finished.set()
+        return bytes((value, quality))
+
+    class TwoFrameCamera(drivers._ThreadedCamera):
+        def _grab_rgb(self):
+            if self.capture_count >= 2:
+                self._stop.wait(0.001)
+                return None
+            return np.full((2, 2, 3), self.capture_count, dtype=np.uint8)
+
+    monkeypatch.setattr(drivers, "_encode_jpeg", out_of_order_encode)
+    camera = TwoFrameCamera(
+        jpeg_quality=90,
+        process_encode=False,
+        encode_workers=2,
+    )
+    camera.start()
+    assert second_finished.wait(timeout=1.0)
+    # Sequence 1 completed first, but it must wait for sequence 0 instead of
+    # replacing it in a latest-frame slot.
+    assert camera.read() is None
+
+    release_first.set()
+    deadline = time.monotonic() + 1.0
+    while camera.encoded_count < 2 and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    frames = camera.read_pending()
+    assert [frame.jpeg[0] for frame in frames] == [0, 1]
+    assert camera.read_pending() == []
     camera.close()

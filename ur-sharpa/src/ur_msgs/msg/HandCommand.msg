@@ -30,3 +30,7 @@ float32[44] q_cmd
 # its 22-DOF slice of q_cmd is ignored.
 bool left_enable
 bool right_enable
+
+# Validate and acknowledge this command without calling the SharpA SDK.
+# Only Actor commands may use dry-run.
+bool dry_run

@@ -1,0 +1,5 @@
+annotations/*.json
+annotations/*.npy
+!annotations/.gitkeep
+__pycache__/
+tests/__pycache__/

@@ -24,5 +24,8 @@ string failure_code
 # Human-readable rejection detail, empty on success.
 string failure_message
 
+# Echoes whether the acknowledged command was validation-only.
+bool dry_run
+
 # Time the device finished handling the step, nanoseconds.
 uint64 timestamp_ns

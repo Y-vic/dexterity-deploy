@@ -301,3 +301,29 @@ def test_command_is_rejected_while_rtde_recovery_gate_is_closed():
     result = node.result_pub.messages[0]
     assert result.success is False
     assert result.failure_code == "ur_recovering"
+
+
+def test_actor_dry_run_never_calls_ur_command_write():
+    node = UrNode.__new__(UrNode)
+    node._driver_lock = threading.RLock()
+    writes = []
+    node.driver = SimpleNamespace(
+        command_joint_step=lambda *_args, **_kwargs: writes.append(True)
+    )
+    node.resolve_targets = lambda _message: (np.zeros(6), np.zeros(6))
+    results = []
+    node.publish_result = (
+        lambda _message, success, code, detail: results.append(
+            (success, code, detail)
+        )
+    )
+    message = SimpleNamespace(
+        dry_run=True,
+        source=ArmCommand.SOURCE_ACTOR,
+        period_s=1.0 / 30.0,
+    )
+
+    node.on_command(message)
+
+    assert writes == []
+    assert results == [(True, "", "")]

@@ -22,6 +22,7 @@ float64 frequency_hz    # step rate, hertz; step period is 1/frequency_hz
 uint32 action_length    # length of the ORIGINAL chunk, before truncation
 uint32 execute_start    # index of the first step of this slice in the chunk
 uint32 execute_length   # number of steps in this slice == first dim of arrays
+uint32 rtc              # 0: fetch at completion; N: fetch with N steps remaining
 
 # --- Action slice ---
 # Every array below is flattened ROW-MAJOR with execute_length rows:

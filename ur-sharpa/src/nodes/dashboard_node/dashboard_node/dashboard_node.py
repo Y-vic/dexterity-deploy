@@ -19,12 +19,17 @@ DASHBOARD_ACTIONS = frozenset(
     {
         "reset_both",
         "start_deploy",
+        "continue_deploy",
+        "preview_deploy",
+        "pause_deploy",
         "stop_deploy",
         "select_policy",
         "select_replay",
     }
 )
-REPLAY_ACTIONS = frozenset({"load", "start", "pause", "resume", "stop"})
+REPLAY_ACTIONS = frozenset(
+    {"load", "start", "pause", "resume", "stop", "unload"}
+)
 LIVE_REPLAY_TIMEOUT_S = 6.0
 
 
@@ -79,6 +84,38 @@ def forward_action(url: str, action: str, timeout_s: float = 2.0) -> dict[str, A
         raise RuntimeError(f"status API unavailable: {exc.reason}") from exc
 
 
+def stop_policy_deployment(
+    status_api_url: str,
+    model_manager: RemoteModelManager,
+    *,
+    forward: Any = forward_action,
+) -> dict[str, Any]:
+    """Stop the current execution while keeping the loaded model resident."""
+    stopped = forward(status_api_url, "stop_deploy")
+    if not stopped.get("accepted"):
+        raise ModelManagerError(
+            str(stopped.get("gate_reason") or "部署停止门未关闭")
+        )
+    return {
+        **stopped,
+        "accepted": True,
+        "model": model_manager.snapshot(),
+        "model_unload_requested": False,
+    }
+
+
+def actor_execution_active(snapshot: dict[str, Any]) -> bool:
+    control = snapshot.get("control") or {}
+    return bool(
+        (
+            int(control.get("ur_state", 0)) == 2
+            and int(control.get("sharpa_state", 0)) == 1
+        )
+        or control.get("execution_dry_run")
+        or control.get("execution_paused")
+    )
+
+
 def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
     action = str(payload.get("action", "")).strip().lower()
     if action not in REPLAY_ACTIONS:
@@ -109,6 +146,8 @@ def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
     for field in ("loop", "dry_run"):
         if not isinstance(payload.get(field), bool):
             raise ValueError(f"replay {field} must be boolean")
+    if payload["loop"]:
+        raise ValueError("replay loop is disabled; clear progress to run again")
     result.update(
         sample_dir=sample_dir,
         execution_steps=execution_steps,
@@ -134,11 +173,12 @@ def validate_live_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
 def replay_config_matches_status(
     replay: dict[str, Any], command: dict[str, Any]
 ) -> bool:
-    """Whether a loaded live sample can be started without resetting its cursor."""
+    """Whether a loaded sample can resume without resetting its cursor."""
     try:
         return bool(
-            replay.get("state") in {"ready", "paused", "complete"}
-            and replay.get("dry_run") is False
+            replay.get("state") in {"ready", "paused"}
+            and bool(replay.get("dry_run"))
+            == bool(command.get("dry_run", False))
             and str(replay.get("sample_dir") or "")
             == str(command.get("sample_dir") or "")
             and int(replay.get("execution_steps"))
@@ -169,14 +209,20 @@ def launch_live_replay(
     before = state.snapshot()
     control = before.get("control") or {}
     replay_before = before.get("replay") or {}
-    if int(control.get("ur_state", -1)) != 1:
+    if int(control.get("ur_state", -1)) not in {0, 1}:
         raise ModelManagerError(
-            "真实启动前请先完成机器复位，确认 UR 状态为初始位置"
+            "Replay 真实启动要求机器执行门处于关闭状态"
         )
     if int(control.get("sharpa_state", -1)) != 0:
         raise ModelManagerError("真实启动前 SharpA 必须处于停止状态")
     if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
         raise ModelManagerError("Replay 仍在执行或预览，请先停止")
+    if (
+        replay_before.get("state") == "complete"
+        and str(replay_before.get("sample_dir") or "")
+        == str(command.get("sample_dir") or "")
+    ):
+        raise ModelManagerError("Replay 已完成，请先点击停止重置执行进度")
 
     previous_execution_id = str(replay_before.get("execution_id") or "")
     gate_opened = False
@@ -276,57 +322,101 @@ def launch_live_replay(
 
 def launch_replay_preview(
     state: DashboardState,
+    status_api_url: str,
     publish_replay_command: Any,
     command: dict[str, Any],
+    *,
+    forward: Any = forward_action,
 ) -> dict[str, Any]:
-    """Load a preview-only sample and wait until preview playback begins."""
+    """Run Replay through Actor and dry-run hardware acknowledgements."""
     before = state.snapshot()
     control = before.get("control") or {}
     replay_before = before.get("replay") or {}
-    if int(control.get("ur_state", 0)) == 2:
+    if int(control.get("ur_state", 0)) == 2 or control.get("execution_dry_run"):
         raise ModelManagerError("机器运行时不能启动 Replay 预览")
     if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
         raise ModelManagerError("Replay 仍在执行或预览，请先停止")
+    if (
+        replay_before.get("state") == "complete"
+        and str(replay_before.get("sample_dir") or "")
+        == str(command.get("sample_dir") or "")
+    ):
+        raise ModelManagerError("Replay 已完成，请先点击停止重置执行进度")
     previous_execution_id = str(replay_before.get("execution_id") or "")
-    publish_replay_command(command)
-
-    loaded = wait_for_dashboard_state(
-        state,
-        lambda snapshot: (
-            str((snapshot.get("replay") or {}).get("execution_id") or "")
-            != previous_execution_id
-            and (snapshot.get("replay") or {}).get("state") == "ready"
-            and (snapshot.get("replay") or {}).get("dry_run") is True
-        ),
-        failure=lambda snapshot: (
-            str((snapshot.get("replay") or {}).get("error") or "Replay 加载失败")
-            if (
-                str((snapshot.get("replay") or {}).get("execution_id") or "")
-                != previous_execution_id
-                and (snapshot.get("replay") or {}).get("state") == "fault"
+    gate_opened = False
+    try:
+        if replay_config_matches_status(replay_before, command):
+            loaded = before
+        else:
+            publish_replay_command(command)
+            loaded = wait_for_dashboard_state(
+                state,
+                lambda snapshot: (
+                    str((snapshot.get("replay") or {}).get("execution_id") or "")
+                    != previous_execution_id
+                    and (snapshot.get("replay") or {}).get("state") == "ready"
+                    and (snapshot.get("replay") or {}).get("dry_run") is True
+                ),
+                failure=lambda snapshot: (
+                    str((snapshot.get("replay") or {}).get("error") or "Replay 加载失败")
+                    if (snapshot.get("replay") or {}).get("state") == "fault"
+                    else ""
+                ),
             )
-            else ""
-        ),
-    )
-    execution_id = str((loaded.get("replay") or {}).get("execution_id") or "")
-    publish_replay_command({"action": "start"})
-    running = wait_for_dashboard_state(
-        state,
-        lambda snapshot: (
-            str((snapshot.get("replay") or {}).get("execution_id") or "")
-            == execution_id
-            and (snapshot.get("replay") or {}).get("preview_active") is True
-        ),
-        failure=lambda snapshot: (
-            str((snapshot.get("replay") or {}).get("error") or "Replay 预览失败")
-            if (
+        execution_id = str((loaded.get("replay") or {}).get("execution_id") or "")
+        selected = forward(status_api_url, "select_replay")
+        if not selected.get("accepted"):
+            raise ModelManagerError(
+                str(selected.get("gate_reason") or "无法切换到 Replay 执行来源")
+            )
+        state.update("execution_provider", "replay")
+        wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
+                (snapshot.get("replay") or {}).get("provider") == "replay"
+            ),
+        )
+        started = forward(status_api_url, "preview_deploy")
+        if not started.get("accepted"):
+            raise ModelManagerError(
+                str(started.get("gate_reason") or "Actor 预览门无法开启")
+            )
+        gate_opened = True
+        wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
+                (snapshot.get("replay") or {}).get("machine_running") is True
+            ),
+        )
+        publish_replay_command({"action": "start"})
+        running = wait_for_dashboard_state(
+            state,
+            lambda snapshot: (
                 str((snapshot.get("replay") or {}).get("execution_id") or "")
                 == execution_id
-                and (snapshot.get("replay") or {}).get("state") == "fault"
-            )
-            else ""
-        ),
-    )
+                and (
+                    (snapshot.get("replay") or {}).get("state") == "complete"
+                    or (
+                        (snapshot.get("replay") or {}).get("preview_active") is True
+                        and (snapshot.get("replay") or {}).get("state")
+                        in {"aligning", "playing"}
+                    )
+                )
+            ),
+            failure=lambda snapshot: (
+                str((snapshot.get("replay") or {}).get("error") or "Replay 预览失败")
+                if (snapshot.get("replay") or {}).get("state") == "fault"
+                else ""
+            ),
+        )
+    except Exception:
+        if gate_opened:
+            publish_replay_command({"action": "stop"})
+            try:
+                forward(status_api_url, "stop_deploy")
+            except RuntimeError:
+                pass
+        raise
     return {
         "accepted": True,
         "replay_action": "preview_start",
@@ -461,7 +551,7 @@ def make_handler(
                 payload = self._read_json()
                 if self.path == "/api/action":
                     action = str(payload.get("action", ""))
-                    if action == "start_deploy":
+                    if action in {"start_deploy", "preview_deploy"}:
                         snapshot = state.snapshot()
                         provider = snapshot.get("execution_provider", "policy")
                         if provider == "policy":
@@ -474,13 +564,22 @@ def make_handler(
                                 )
                         else:
                             replay = snapshot.get("replay") or {}
-                            if replay.get("state") not in {"ready", "paused", "complete"}:
+                            if replay.get("state") not in {"ready", "paused"}:
                                 raise ModelManagerError("请先加载有效的 replay 样本")
-                            if replay.get("dry_run", True):
+                            if action == "start_deploy" and replay.get("dry_run", True):
                                 raise ModelManagerError("Replay 仍处于 Dry run；取消勾选后重新加载")
-                    result = forward_action(
-                        status_api_url, action
-                    )
+                            if action == "preview_deploy" and not replay.get("dry_run", False):
+                                raise ModelManagerError("Replay 尚未以预览模式加载")
+                    if (
+                        action == "stop_deploy"
+                        and state.snapshot().get("execution_provider", "policy")
+                        == "policy"
+                    ):
+                        result = stop_policy_deployment(
+                            status_api_url, model_manager
+                        )
+                    else:
+                        result = forward_action(status_api_url, action)
                     if result.get("accepted") and action in {
                         "select_policy",
                         "select_replay",
@@ -524,6 +623,7 @@ def make_handler(
                     self._send_json(
                         launch_replay_preview(
                             state,
+                            status_api_url,
                             publish_replay_command,
                             command,
                         )
@@ -538,17 +638,16 @@ def make_handler(
                     self._send_json({"accepted": True, "model": result}, 202)
                     return
                 if self.path == "/api/model/stop":
-                    machine_warning = ""
-                    try:
-                        forward_action(status_api_url, "stop_deploy")
-                    except RuntimeError as exc:
-                        machine_warning = str(exc)
+                    snapshot = state.snapshot()
+                    if actor_execution_active(snapshot):
+                        stop_policy_deployment(
+                            status_api_url, model_manager
+                        )
                     result = model_manager.stop()
                     self._send_json(
                         {
                             "accepted": True,
                             "model": result,
-                            "machine_warning": machine_warning,
                         },
                         202,
                     )
@@ -602,9 +701,9 @@ def main(args=None) -> None:
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     from ur_msgs.msg import (
+        ActorTrajectory,
         CameraSet,
         ControlStatus,
-        ExecutableAction,
         HandStateFrame,
         UrStateFrame,
     )
@@ -621,7 +720,7 @@ def main(args=None) -> None:
             self.declare_parameter("model_ssh_host", "BAAI")
             self.declare_parameter(
                 "model_remote_root",
-                "/share/project/yenaisheng/dreamzero",
+                "/share/project/yenaisheng/sharpa-deploy",
             )
             self._model_status_pub = self.create_publisher(
                 String, "/model/status", 10
@@ -660,6 +759,12 @@ def main(args=None) -> None:
             self.create_subscription(String, "/replay/status", self._replay, 10)
             self.create_subscription(
                 String,
+                "/actor_ik/latency_status",
+                self._actor_latency,
+                10,
+            )
+            self.create_subscription(
+                String,
                 "/control/execution_provider",
                 self._provider,
                 10,
@@ -683,20 +788,8 @@ def main(args=None) -> None:
                 String, "/control/bias_status", self._bias, 10
             )
             self.create_subscription(
-                ExecutableAction,
-                "/policy/executable_action",
-                self._prediction,
-                10,
-            )
-            self.create_subscription(
-                ExecutableAction,
-                "/replay/executable_action",
-                self._prediction,
-                10,
-            )
-            self.create_subscription(
-                ExecutableAction,
-                "/replay/preview_action",
+                ActorTrajectory,
+                "/actor_ik/trajectory",
                 self._prediction,
                 10,
             )
@@ -736,12 +829,17 @@ def main(args=None) -> None:
                     "sharpa_state": int(message.sharpa_state),
                     "record_state": int(message.record_state),
                     "active_source": int(message.active_source),
+                    "execution_paused": bool(message.execution_paused),
+                    "execution_dry_run": bool(message.execution_dry_run),
                     "gate_reason": message.gate_reason,
                 },
             )
 
         def _policy(self, message: String) -> None:
             state.update("policy", self._json(message))
+
+        def _actor_latency(self, message: String) -> None:
+            state.update("actor_latency", self._json(message))
 
         def _replay(self, message: String) -> None:
             state.update("replay", self._json(message))
@@ -783,8 +881,18 @@ def main(args=None) -> None:
             state.update("sharpa", payload)
             self._update_measured_motion()
 
-        def _prediction(self, message: ExecutableAction) -> None:
+        def _prediction(self, message: ActorTrajectory) -> None:
             payload = action_visualization(message)
+            payload.update(
+                provider=str(message.provider),
+                dry_run=bool(message.dry_run),
+                trace_dir=str(message.trace_dir),
+                ik_applied=bool(message.ik_applied),
+            )
+            try:
+                payload["diagnostics"] = json.loads(message.diagnostics_json or "{}")
+            except json.JSONDecodeError:
+                payload["diagnostics"] = {"raw": message.diagnostics_json}
             payload["received_at_unix_ms"] = int(time.time() * 1000)
             for frame in payload["frames"]:
                 try:

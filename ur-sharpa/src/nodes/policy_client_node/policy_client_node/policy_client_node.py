@@ -8,57 +8,65 @@ from typing import Any
 import numpy as np
 
 
+DIRECT_CANONICAL_EEF_SCHEMA = "sharpa62_direct_absolute_eef.v1"
+CANONICAL_EEF_POSE_LAYOUT = "xyz,r00,r10,r20,r01,r11,r21"
+
+
 @dataclass(frozen=True)
 class PendingRequest:
     request_id: int
     feedback: dict[str, Any]
 
 
-class LegacyServerPoseAdapter:
-    """Keep the remote physical-pose adapter outside the canonical ROS ABI."""
+@dataclass
+class PolicyRequestMetrics:
+    """Dashboard-visible counters owned by one loaded model lifecycle."""
 
-    def __init__(self, geometry: Any):
-        self.geometry = geometry
+    inference_count: int = 0
+    last_request_id: int = 0
+    latency_s: float | None = None
 
-    def observation_to_server(self, payload: dict[str, Any]) -> dict[str, Any]:
-        result = dict(payload)
-        state = dict(result.get("state") or {})
-        for name in ("history", "current"):
-            frame = state.get(name)
-            if frame is not None:
-                state[name] = self._convert_frame(
-                    frame, self.geometry.canonical_pose_to_legacy_server_pose
-                )
-        result["state"] = state
-        return result
+    def record(self, request_id: int, latency_s: float) -> None:
+        self.inference_count += 1
+        self.last_request_id = int(request_id)
+        self.latency_s = float(latency_s)
 
-    def action_to_canonical(self, command: dict[str, Any]) -> dict[str, Any]:
-        result = dict(command)
-        action = dict(result["action"])
-        result["action"] = self._convert_frame(
-            action, self.geometry.legacy_server_pose_to_canonical_pose
+    def reset(self) -> None:
+        self.inference_count = 0
+        self.last_request_id = 0
+        self.latency_s = None
+
+
+def validate_server_eef_contract(metadata: dict[str, Any]) -> None:
+    """Reject an explicitly non-canonical server contract.
+
+    Every policy uses the same public absolute-EEF ABI. Model-specific
+    relative/legacy representations must be resolved inside the model server,
+    never in this embodiment client.
+    """
+    interface = metadata.get("interface")
+    if not isinstance(interface, dict) or "eef_contract" not in interface:
+        return
+    eef_contract = interface["eef_contract"]
+    if not isinstance(eef_contract, dict):
+        raise ValueError("server interface.eef_contract must be a mapping")
+    expected = {
+        "schema": DIRECT_CANONICAL_EEF_SCHEMA,
+        "observation_eef_def": "absolute",
+        "action_eef_def": "absolute",
+        "eef_pose_layout": CANONICAL_EEF_POSE_LAYOUT,
+        "server_xyz_direction_transform": "none",
+    }
+    mismatches = [
+        f"{key}={eef_contract.get(key)!r}"
+        for key, value in expected.items()
+        if eef_contract.get(key) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "server EEF contract is not the canonical absolute ABI: "
+            + ", ".join(mismatches)
         )
-        return result
-
-    @staticmethod
-    def _pose_array(value: Any, side: str, converter: Any) -> np.ndarray | None:
-        if value is None:
-            return None
-        array = np.asarray(value, dtype=np.float32)
-        if array.ndim < 1 or array.shape[-1] != 9 or not np.isfinite(array).all():
-            raise ValueError(f"{side} wrist EEF must be finite with last dimension 9")
-        rows = array.reshape(-1, 9)
-        converted = np.stack([converter(row, side) for row in rows])
-        return converted.reshape(array.shape).astype(np.float32)
-
-    def _convert_frame(self, frame: dict[str, Any], converter: Any) -> dict[str, Any]:
-        result = dict(frame)
-        for side in ("left", "right"):
-            key = f"{side}_wrist"
-            wrist = dict(result[key])
-            wrist["eef"] = self._pose_array(wrist.get("eef"), side, converter)
-            result[key] = wrist
-        return result
 
 
 class PolicyClientCore:
@@ -70,6 +78,8 @@ class PolicyClientCore:
         from sharpa_interface.server.execution import SyncExecutionGate
         self.session_id = session_id
         self.gate = SyncExecutionGate()
+        self._actor_gate_running = False
+        self._restart_acknowledged = False
 
     def begin(self) -> PendingRequest:
         request_id, feedback = self.gate.begin_inference()
@@ -81,28 +91,89 @@ class PolicyClientCore:
 
     @property
     def inference_pending(self) -> bool:
-        return self.gate.phase.value == "inference"
+        return self.gate.phase.value in {"inference", "prefetching"}
 
-    def accept_action(self, action_payload: dict[str, Any]) -> dict[str, Any]:
+    @property
+    def executing(self) -> bool:
+        return self.gate.active_action is not None
+
+    @property
+    def failed(self) -> bool:
+        return self.gate.phase.value == "failed"
+
+    @property
+    def phase(self) -> str:
+        return self.gate.phase.value
+
+    @property
+    def waiting_for_restart(self) -> bool:
+        return self._restart_acknowledged and self.failed
+
+    def accept_action(
+        self,
+        action_payload: dict[str, Any],
+        *,
+        expected_schema: str = "sharpa_policy_action.v5",
+    ) -> dict[str, Any]:
         from sharpa_interface.server.action import parse_policy_action
         action = parse_policy_action(
             action_payload,
             expected_session_id=self.session_id,
             expected_request_id=self.gate.active_request_id,
+            expected_schema=expected_schema,
         )
         return self.gate.accept_action(action)
 
     def accept_parsed_action(self, action: Any) -> dict[str, Any]:
         return self.gate.accept_action(action)
 
+    def prefetch(self, message: Any) -> PendingRequest:
+        request_id, feedback = self.gate.begin_prefetch(
+            request_id=int(message.request_id),
+            action_id=str(message.action_id),
+            revision=int(message.revision),
+            execute_start=int(message.execute_start),
+            execute_length=int(message.execute_length),
+            executed_steps=int(message.executed_steps),
+        )
+        return PendingRequest(request_id, feedback)
+
     def cancel_request(self) -> None:
         self.gate.cancel_inference()
 
     def complete(self, done_payload: dict[str, Any]) -> dict[str, Any]:
-        return self.gate.complete(done_payload)
+        feedback = self.gate.complete(done_payload)
+        if feedback["success"]:
+            self._restart_acknowledged = False
+        elif self._restart_acknowledged and self._actor_gate_running:
+            # Handles a fast stop -> start sequence where the Actor's failed
+            # terminal event arrives after the gate has already reopened.
+            self.gate.resume_after_failure()
+            self._restart_acknowledged = False
+        return feedback
+
+    def update_actor_gate(self, running: bool) -> bool:
+        """Track explicit stop/start edges and recover only after a restart.
+
+        Pause deliberately keeps this gate running, so it never enters this
+        path and the active chunk remains owned by the synchronous gate.
+        """
+        running = bool(running)
+        if self._actor_gate_running and not running and (
+            self.executing or self.failed
+        ):
+            self._restart_acknowledged = True
+        self._actor_gate_running = running
+        if running and self._restart_acknowledged and self.failed:
+            self.gate.resume_after_failure()
+            self._restart_acknowledged = False
+            return True
+        return False
 
     def reset(self) -> None:
         self.gate.reset()
+        self._actor_gate_running = False
+        self._restart_acknowledged = False
 
 
 def completion_belongs_to_session(message: Any, session_id: str) -> bool:
@@ -110,8 +181,21 @@ def completion_belongs_to_session(message: Any, session_id: str) -> bool:
     return bool(session_id) and str(message.session_id) == str(session_id)
 
 
-def deployment_ready(ur_state: int, sharpa_state: int, active_source: int) -> bool:
-    return int(ur_state) == 2 and int(sharpa_state) == 1 and int(active_source) == 3
+def deployment_ready(
+    ur_state: int,
+    sharpa_state: int,
+    active_source: int,
+    execution_paused: bool = False,
+    execution_dry_run: bool = False,
+) -> bool:
+    return (
+        int(active_source) == 3
+        and (
+            bool(execution_dry_run)
+            or (int(ur_state) == 2 and int(sharpa_state) == 1)
+        )
+        and not execution_paused
+    )
 
 
 def metadata_identity_error(
@@ -185,7 +269,7 @@ def main(args=None) -> None:
     from sharpa_interface.server.client import ServerClient, ServerConfig
     from sharpa_interface.server.serialization import unpackb
     from sharpa_interface.sharpa import CANONICAL_EEF_FRAME
-    from ur_common.geometry import UrSharpAWireGeometry
+    from ur_common.execution_log import execution_event_json
 
     class RosPolicyClientNode(Node):
         def __init__(self):
@@ -197,7 +281,6 @@ def main(args=None) -> None:
             self.declare_parameter("ssh_remote_host", "127.0.0.1")
             self.declare_parameter("ssh_remote_port", 5500)
             self._core = PolicyClientCore(str(self.get_parameter("session_id").value))
-            self._server_pose = LegacyServerPoseAdapter(UrSharpAWireGeometry())
             self._fallback_prompt = str(self.get_parameter("prompt").value)
             self._server_config = ServerConfig(
                 url=str(self.get_parameter("server_url").value),
@@ -226,11 +309,12 @@ def main(args=None) -> None:
             self._phase = "waiting"
             self._reason = "等待模型启动"
             self._last_error = ""
-            self._inference_count = 0
-            self._last_request_id = -1
-            self._last_latency_s = None
+            self._request_metrics = PolicyRequestMetrics()
             self._last_waiting_reason = ""
             self._status = self.create_publisher(String, "/policy/status", 10)
+            self._execution_event_pub = self.create_publisher(
+                String, "/deploy/execution_event", 100
+            )
             self._action_pub = self.create_publisher(ExecutableAction, "/policy/executable_action", 10)
             self._build_client = self.create_client(BuildObservation, "/policy/build_observation")
             self.create_subscription(String, "/policy/action_result_json", self._action, 10)
@@ -246,6 +330,16 @@ def main(args=None) -> None:
             self.create_subscription(String, "/model/status", self._model_status, 10)
             self._timer = self.create_timer(0.1, self._tick)
             self._status_timer = self.create_timer(1.0, lambda: self._publish({}))
+
+        def _execution_event(self, event, **fields):
+            try:
+                message = String()
+                message.data = execution_event_json(
+                    "policy_client_node", event, **fields
+                )
+                self._execution_event_pub.publish(message)
+            except Exception as exc:
+                self.get_logger().warning(f"failed to publish execution event: {exc}")
 
         def _publish(self, payload):
             if payload.get("phase"):
@@ -265,9 +359,9 @@ def main(args=None) -> None:
                 "model_identity_ok": self._model_identity_ok,
                 "model_identity_error": self._model_identity_error,
                 "execution_provider": self._execution_provider,
-                "inference_count": self._inference_count,
-                "last_request_id": self._last_request_id,
-                "latency_s": self._last_latency_s,
+                "inference_count": self._request_metrics.inference_count,
+                "last_request_id": self._request_metrics.last_request_id,
+                "latency_s": self._request_metrics.latency_s,
                 "metadata": summarize_metadata(self._metadata),
             }
             result.update(payload)
@@ -300,6 +394,17 @@ def main(args=None) -> None:
                 self._expected_run_id = expected_run_id
                 self._expected_prompt = expected_prompt
                 self._model_available = phase == "running"
+                self._execution_event(
+                    "model_status_changed",
+                    generation=generation,
+                    phase=phase,
+                    model_port=remote_port,
+                    task_id=expected_task_id,
+                    run_id=expected_run_id,
+                    detail=str(payload.get("detail") or ""),
+                    log_tail=str(payload.get("log_tail") or "")[-12000:],
+                    success=phase != "fault",
+                )
                 self._client.close()
                 self._server_config = replace(
                     self._server_config,
@@ -314,6 +419,7 @@ def main(args=None) -> None:
                 self._busy = False
                 self._pending = None
                 self._core.reset()
+                self._request_metrics.reset()
                 self._reason = "" if self._model_available else f"模型状态: {phase}"
                 self._last_error = ""
                 self._publish({"phase": "waiting", "reason": self._reason})
@@ -321,8 +427,24 @@ def main(args=None) -> None:
                 self._publish({"phase": "fault", "error": str(exc)})
 
         def _control_status(self, message):
+            actor_gate_running = bool(
+                int(message.active_source) == 3
+                and (
+                    bool(message.execution_dry_run)
+                    or (
+                        int(message.ur_state) == 2
+                        and int(message.sharpa_state) == 1
+                    )
+                )
+                and self._execution_provider == "policy"
+            )
+            recovered = self._core.update_actor_gate(actor_gate_running)
             self._machine_control_ready = deployment_ready(
-                message.ur_state, message.sharpa_state, message.active_source
+                message.ur_state,
+                message.sharpa_state,
+                message.active_source,
+                message.execution_paused,
+                message.execution_dry_run,
             )
             self._control_ready = bool(
                 self._machine_control_ready and self._execution_provider == "policy"
@@ -330,10 +452,16 @@ def main(args=None) -> None:
             reason = "" if self._control_ready else (
                 "policy disabled: replay provider selected"
                 if self._execution_provider != "policy"
-                else "waiting for UR and SharpA actor control"
+                else (
+                    "policy paused: waiting for continue"
+                    if message.execution_paused
+                    else "waiting for live or preview Actor control"
+                )
             )
             if reason and reason != self._last_waiting_reason:
                 self._publish({"phase": "waiting", "reason": reason})
+            elif recovered:
+                self._publish({"phase": "ready", "reason": "", "error": ""})
             self._last_waiting_reason = reason
 
         def _provider_status(self, message):
@@ -349,6 +477,38 @@ def main(args=None) -> None:
                     {"phase": "waiting", "reason": "policy disabled: replay provider selected"}
                 )
 
+        def _request_observation(self, pending):
+            if self._busy:
+                raise RuntimeError("another policy request is already in flight")
+            if not self._build_client.service_is_ready():
+                raise RuntimeError("observation builder service is not ready")
+            self._pending = pending
+            request = BuildObservation.Request()
+            request.metadata_format_json = json.dumps(
+                self._metadata["metadata_format"], separators=(",", ":")
+            )
+            request.session_id = self._core.session_id
+            request.request_id = pending.request_id
+            request.timestamp_ns = self.get_clock().now().nanoseconds
+            request.prompt = self._active_prompt
+            request.execution_feedback_json = json.dumps(
+                pending.feedback, separators=(",", ":")
+            )
+            request.max_message_size = int(
+                self._metadata.get("max_message_size", 64 * 1024 * 1024)
+            )
+            self._busy = True
+            self._execution_event(
+                "observation_build_requested",
+                session_id=self._core.session_id,
+                request_id=int(pending.request_id),
+                model_generation=int(self._model_generation),
+                model_port=int(self._model_port),
+            )
+            self._build_client.call_async(request).add_done_callback(
+                self._observation_done
+            )
+
         def _tick(self):
             if self._busy or not self._core.ready: return
             try:
@@ -356,6 +516,7 @@ def main(args=None) -> None:
                 if not self._model_available: return
                 if not self._started:
                     self._metadata = self._client.connect()
+                    validate_server_eef_contract(self._metadata)
                     identity_error = metadata_identity_error(
                         self._metadata,
                         expected_task_id=self._expected_task_id,
@@ -382,36 +543,100 @@ def main(args=None) -> None:
                     self._publish({"phase": "connected", "metadata_format_id": self._metadata["metadata_format"]["format_id"]}); return
                 if not self._control_ready: return
                 if not self._build_client.service_is_ready(): return
-                pending = self._core.begin(); self._pending = pending
-                request = BuildObservation.Request(); request.metadata_format_json = json.dumps(self._metadata["metadata_format"], separators=(",", ":")); request.session_id = self._core.session_id; request.request_id = pending.request_id; request.timestamp_ns = self.get_clock().now().nanoseconds; request.prompt = self._active_prompt; request.execution_feedback_json = json.dumps(pending.feedback, separators=(",", ":")); request.max_message_size = int(self._metadata.get("max_message_size", 64 * 1024 * 1024)); self._busy = True
-                self._build_client.call_async(request).add_done_callback(self._observation_done)
-            except Exception as exc: self._publish({"phase": "fault", "error": str(exc)})
+                self._request_observation(self._core.begin())
+            except Exception as exc:
+                self._execution_event(
+                    "policy_tick_failed",
+                    request_id=(
+                        int(self._pending.request_id)
+                        if self._pending is not None
+                        else None
+                    ),
+                    success=False,
+                    error=str(exc),
+                )
+                self._publish({"phase": "fault", "error": str(exc)})
 
         def _observation_done(self, future):
             try:
                 response = future.result()
                 if not response.success:
+                    self._execution_event(
+                        "observation_build_failed",
+                        session_id=self._core.session_id,
+                        request_id=int(self._pending.request_id),
+                        success=False,
+                        error=str(response.error_message),
+                    )
                     self._core.cancel_request(); self._publish({"phase": "waiting", "error": response.error_message}); return
                 if not self._control_ready or self._execution_provider != "policy":
+                    self._execution_event(
+                        "inference_cancelled_before_request",
+                        session_id=self._core.session_id,
+                        request_id=int(self._pending.request_id),
+                        success=False,
+                        error="control state changed before inference",
+                    )
                     self._core.cancel_request(); self._publish({"phase": "waiting", "reason": "control state changed before inference"}); return
+                self._execution_event(
+                    "observation_build_completed",
+                    session_id=self._core.session_id,
+                    request_id=int(self._pending.request_id),
+                    observation_bytes=len(response.observation_msgpack),
+                    success=True,
+                )
                 payload = unpackb(bytes(response.observation_msgpack), max_size=int(self._metadata.get("max_message_size", 64 * 1024 * 1024)))
-                server_payload = self._server_pose.observation_to_server(payload)
-                action, latency = self._client.infer_action(server_payload, expected_session_id=self._core.session_id, expected_request_id=self._pending.request_id)
+                self._execution_event(
+                    "model_inference_started",
+                    session_id=self._core.session_id,
+                    request_id=int(self._pending.request_id),
+                    model_generation=int(self._model_generation),
+                    model_port=int(self._model_port),
+                )
+                action, latency = self._client.infer_action(payload, expected_session_id=self._core.session_id, expected_request_id=self._pending.request_id)
+                self._execution_event(
+                    "model_inference_completed",
+                    session_id=self._core.session_id,
+                    request_id=int(self._pending.request_id),
+                    latency_ms=float(latency) * 1000.0,
+                    success=True,
+                )
                 if action.next_metadata_format is not None:
                     self._metadata = dict(self._metadata); self._metadata["metadata_format"] = action.next_metadata_format
-                command = self._server_pose.action_to_canonical(self._core.accept_parsed_action(action)); execution = command["execution"]; values = command["action"]
-                self._inference_count += 1
-                self._last_request_id = int(command["request_id"])
-                self._last_latency_s = float(latency)
-                message = ExecutableAction(); message.session_id = command["session_id"]; message.request_id = command["request_id"]; message.action_id = command["action_id"]; message.revision = command["revision"]; message.timestamp_ns = command["timestamp_ns"]; message.frequency_hz = execution["frequency_hz"]; message.action_length = execution["action_length"]; message.execute_start = execution["execute_start"]; message.execute_length = execution["execute_length"]; message.eef_frame = CANONICAL_EEF_FRAME
+                command = self._core.accept_parsed_action(action); execution = command["execution"]; values = command["action"]
+                self._request_metrics.record(command["request_id"], latency)
+                message = ExecutableAction(); message.session_id = command["session_id"]; message.request_id = command["request_id"]; message.action_id = command["action_id"]; message.revision = command["revision"]; message.timestamp_ns = command["timestamp_ns"]; message.frequency_hz = execution["frequency_hz"]; message.action_length = execution["action_length"]; message.execute_start = execution["execute_start"]; message.execute_length = execution["execute_length"]; message.rtc = execution["rtc"]; message.eef_frame = CANONICAL_EEF_FRAME
                 for field, source in (("left_eef", values["left_wrist"]["eef"]), ("right_eef", values["right_wrist"]["eef"])):
                     if source is not None: setattr(message, field, np.asarray(source, dtype=np.float32).reshape(-1).tolist())
                 for field, source in (("left_arm_joint", values["left_wrist"]["joint"]), ("right_arm_joint", values["right_wrist"]["joint"])):
                     if source is not None: setattr(message, field, np.asarray(source, dtype=np.float32).reshape(-1).tolist())
                 left, right = values["hand_joint"]["left"], values["hand_joint"]["right"]
                 if left is not None and right is not None: message.hand_joint = np.concatenate((left, right), axis=-1).reshape(-1).tolist()
-                self._action_pub.publish(message); self._publish({"phase": "executing", "action_id": message.action_id, "latency_s": latency, "reason": "", "error": ""})
+                self._action_pub.publish(message)
+                self._execution_event(
+                    "policy_action_published",
+                    session_id=str(message.session_id),
+                    request_id=int(message.request_id),
+                    action_id=str(message.action_id),
+                    revision=int(message.revision),
+                    execute_start=int(message.execute_start),
+                    execute_length=int(message.execute_length),
+                    rtc=int(message.rtc),
+                    frequency_hz=float(message.frequency_hz),
+                )
+                self._publish({"phase": "executing", "action_id": message.action_id, "latency_s": latency, "reason": "", "error": ""})
             except Exception as exc:
+                self._execution_event(
+                    "policy_inference_pipeline_failed",
+                    session_id=self._core.session_id,
+                    request_id=(
+                        int(self._pending.request_id)
+                        if self._pending is not None
+                        else None
+                    ),
+                    success=False,
+                    error=str(exc),
+                )
                 if self._core.inference_pending:
                     self._core.cancel_request()
                 self._publish({"phase": "fault", "error": str(exc)})
@@ -419,22 +644,70 @@ def main(args=None) -> None:
 
         def _action(self, message):
             try:
-                command = self._core.accept_action(json.loads(message.data))
+                command = self._core.accept_action(
+                    json.loads(message.data),
+                    expected_schema=str(
+                        (self._metadata or {}).get("action_schema")
+                        or "sharpa_policy_action.v5"
+                    ),
+                )
                 self._publish({"phase": "executing", "action": command})
             except Exception as exc:
                 self._publish({"phase": "fault", "error": str(exc)})
 
         def _done(self, message):
             try:
-                feedback = self._core.complete(json.loads(message.data))
-                self._publish({"phase": "ready", "execution_feedback": feedback})
+                payload = json.loads(message.data)
+                # A full STOP may unload/reset the model before Actor's aborted
+                # chunk terminal event reaches this callback.  That event is
+                # stale once the synchronous gate no longer owns an execution.
+                if not self._core.executing:
+                    return
+                feedback = self._core.complete(payload)
+                waiting_for_restart = self._core.waiting_for_restart
+                self._publish({
+                    "phase": self._core.phase,
+                    "reason": (
+                        "execution stopped; start again to request a new chunk"
+                        if waiting_for_restart
+                        else ""
+                    ),
+                    "error": (
+                        str(payload.get("error") or "execution failed")
+                        if self._core.failed and not waiting_for_restart
+                        else ""
+                    ),
+                    "execution_feedback": feedback,
+                })
             except Exception as exc:
                 self._publish({"phase": "fault", "error": str(exc)})
 
         def _done_msg(self, message):
             if not completion_belongs_to_session(message, self._core.session_id):
                 return
-            self._done(String(data=json.dumps({"schema": "sharpa_execution_done.v1", "session_id": message.session_id, "request_id": int(message.request_id), "action_id": message.action_id, "revision": int(message.revision), "execute_start": int(message.execute_start), "execute_length": int(message.execute_length), "executed_steps": int(message.executed_steps), "success": bool(message.success), "done": True, "error": message.error or None})))
+            execute_fetch = bool(getattr(message, "execute_fetch", False))
+            execute_done = bool(message.execute_done)
+            if execute_done:
+                self._done(String(data=json.dumps({"schema": "sharpa_execution_done.v1", "session_id": message.session_id, "request_id": int(message.request_id), "action_id": message.action_id, "revision": int(message.revision), "execute_start": int(message.execute_start), "execute_length": int(message.execute_length), "executed_steps": int(message.executed_steps), "success": bool(message.success), "done": True, "error": message.error or None})))
+            if execute_fetch and not execute_done:
+                try:
+                    if not bool(message.success):
+                        raise RuntimeError("execute_fetch requires successful progress")
+                    if not self._control_ready or self._execution_provider != "policy":
+                        return
+                    pending = self._core.prefetch(message)
+                    self._request_observation(pending)
+                    self._publish(
+                        {
+                            "phase": self._core.phase,
+                            "reason": "RTC next chunk requested",
+                            "error": "",
+                        }
+                    )
+                except Exception as exc:
+                    if self._core.inference_pending:
+                        self._core.cancel_request()
+                    self._publish({"phase": "fault", "error": str(exc)})
 
     rclpy.init(args=args); node = RosPolicyClientNode()
     try:

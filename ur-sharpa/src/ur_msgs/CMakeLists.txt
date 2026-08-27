@@ -21,6 +21,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   # deploy layer
   "msg/PolicyObs.msg"
   "msg/ExecutableAction.msg"
+  "msg/ActorTrajectory.msg"
   "msg/ExecutionDone.msg"
   # services
   "srv/BuildObservation.srv"

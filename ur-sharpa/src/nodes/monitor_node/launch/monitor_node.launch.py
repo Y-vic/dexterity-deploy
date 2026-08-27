@@ -14,7 +14,7 @@ def generate_launch_description():
         DeclareLaunchArgument("upload_host", default_value="BAAI"),
         DeclareLaunchArgument(
             "upload_path",
-            default_value="/share/project/yenaisheng/dreamzero/datasets/postrain/ur-sharpa/raw_data",
+            default_value="/share/project/yenaisheng/datasets/postrain/ur-sharpa/raw_data",
         ),
         DeclareLaunchArgument("status_timeout_s", default_value="2.0"),
         Node(package="monitor_node", executable="monitor_node", name="monitor_node",

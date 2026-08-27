@@ -30,7 +30,7 @@ import numpy as np
 import rclpy
 from rclpy._rclpy_pybind11 import RCLError
 from rclpy.node import Node
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from ur_common.drivers import (
     HardwareConnectionError,
@@ -41,6 +41,7 @@ from ur_common.drivers import (
 from ur_common.safety import SafetyConfig
 from ur_common.kinematics import UrCommonKinematics
 from ur_common.geometry import CANONICAL_EEF_FRAME
+from ur_common.execution_log import execution_event_json
 
 from ur_msgs.msg import ArmCommand, ControlStatus, HardwareCommandResult, UrStateFrame
 
@@ -175,6 +176,9 @@ class UrNode(Node):
         )
         self.result_pub = self.create_publisher(
             HardwareCommandResult, str(self.get_parameter("result_topic").value), 10
+        )
+        self.execution_event_pub = self.create_publisher(
+            String, "/deploy/execution_event", 100
         )
         self.command_sub = self.create_subscription(
             ArmCommand,
@@ -394,8 +398,51 @@ class UrNode(Node):
         return tuple(result)
 
     # ---- commands ------------------------------------------------------
+    def execution_event(self, event: str, message: ArmCommand, **fields: Any) -> None:
+        publisher = getattr(self, "execution_event_pub", None)
+        if publisher is None:
+            return
+        try:
+            output = String()
+            output.data = execution_event_json(
+                "ur_node",
+                event,
+                action_id=str(getattr(message, "action_id", "")),
+                revision=int(getattr(message, "revision", 0)),
+                step_index=int(getattr(message, "step_index", 0)),
+                source=int(getattr(message, "source", 0)),
+                dry_run=bool(getattr(message, "dry_run", False)),
+                **fields,
+            )
+            publisher.publish(output)
+        except Exception as exc:
+            self.get_logger().warning(f"failed to publish execution event: {exc}")
+
     def on_command(self, message: ArmCommand) -> None:
         """Arbitrate, then execute. Always publishes exactly one result."""
+        self.execution_event("hardware_command_received", message, device=DEVICE)
+        if bool(message.dry_run):
+            if int(message.source) != int(ArmCommand.SOURCE_ACTOR):
+                self.publish_result(
+                    message,
+                    False,
+                    "dry_run_source_rejected",
+                    "only Actor commands may use dry_run",
+                )
+                return
+            try:
+                period_s = float(message.period_s)
+                if not np.isfinite(period_s) or period_s <= 0.0:
+                    raise ValueError("period_s must be finite and positive")
+                with self._driver_lock:
+                    self.resolve_targets(message)
+            except Exception as exc:
+                self.publish_result(
+                    message, False, "ur_dry_run_validation_failed", str(exc)
+                )
+                return
+            self.publish_result(message, True, "", "")
+            return
         if self.stopped:
             self.publish_result(message, False, "hardware_stopped", "hardware stop asserted")
             return
@@ -417,6 +464,8 @@ class UrNode(Node):
             return
 
         try:
+            sdk_started_ns = time.monotonic_ns()
+            self.execution_event("hardware_sdk_command_started", message, device=DEVICE)
             with self._driver_lock:
                 left, right = self.resolve_targets(message)
                 self.driver.command_joint_step(
@@ -424,7 +473,21 @@ class UrNode(Node):
                     left_enable=bool(message.left_enable),
                     right_enable=bool(message.right_enable),
                 )
+            self.execution_event(
+                "hardware_sdk_command_completed",
+                message,
+                device=DEVICE,
+                duration_ms=(time.monotonic_ns() - sdk_started_ns) / 1_000_000.0,
+                success=True,
+            )
         except Exception as exc:
+            self.execution_event(
+                "hardware_sdk_command_failed",
+                message,
+                device=DEVICE,
+                success=False,
+                error=str(exc),
+            )
             with self._driver_lock:
                 enabled = [
                     side for side in ("left", "right")
@@ -518,8 +581,17 @@ class UrNode(Node):
         result.success = bool(success)
         result.failure_code = failure_code
         result.failure_message = failure_message
+        result.dry_run = bool(message.dry_run)
         result.timestamp_ns = time.time_ns()
         self.result_pub.publish(result)
+        self.execution_event(
+            "hardware_command_result_published",
+            message,
+            device=DEVICE,
+            success=bool(success),
+            failure_code=str(failure_code),
+            failure_message=str(failure_message),
+        )
         self.last_command_acked = bool(success)
         self.last_command_message = "" if success else failure_message
 

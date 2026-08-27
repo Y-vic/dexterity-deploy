@@ -104,11 +104,23 @@ if ROS_AVAILABLE:
 
         def _result(self, key):
             def callback(msg):
-                self.upstream[f"{key}_command"] = {
+                payload = {
+                    "timestamp_ns": int(msg.timestamp_ns),
+                    "source": int(msg.source),
+                    "action_id": str(msg.action_id),
+                    "revision": int(msg.revision),
+                    "step_index": int(msg.step_index),
+                    "device": str(msg.device),
+                    "dry_run": bool(msg.dry_run),
                     "success": bool(msg.success),
-                    "failure_code": msg.failure_code,
-                    "failure_message": msg.failure_message,
+                    "failure_code": str(msg.failure_code),
+                    "failure_message": str(msg.failure_message),
                 }
+                self.upstream[f"{key}_command"] = payload
+                history_key = f"{key}_command_history"
+                history = list(self.upstream.get(history_key) or [])
+                history.append(payload)
+                self.upstream[history_key] = history[-200:]
             return callback
 
         def _camera(self, msg):
@@ -163,6 +175,9 @@ if ROS_AVAILABLE:
                 "stop_record": self.machine.attempt_stop_recording,
                 "discard_record": self.machine.attempt_discard_recording,
                 "start_deploy": self.machine.attempt_start_deploy,
+                "continue_deploy": self.machine.attempt_continue_deploy,
+                "preview_deploy": self.machine.attempt_preview_deploy,
+                "pause_deploy": self.machine.attempt_pause_deploy,
                 "stop_deploy": self.machine.attempt_stop_deploy,
                 "select_policy": lambda: self.machine.attempt_set_execution_provider("policy"),
                 "select_replay": lambda: self.machine.attempt_set_execution_provider("replay"),
@@ -204,6 +219,8 @@ if ROS_AVAILABLE:
             msg.sharpa_state = int(state.sharpa_state)
             msg.record_state = int(state.record_state)
             msg.active_source = int(state.active_source)
+            msg.execution_paused = bool(state.execution_paused)
+            msg.execution_dry_run = bool(state.execution_dry_run)
             msg.gate_reason = state.gate_reason or state.camera_gate_reason()
             msg.session_id = state.session_id
             self.status_pub.publish(msg)

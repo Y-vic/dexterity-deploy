@@ -1,0 +1,348 @@
+"""Actor trajectory serialization and bounded Deploy execution tracing."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import shutil
+import time
+from typing import Any
+
+import numpy as np
+
+
+TRACE_SCHEMA = "sharpa.actor_ik.execution_trace.v2"
+LEGACY_PREVIEW_SCHEMA = "sharpa.actor_ik.preview_trace.v1"
+TRAJECTORY_SCHEMA = "sharpa.actor_ik.trajectory.v1"
+DEFAULT_RETENTION_DAYS = 7
+DEFAULT_MAX_RUNS = 100
+DEFAULT_MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024
+
+
+def build_trajectory_payload(
+    action: Any,
+    plan: Any,
+    *,
+    provider: str,
+    dry_run: bool,
+    trace_dir: str = "",
+) -> dict[str, Any]:
+    """Build the canonical chunk published after Actor planning succeeds."""
+    left = np.asarray(plan.left_joint, dtype=np.float32)
+    right = np.asarray(plan.right_joint, dtype=np.float32)
+    hand = np.asarray(plan.hand_joint, dtype=np.float32)
+    length = int(action.execute_length)
+    if left.shape != (length, 6) or right.shape != (length, 6):
+        raise ValueError("Actor arm plan must have shape (execute_length, 6)")
+    if hand.shape != (length, 44):
+        raise ValueError("Actor hand plan must have shape (execute_length, 44)")
+    if not all(np.isfinite(values).all() for values in (left, right, hand)):
+        raise ValueError("Actor trajectory contains non-finite joints")
+
+    def max_step(values: np.ndarray) -> float:
+        if len(values) < 2:
+            return 0.0
+        return float(np.max(np.abs(np.diff(values.astype(np.float64), axis=0))))
+
+    diagnostics = {
+        "schema": TRAJECTORY_SCHEMA,
+        "left_arm_max_step_rad": max_step(left),
+        "right_arm_max_step_rad": max_step(right),
+        "hand_max_step_rad": max_step(hand),
+        "left_eef_present": bool(action.left_eef),
+        "right_eef_present": bool(action.right_eef),
+    }
+    return {
+        "provider": str(provider),
+        "dry_run": bool(dry_run),
+        "trace_dir": str(trace_dir),
+        "session_id": str(action.session_id),
+        "request_id": int(action.request_id),
+        "action_id": str(action.action_id),
+        "revision": int(action.revision),
+        "timestamp_ns": int(action.timestamp_ns),
+        "frequency_hz": float(action.frequency_hz),
+        "action_length": int(action.action_length),
+        "execute_start": int(action.execute_start),
+        "execute_length": length,
+        "rtc": int(getattr(action, "rtc", 0)),
+        "eef_frame": str(action.eef_frame),
+        "left_eef": [float(value) for value in action.left_eef],
+        "right_eef": [float(value) for value in action.right_eef],
+        "left_arm_joint": left.reshape(-1).tolist(),
+        "right_arm_joint": right.reshape(-1).tolist(),
+        "hand_joint": hand.reshape(-1).tolist(),
+        "ik_applied": bool(action.left_eef and action.right_eef),
+        "diagnostics": diagnostics,
+    }
+
+
+class ExecutionTraceWriter:
+    """Durable live/preview Actor journal with bounded on-disk retention."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        retention_days: int = DEFAULT_RETENTION_DAYS,
+        max_runs: int = DEFAULT_MAX_RUNS,
+        max_total_bytes: int = DEFAULT_MAX_TOTAL_BYTES,
+    ) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.retention_days = int(retention_days)
+        self.max_runs = int(max_runs)
+        self.max_total_bytes = int(max_total_bytes)
+        if self.retention_days <= 0:
+            raise ValueError("retention_days must be positive")
+        if self.max_runs <= 0:
+            raise ValueError("max_runs must be positive")
+        if self.max_total_bytes <= 0:
+            raise ValueError("max_total_bytes must be positive")
+        self.run_dir: Path | None = None
+        self.started_at_ns = 0
+        self.trajectory_count = 0
+        self.event_count = 0
+        self.failure_count = 0
+        self.mode = ""
+        self.provider = ""
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._recover_abandoned_runs()
+        self.cleanup()
+
+    @property
+    def active(self) -> bool:
+        return self.run_dir is not None
+
+    @property
+    def path(self) -> str:
+        return str(self.run_dir) if self.run_dir is not None else ""
+
+    def start(self, *, mode: str = "preview", provider: str = "policy") -> str:
+        if self.run_dir is not None:
+            return str(self.run_dir)
+        self.cleanup()
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        suffix = f"{time.time_ns() % 1_000_000_000:09d}"
+        self.run_dir = self.root / f"{stamp}.{suffix}"
+        self.run_dir.mkdir(parents=True, exist_ok=False)
+        self.started_at_ns = time.time_ns()
+        self.trajectory_count = 0
+        self.event_count = 0
+        self.failure_count = 0
+        self.mode = str(mode)
+        self.provider = str(provider)
+        self._write_json(
+            "manifest.json",
+            {
+                "schema": TRACE_SCHEMA,
+                "created_at_ns": self.started_at_ns,
+                "state": "active",
+                "mode": self.mode,
+                "provider": self.provider,
+                "trajectory_source": "/actor_ik/trajectory",
+                "coordinate_frame": "canonical",
+                "retention": {
+                    "days": self.retention_days,
+                    "max_runs": self.max_runs,
+                    "max_total_bytes": self.max_total_bytes,
+                },
+            },
+        )
+        self.event("execution_started", mode=self.mode, provider=self.provider)
+        return str(self.run_dir)
+
+    def trajectory(self, payload: dict[str, Any]) -> None:
+        if self.run_dir is None:
+            return
+        self._append_jsonl("trajectories.jsonl", payload)
+        self.trajectory_count += 1
+
+    def event(self, event: str, **fields: Any) -> None:
+        if self.run_dir is None:
+            return
+        record = {
+            "event": str(event),
+            "timestamp_ns": time.time_ns(),
+            "monotonic_ns": time.monotonic_ns(),
+            **fields,
+        }
+        self.record(record)
+
+    def record(self, record: dict[str, Any]) -> None:
+        """Append an already structured event from another Deploy node."""
+        if self.run_dir is None:
+            return
+        value = dict(record)
+        value.setdefault("timestamp_ns", time.time_ns())
+        value.setdefault("monotonic_ns", time.monotonic_ns())
+        self._append_jsonl("events.jsonl", value)
+        self.event_count += 1
+        if value.get("success") is False:
+            self.failure_count += 1
+
+    def stop(
+        self,
+        reason: str = "execution_stopped",
+        *,
+        final_state: dict[str, Any] | None = None,
+    ) -> str:
+        if self.run_dir is None:
+            return ""
+        path = str(self.run_dir)
+        self.event(reason)
+        finished_at_ns = time.time_ns()
+        if final_state is not None:
+            self._write_json("final_state.json", final_state)
+        self._write_json(
+            "summary.json",
+            {
+                "schema": TRACE_SCHEMA,
+                "started_at_ns": self.started_at_ns,
+                "finished_at_ns": finished_at_ns,
+                "mode": self.mode,
+                "provider": self.provider,
+                "trajectory_count": self.trajectory_count,
+                "event_count": self.event_count,
+                "failure_count": self.failure_count,
+                "reason": str(reason),
+            },
+        )
+        manifest = self._read_json(self.run_dir / "manifest.json") or {}
+        manifest.update(state="complete", finished_at_ns=finished_at_ns)
+        self._write_json("manifest.json", manifest)
+        self.run_dir = None
+        self.mode = ""
+        self.provider = ""
+        self.cleanup()
+        return path
+
+    def cleanup(self, *, now_ns: int | None = None) -> list[str]:
+        """Delete only recognized, completed trace dirs that exceed retention."""
+        now_ns = time.time_ns() if now_ns is None else int(now_ns)
+        cutoff_ns = now_ns - self.retention_days * 24 * 60 * 60 * 1_000_000_000
+        runs = self._completed_runs()
+        removed: list[str] = []
+
+        def remove(run: dict[str, Any]) -> None:
+            path = run["path"]
+            allowed_parents = {self.root, self.root / "legacy_previews"}
+            if (
+                path == self.run_dir
+                or path.parent not in allowed_parents
+                or path.is_symlink()
+            ):
+                return
+            shutil.rmtree(path)
+            removed.append(str(path))
+
+        for run in list(runs):
+            if run["created_at_ns"] < cutoff_ns:
+                remove(run)
+        runs = [run for run in self._completed_runs() if str(run["path"]) not in removed]
+        while len(runs) > self.max_runs:
+            run = runs.pop(0)
+            remove(run)
+        total_bytes = sum(run["bytes"] for run in runs)
+        while runs and total_bytes > self.max_total_bytes:
+            run = runs.pop(0)
+            total_bytes -= run["bytes"]
+            remove(run)
+        return removed
+
+    def _recover_abandoned_runs(self) -> None:
+        """A new Actor process makes every older active manifest abandoned."""
+        for path in self.root.iterdir():
+            if not path.is_dir() or path.is_symlink():
+                continue
+            manifest_path = path / "manifest.json"
+            manifest = self._read_json(manifest_path)
+            if not manifest or manifest.get("schema") != TRACE_SCHEMA:
+                continue
+            if manifest.get("state") != "active":
+                continue
+            finished_at_ns = time.time_ns()
+            manifest.update(state="abandoned", finished_at_ns=finished_at_ns)
+            self._write_json_at(manifest_path, manifest)
+            summary_path = path / "summary.json"
+            if not summary_path.exists():
+                self._write_json_at(
+                    summary_path,
+                    {
+                        "schema": TRACE_SCHEMA,
+                        "started_at_ns": int(manifest.get("created_at_ns") or 0),
+                        "finished_at_ns": finished_at_ns,
+                        "mode": str(manifest.get("mode") or ""),
+                        "provider": str(manifest.get("provider") or ""),
+                        "reason": "actor_process_restarted",
+                    },
+                )
+
+    def _completed_runs(self) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        paths = list(self.root.iterdir())
+        legacy_root = self.root / "legacy_previews"
+        if legacy_root.is_dir() and not legacy_root.is_symlink():
+            paths.extend(legacy_root.iterdir())
+        for path in paths:
+            if not path.is_dir() or path.is_symlink() or path == self.run_dir:
+                continue
+            manifest = self._read_json(path / "manifest.json")
+            if not manifest:
+                continue
+            schema = manifest.get("schema")
+            completed = bool(
+                schema == TRACE_SCHEMA
+                and manifest.get("state") in {"complete", "abandoned"}
+            )
+            legacy_completed = bool(
+                schema == LEGACY_PREVIEW_SCHEMA
+                and path.parent == legacy_root
+            )
+            if not (completed or legacy_completed):
+                continue
+            runs.append(
+                {
+                    "path": path,
+                    "created_at_ns": int(manifest.get("created_at_ns") or 0),
+                    "bytes": sum(
+                        item.stat().st_size
+                        for item in path.rglob("*")
+                        if item.is_file() and not item.is_symlink()
+                    ),
+                }
+            )
+        return sorted(runs, key=lambda run: (run["created_at_ns"], str(run["path"])))
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any] | None:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _write_json(self, name: str, payload: dict[str, Any]) -> None:
+        assert self.run_dir is not None
+        self._write_json_at(self.run_dir / name, payload)
+
+    @staticmethod
+    def _write_json_at(path: Path, payload: dict[str, Any]) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+
+    def _append_jsonl(self, name: str, payload: dict[str, Any]) -> None:
+        assert self.run_dir is not None
+        with (self.run_dir / name).open("a", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+
+
+# Compatibility for callers/tests created when traces were preview-only.
+PreviewTraceWriter = ExecutionTraceWriter

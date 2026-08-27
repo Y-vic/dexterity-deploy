@@ -13,7 +13,8 @@ import numpy.typing as npt
 from .metadata import validate_metadata_format
 
 
-ACTION_SCHEMA = "sharpa_policy_action.v4"
+ACTION_SCHEMA = "sharpa_policy_action.v5"
+LEGACY_ACTION_SCHEMA = "sharpa_policy_action.v4"
 EXECUTABLE_ACTION_SCHEMA = "sharpa_executable_action.v1"
 ERROR_SCHEMA = "sharpa_policy_error.v1"
 EEF_DEFINITIONS = frozenset({"absolute", "relative"})
@@ -45,6 +46,7 @@ class ActionExecution:
     action_length: int
     execute_start: int
     execute_length: int
+    rtc: int = 0
 
     @property
     def execute_stop(self) -> int:
@@ -119,6 +121,7 @@ class ParsedPolicyAction:
                 "action_length": self.execution.action_length,
                 "execute_start": self.execution.execute_start,
                 "execute_length": self.execution.execute_length,
+                "rtc": self.execution.rtc,
             },
             "action": self.executable_action(),
         }
@@ -143,6 +146,7 @@ def parse_policy_action(
     expected_session_id: str,
     expected_request_id: int,
     expected_eef_def: str | None = "absolute",
+    expected_schema: str = ACTION_SCHEMA,
 ) -> ParsedPolicyAction:
     envelope = _required_mapping(value, "action_result", ("schema",))
     if envelope["schema"] == ERROR_SCHEMA:
@@ -164,8 +168,14 @@ def parse_policy_action(
             "next_metadata_format",
         ),
     )
-    if result["schema"] != ACTION_SCHEMA:
-        raise ActionValidationError(f"action_result.schema must be {ACTION_SCHEMA}")
+    if expected_schema not in {ACTION_SCHEMA, LEGACY_ACTION_SCHEMA}:
+        raise ActionValidationError(
+            f"unsupported expected action schema {expected_schema!r}"
+        )
+    if result["schema"] != expected_schema:
+        raise ActionValidationError(
+            f"action_result.schema must be {expected_schema}"
+        )
     if result["session_id"] != expected_session_id:
         raise ActionValidationError("action_result.session_id does not match request")
 
@@ -173,10 +183,23 @@ def parse_policy_action(
     if request_id != expected_request_id:
         raise ActionValidationError("action_result.request_id does not match request")
 
+    execution_fields = [
+        "frequency_hz",
+        "action_length",
+        "execute_start",
+        "execute_length",
+    ]
+    if expected_schema == ACTION_SCHEMA:
+        execution_fields.append("rtc")
     execution_raw = _required_mapping(
         result["execution"],
         "action_result.execution",
-        ("frequency_hz", "action_length", "execute_start", "execute_length"),
+        tuple(execution_fields),
+    )
+    rtc = (
+        _integer(execution_raw["rtc"], "action_result.execution.rtc")
+        if expected_schema == ACTION_SCHEMA
+        else 0
     )
     execution = ActionExecution(
         frequency_hz=_positive_float(
@@ -195,9 +218,14 @@ def parse_policy_action(
             "action_result.execution.execute_length",
             minimum=1,
         ),
+        rtc=rtc,
     )
     if execution.execute_stop > execution.action_length:
         raise ActionValidationError("action_result execution slice exceeds action_length")
+    if execution.rtc >= execution.execute_length and execution.rtc != 0:
+        raise ActionValidationError(
+            "action_result.execution.rtc must be zero or smaller than execute_length"
+        )
 
     action = _required_mapping(
         result["action"],

@@ -178,6 +178,7 @@ def main(args=None) -> None:
             self._last_connect_errors = {}
             self._last_connect_log_at = {}
             self._last_camera_errors = {}
+            self._last_camera_drop_counts = {}
             self._closing = False
             self._ego_first_frame_timeout_s = float(
                 self.get_parameter("ego_first_frame_timeout_s").value
@@ -349,9 +350,16 @@ def main(args=None) -> None:
         def _tick(self):
             self._reconnect_missing()
             data = {}
+            pending_frames = {}
             for name in CameraSetCore.NAMES:
                 camera = self._cameras.get(name)
-                snapshot = camera.read() if camera is not None else None
+                drain = getattr(camera, "read_pending", None)
+                pending = list(drain()) if drain is not None else []
+                snapshot = (
+                    pending[-1]
+                    if pending
+                    else camera.read() if camera is not None else None
+                )
                 if (
                     name == "ego"
                     and camera is not None
@@ -367,6 +375,8 @@ def main(args=None) -> None:
                     )
                     snapshot = None
                     camera = None
+                    pending = []
+                pending_frames[name] = pending
                 data[name] = _camera_frame(
                     name,
                     snapshot,
@@ -379,8 +389,25 @@ def main(args=None) -> None:
                 if error and error != self._last_camera_errors.get(name):
                     self.get_logger().warning(f"camera {name} capture failed: {error}")
                 self._last_camera_errors[name] = error
+                if camera is not None:
+                    dropped = (
+                        int(getattr(camera, "dropped_raw_count", 0)),
+                        int(getattr(camera, "dropped_encoded_count", 0)),
+                    )
+                    previous_dropped = self._last_camera_drop_counts.get(name, (0, 0))
+                    if dropped != previous_dropped and sum(dropped) > sum(previous_dropped):
+                        self.get_logger().warning(
+                            f"camera {name} queue dropped frames: "
+                            f"raw={dropped[0]} encoded={dropped[1]}"
+                        )
+                    self._last_camera_drop_counts[name] = dropped
             payload = CameraSetCore.make(data)
             for name in CameraSetCore.NAMES:
+                for frame in pending_frames[name]:
+                    timestamp = int(frame.timestamp_ns)
+                    jpeg = bytes(frame.jpeg)
+                    self._shared_camera.write(name, timestamp, jpeg, True)
+                    self._last_shared_signatures[name] = (timestamp, True)
                 signature = (payload[f"{name}_timestamp_ns"], payload[f"{name}_valid"])
                 if signature != self._last_shared_signatures.get(name):
                     self._shared_camera.write(name, signature[0], payload[name], signature[1])

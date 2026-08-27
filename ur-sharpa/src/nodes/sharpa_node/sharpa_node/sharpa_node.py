@@ -11,6 +11,25 @@ from typing import Any
 import numpy as np
 
 
+ACTOR_SOURCE = 3
+
+
+def validate_hand_command(command: Any) -> tuple[np.ndarray, int, bool, bool, bool]:
+    """Validate a command before either dry-run ACK or SDK dispatch."""
+    source = int(command.source)
+    values = np.asarray(command.q_cmd, dtype=np.float64)
+    if values.shape != (44,) or not np.isfinite(values).all():
+        raise ValueError("q_cmd must have 44 finite values")
+    left_enable = bool(command.left_enable)
+    right_enable = bool(command.right_enable)
+    if not left_enable and not right_enable:
+        raise ValueError("at least one SharpA hand must be enabled")
+    dry_run = bool(command.dry_run)
+    if dry_run and source != ACTOR_SOURCE:
+        raise ValueError("only Actor commands may use dry_run")
+    return values, source, left_enable, right_enable, dry_run
+
+
 class SharpaStateCore:
     """Validate and normalize a driver snapshot before it crosses ROS."""
 
@@ -93,7 +112,7 @@ def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
-    from std_msgs.msg import Bool
+    from std_msgs.msg import Bool, String
     from ur_msgs.msg import (
         ControlStatus,
         DeformationFrame,
@@ -104,6 +123,7 @@ def main(args=None) -> None:
         WrenchFrame,
     )
     from ur_common.drivers import SharpADevicePair
+    from ur_common.execution_log import execution_event_json
     from .arbitration import SharpaState, Source, arbitrate
 
     class RosSharpaNode(Node):
@@ -132,6 +152,9 @@ def main(args=None) -> None:
             self.wrench_pub = self.create_publisher(WrenchFrame, "/sharpa/wrench", 10)
             self.deformation_pub = self.create_publisher(DeformationFrame, "/sharpa/deformation", 1)
             self.result = self.create_publisher(HardwareCommandResult, "/sharpa/command_result", 10)
+            self._execution_event_pub = self.create_publisher(
+                String, "/deploy/execution_event", 100
+            )
             self._sharpa_state = SharpaState.STOPPED
             self._active_source = Source.UNKNOWN
             self._stopped = False
@@ -243,17 +266,23 @@ def main(args=None) -> None:
 
         def _command(self, command):
             result = HardwareCommandResult(); result.source = command.source; result.action_id = command.action_id; result.revision = command.revision; result.step_index = command.step_index; result.device = "sharpa"; result.timestamp_ns = time.time_ns()
+            result.dry_run = bool(command.dry_run)
+            self._execution_event(
+                "hardware_command_received", command, device="sharpa"
+            )
             try:
+                values, source, left_enable, right_enable, dry_run = (
+                    validate_hand_command(command)
+                )
                 try:
-                    command_source = Source(int(command.source))
+                    command_source = Source(source)
                 except ValueError:
                     command_source = Source.UNKNOWN
-                values = np.asarray(command.q_cmd, dtype=np.float64)
-                if values.shape != (44,) or not np.isfinite(values).all():
-                    raise ValueError("q_cmd must have 44 finite values")
-
-                left_enable = bool(command.left_enable)
-                right_enable = bool(command.right_enable)
+                if dry_run:
+                    result.success = True
+                    self.result.publish(result)
+                    self._result_event(command, result)
+                    return
                 with self._sdk_lock:
                     if self._stopped:
                         raise RuntimeError("hardware stop asserted")
@@ -269,6 +298,7 @@ def main(args=None) -> None:
                         result.failure_code = "arbitration_rejected"
                         result.failure_message = decision.reason
                         self.result.publish(result)
+                        self._result_event(command, result)
                         return
                     if self._driver_error:
                         raise RuntimeError(
@@ -279,10 +309,25 @@ def main(args=None) -> None:
                         # any SDK failure must not leave an older full command
                         # looking like the command paired with future state.
                         self._command_cache.invalidate()
+                    sdk_started_ns = time.monotonic_ns()
+                    self._execution_event(
+                        "hardware_sdk_command_started", command, device="sharpa"
+                    )
                     dispatched = self.driver.command(
                         values[:22], values[22:],
                         left_enable=left_enable,
                         right_enable=right_enable,
+                        event_callback=lambda event, **fields: self._execution_event(
+                            event, command, device="sharpa", **fields
+                        ),
+                    )
+                    self._execution_event(
+                        "hardware_sdk_command_completed",
+                        command,
+                        device="sharpa",
+                        duration_ms=(time.monotonic_ns() - sdk_started_ns)
+                        / 1_000_000.0,
+                        success=True,
                     )
                     self._command_cache.record(
                         dispatched,
@@ -292,7 +337,42 @@ def main(args=None) -> None:
                 result.success = True
             except Exception as exc:
                 result.success = False; result.failure_code = "sharpa_command_failed"; result.failure_message = str(exc)
+                self._execution_event(
+                    "hardware_sdk_command_failed",
+                    command,
+                    device="sharpa",
+                    success=False,
+                    error=str(exc),
+                )
             self.result.publish(result)
+            self._result_event(command, result)
+
+        def _execution_event(self, event, command, **fields):
+            try:
+                message = String()
+                message.data = execution_event_json(
+                    "sharpa_node",
+                    event,
+                    action_id=str(command.action_id),
+                    revision=int(command.revision),
+                    step_index=int(command.step_index),
+                    source=int(command.source),
+                    dry_run=bool(command.dry_run),
+                    **fields,
+                )
+                self._execution_event_pub.publish(message)
+            except Exception as exc:
+                self.get_logger().warning(f"failed to publish execution event: {exc}")
+
+        def _result_event(self, command, result):
+            self._execution_event(
+                "hardware_command_result_published",
+                command,
+                device="sharpa",
+                success=bool(result.success),
+                failure_code=str(result.failure_code),
+                failure_message=str(result.failure_message),
+            )
 
         def destroy_node(self):
             self.driver.close(); return super().destroy_node()

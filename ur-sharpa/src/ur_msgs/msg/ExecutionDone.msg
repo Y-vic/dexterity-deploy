@@ -1,5 +1,7 @@
-# Terminal report for one executed slice. action_execute publishes this EXACTLY
-# ONCE per ExecutableAction, whether the slice completed, failed or was aborted.
+# Fetch/done state update for one executable slice.  Actor may publish twice
+# when rtc > 0: first execute_fetch=true while execution continues, then
+# execute_done=true after the final step or on failure.  With rtc == 0 both
+# flags are true in the single terminal update.
 #
 # The policy client only accepts a done whose identity matches the action it is
 # waiting on, then converts it into the execution_feedback of the next
@@ -31,12 +33,13 @@ uint32 execute_length
 # adding the two numbers by hand.
 uint32 executed_steps
 
-# True when the whole slice ran without fault.
+# True when all acknowledged steps represented by this update ran without fault.
 bool success
 
-# Always true: this message is only published on termination. Present so the
-# wire form matches the sharpa_execution_done.v1 dict key-for-key.
-bool done true
+# Independent state edges.  A fetch-only update never releases the currently
+# executing Actor plan.  A done update is terminal for this action identity.
+bool execute_fetch false
+bool execute_done true
 
 # Failure detail, empty string on success (the dict's None).
 string error

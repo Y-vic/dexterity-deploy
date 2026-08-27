@@ -1192,6 +1192,7 @@ class SharpADevicePair:
         *,
         left_enable: bool = True,
         right_enable: bool = True,
+        event_callback: Any = None,
     ) -> dict[str, np.ndarray]:
         """Set both hands' joint positions.
 
@@ -1216,7 +1217,22 @@ class SharpADevicePair:
             "left": _finite_vector(left_joint, n, "left hand target"),
             "right": _finite_vector(right_joint, n, "right hand target"),
         }
+        def report(event: str, **fields: Any) -> None:
+            if not callable(event_callback):
+                return
+            try:
+                event_callback(event, **fields)
+            except Exception:
+                # Diagnostics must never change the hardware command outcome.
+                pass
+
+        report("sharpa_sdk_state_read_started")
+        read_started_ns = time.monotonic_ns()
         current = self.read()
+        report(
+            "sharpa_sdk_state_read_completed",
+            duration_ms=(time.monotonic_ns() - read_started_ns) / 1_000_000.0,
+        )
         current_joint = {
             "left": current.left_joint.astype(np.float64),
             "right": current.right_joint.astype(np.float64),
@@ -1233,7 +1249,18 @@ class SharpADevicePair:
                     delta, -self.max_hand_step_rad, self.max_hand_step_rad
                 )
             for side in active:
+                command_started_ns = time.monotonic_ns()
+                report("sharpa_sdk_hand_command_started", side=side)
                 error = self.hands[side].set_joint_position(targets[side].tolist(), False)
+                report(
+                    "sharpa_sdk_hand_command_completed",
+                    side=side,
+                    duration_ms=(time.monotonic_ns() - command_started_ns)
+                    / 1_000_000.0,
+                    sdk_code=int(getattr(error, "code", -1)),
+                    sdk_message=str(getattr(error, "message", "")),
+                    success=getattr(error, "code", -1) == 0,
+                )
                 if getattr(error, "code", -1) != 0:
                     self.hold(side)
                     raise HardwareCommandError(
@@ -1394,9 +1421,10 @@ class _ThreadedCamera:
     def __init__(
         self,
         jpeg_quality: int = 90,
-        raw_queue_size: int = 0,
+        raw_queue_size: int = 8,
         process_encode: bool = False,
         encode_workers: int = 1,
+        encoded_queue_size: int = 128,
     ) -> None:
         self.jpeg_quality = int(jpeg_quality)
         self.raw_queue_size = int(raw_queue_size)
@@ -1406,10 +1434,18 @@ class _ThreadedCamera:
         self.encode_workers = int(encode_workers)
         if self.encode_workers <= 0:
             raise ValueError("camera encode worker count must be positive")
+        self.encoded_queue_size = int(encoded_queue_size)
+        if self.encoded_queue_size <= 0:
+            raise ValueError("camera encoded queue size must be positive")
         self._latest: CameraSnapshot | None = None
         self._lock = threading.Lock()
         self._raw_ready = threading.Condition(self._lock)
-        self._raw_queue: deque[tuple[int, np.ndarray]] = deque()
+        self._raw_queue: deque[tuple[int, int, np.ndarray]] = deque()
+        self._encoded_pending: dict[int, CameraSnapshot] = {}
+        self._encoded_ready: deque[CameraSnapshot] = deque()
+        self._dropped_sequences: set[int] = set()
+        self._next_capture_sequence = 0
+        self._next_output_sequence = 0
         self._stop = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._encode_threads: list[threading.Thread] = []
@@ -1419,6 +1455,7 @@ class _ThreadedCamera:
         self.capture_count = 0
         self.encoded_count = 0
         self.dropped_raw_count = 0
+        self.dropped_encoded_count = 0
 
     def _grab_rgb(self) -> np.ndarray | None:  # pragma: no cover - hardware
         raise NotImplementedError
@@ -1462,13 +1499,17 @@ class _ThreadedCamera:
                 sampled_at_ns = self._sample_timestamp_ns()
                 raw = np.asarray(bgr, dtype=np.uint8).copy()
                 with self._raw_ready:
+                    sequence = self._next_capture_sequence
+                    self._next_capture_sequence += 1
                     if (
                         self.raw_queue_size > 0
                         and len(self._raw_queue) >= self.raw_queue_size
                     ):
-                        self._raw_queue.popleft()
+                        dropped_sequence, _, _ = self._raw_queue.popleft()
+                        self._dropped_sequences.add(dropped_sequence)
                         self.dropped_raw_count += 1
-                    self._raw_queue.append((sampled_at_ns, raw))
+                        self._publish_encoded_locked()
+                    self._raw_queue.append((sequence, sampled_at_ns, raw))
                     self.capture_count += 1
                     self._raw_ready.notify()
                 self.last_capture_error = ""
@@ -1490,7 +1531,7 @@ class _ThreadedCamera:
                     return
                 if not self._raw_queue:
                     continue
-                timestamp_ns, bgr = self._raw_queue.popleft()
+                sequence, timestamp_ns, bgr = self._raw_queue.popleft()
             if bgr is None:
                 continue
             try:
@@ -1505,17 +1546,36 @@ class _ThreadedCamera:
                     jpeg=jpeg,
                 )
                 with self._lock:
-                    # Parallel Ego encoders may finish a neighbouring pair in
-                    # reverse order. Never move the published stream backward.
-                    if (
-                        self._latest is None
-                        or snapshot.timestamp_ns > self._latest.timestamp_ns
-                    ):
-                        self._latest = snapshot
+                    # Parallel encoders commonly complete adjacent frames in a
+                    # burst or in reverse order. Keep every result until all
+                    # earlier capture sequences have completed (or were
+                    # explicitly dropped), then publish them in capture order.
+                    self._encoded_pending[sequence] = snapshot
                     self.encoded_count += 1
+                    self._publish_encoded_locked()
                 self.last_encode_error = ""
             except Exception as exc:
                 self.last_encode_error = str(exc)
+                with self._lock:
+                    self._dropped_sequences.add(sequence)
+                    self._publish_encoded_locked()
+
+    def _publish_encoded_locked(self) -> None:
+        while True:
+            sequence = self._next_output_sequence
+            if sequence in self._dropped_sequences:
+                self._dropped_sequences.remove(sequence)
+                self._next_output_sequence += 1
+                continue
+            snapshot = self._encoded_pending.pop(sequence, None)
+            if snapshot is None:
+                return
+            if len(self._encoded_ready) >= self.encoded_queue_size:
+                self._encoded_ready.popleft()
+                self.dropped_encoded_count += 1
+            self._encoded_ready.append(snapshot)
+            self._latest = snapshot
+            self._next_output_sequence += 1
 
     def _sample_timestamp_ns(self) -> int:
         return time.time_ns()
@@ -1523,6 +1583,14 @@ class _ThreadedCamera:
     def read(self) -> CameraSnapshot | None:
         with self._lock:
             return self._latest
+
+    def read_pending(self) -> list[CameraSnapshot]:
+        """Drain all encoded frames that have not yet reached camera_node."""
+
+        with self._lock:
+            frames = list(self._encoded_ready)
+            self._encoded_ready.clear()
+            return frames
 
     def close(self) -> None:
         self._stop.set()
@@ -1534,6 +1602,14 @@ class _ThreadedCamera:
             thread.join(timeout=2.0)
         if self._encode_executor is not None:
             self._encode_executor.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            self._raw_queue.clear()
+            self._encoded_pending.clear()
+            self._encoded_ready.clear()
+            self._dropped_sequences.clear()
+            self._latest = None
+            self._next_capture_sequence = 0
+            self._next_output_sequence = 0
         self._capture_thread = None
         self._encode_threads = []
         self._encode_executor = None

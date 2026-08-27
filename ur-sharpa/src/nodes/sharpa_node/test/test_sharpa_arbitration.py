@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from sharpa_node.arbitration import SharpaState, Source, arbitrate
-from sharpa_node.sharpa_node import SuccessfulHandCommandCache
+from sharpa_node.sharpa_node import SuccessfulHandCommandCache, validate_hand_command
 
 
 @pytest.mark.parametrize("state", list(SharpaState))
@@ -84,3 +84,40 @@ def test_invalidate_clears_the_held_successful_command():
     assert np.isnan(q_cmd).all()
     assert timestamp_ns == 0
     assert source == 0
+
+
+def test_actor_dry_run_hand_command_is_validated_without_sdk_state():
+    command = type(
+        "Command",
+        (),
+        {
+            "source": 3,
+            "q_cmd": [0.0] * 44,
+            "left_enable": True,
+            "right_enable": True,
+            "dry_run": True,
+        },
+    )()
+
+    values, source, left_enable, right_enable, dry_run = validate_hand_command(command)
+
+    assert values.shape == (44,)
+    assert source == 3
+    assert left_enable and right_enable and dry_run
+
+
+def test_non_actor_cannot_request_sharpa_dry_run():
+    command = type(
+        "Command",
+        (),
+        {
+            "source": 2,
+            "q_cmd": [0.0] * 44,
+            "left_enable": True,
+            "right_enable": True,
+            "dry_run": True,
+        },
+    )()
+
+    with pytest.raises(ValueError, match="only Actor"):
+        validate_hand_command(command)

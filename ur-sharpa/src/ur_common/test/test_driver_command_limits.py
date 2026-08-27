@@ -319,6 +319,35 @@ def test_sharpa_slews_large_live_target_instead_of_rejecting_it():
     np.testing.assert_allclose(dispatched["right"], -0.5)
 
 
+def test_sharpa_command_reports_each_blocking_sdk_stage():
+    driver = SharpADevicePair(
+        sdk_root="/unused", enable_control=True, max_hand_step_rad=0.5
+    )
+    driver.hands = {side: FakeHand() for side in ("left", "right")}
+    events = []
+
+    driver.command(
+        np.full(22, 0.1),
+        np.full(22, -0.1),
+        event_callback=lambda event, **fields: events.append((event, fields)),
+    )
+
+    names = [event for event, _fields in events]
+    assert names == [
+        "sharpa_sdk_state_read_started",
+        "sharpa_sdk_state_read_completed",
+        "sharpa_sdk_hand_command_started",
+        "sharpa_sdk_hand_command_completed",
+        "sharpa_sdk_hand_command_started",
+        "sharpa_sdk_hand_command_completed",
+    ]
+    assert [
+        fields["side"]
+        for event, fields in events
+        if event == "sharpa_sdk_hand_command_started"
+    ] == ["left", "right"]
+
+
 def test_sharpa_commands_connected_left_without_right_hand():
     driver = SharpADevicePair(
         sdk_root="/unused", enable_control=True, max_hand_step_rad=0.5

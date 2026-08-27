@@ -389,6 +389,25 @@ def limit_pose_delta(
     return limited
 
 
+def interpolate_pose(previous: Any, target: Any, fraction: float) -> np.ndarray:
+    """Interpolate a rigid pose without distorting its rotation matrix."""
+    previous_pose = validate_transform(previous, "previous TCP pose")
+    target_pose = validate_transform(target, "target TCP pose")
+    amount = float(fraction)
+    if not np.isfinite(amount) or amount < 0.0 or amount > 1.0:
+        raise ValueError("pose interpolation fraction must be within [0, 1]")
+
+    interpolated = previous_pose.copy()
+    interpolated[:3, 3] += amount * (
+        target_pose[:3, 3] - previous_pose[:3, 3]
+    )
+    relative_rotation = previous_pose[:3, :3].T @ target_pose[:3, :3]
+    interpolated[:3, :3] = previous_pose[:3, :3] @ rotvec_to_matrix(
+        amount * matrix_to_rotvec(relative_rotation)
+    )
+    return interpolated
+
+
 def limit_ur_tcp_target(
     kinematics: Any,
     side: str,

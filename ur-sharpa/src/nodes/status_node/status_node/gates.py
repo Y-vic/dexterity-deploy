@@ -286,6 +286,8 @@ class GateMachine:
     mode: str = "teleop"
     camera_max_age_s: float = 0.25
     execution_provider: str = "policy"
+    execution_paused: bool = False
+    execution_dry_run: bool = False
     ur_state: UrState = UrState.STOPPED
     sharpa_state: SharpaState = SharpaState.STOPPED
     record_state: RecordState = RecordState.IDLE
@@ -406,12 +408,18 @@ class GateMachine:
         self.bias_phase = "requested"
         self.record_state = RecordState.IDLE
         self.session_id = ""
+        self.execution_paused = False
+        self.execution_dry_run = False
         self.ur_state = UrState.STOPPED
         self._clear_reason()
         return _ok(bias_request="home_ur", hardware_stop=False)
 
     def attempt_reset_both(self) -> Outcome:
         """Return both arms and both hands to their deployment home pose."""
+        if self.execution_dry_run:
+            return self._set_reason(
+                "machine reset blocked: stop trajectory preview first"
+            )
         if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
             return self._set_reason("machine reset blocked: pause the machine first")
         if not self.ur_hardware_ready:
@@ -423,6 +431,8 @@ class GateMachine:
         self.bias_phase = "requested"
         self.record_state = RecordState.IDLE
         self.session_id = ""
+        self.execution_paused = False
+        self.execution_dry_run = False
         self.ur_state = UrState.STOPPED
         self.sharpa_state = SharpaState.STOPPED
         self.machine_ready = False
@@ -435,12 +445,104 @@ class GateMachine:
         )
 
     def attempt_start_deploy(self) -> Outcome:
-        """Open the actor command gate after a complete reset."""
+        """Open the actor gate from either home or the current measured pose.
+
+        Deployment reset is an operator choice, not a prerequisite.  STOPPED
+        means no source can command the hardware; it does not mean the current
+        pose is unsafe.  Hardware validity and an idle bias trajectory remain
+        mandatory before the gate can open.
+        """
         if self.mode != "deploy":
             return self._set_reason(
                 f"start deploy blocked: launch mode is {self.mode}, expected deploy"
             )
-        return self.attempt_run_ur()
+        if not self.ur_hardware_ready:
+            return self._set_reason(
+                "machine start blocked: UR is not in Normal mode"
+            )
+        if not self.sharpa_hardware_ready:
+            return self._set_reason(
+                "machine start blocked: SharpA state is unavailable"
+            )
+        if self.execution_paused:
+            return self._set_reason(
+                "machine start blocked: deployment is paused; use continue"
+            )
+        if self.execution_dry_run:
+            return self._set_reason(
+                "machine start blocked: stop trajectory preview first"
+            )
+        if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
+            return self._set_reason("machine start blocked: machine is already running")
+        if self.bias_phase not in {"done", "idle", ""}:
+            return self._set_reason(
+                f"machine start blocked: bias phase is {self.bias_phase}"
+            )
+        self.ur_state = UrState.RUNNING
+        self.sharpa_state = SharpaState.RUNNING
+        self.execution_paused = False
+        self.execution_dry_run = False
+        self._clear_reason()
+        return _ok(hardware_stop=False)
+
+    def attempt_continue_deploy(self) -> Outcome:
+        """Resume the exact paused Actor chunk without starting a new session."""
+        if self.mode != "deploy":
+            return self._set_reason(
+                f"continue deploy blocked: launch mode is {self.mode}, expected deploy"
+            )
+        if not self.execution_paused:
+            return self._set_reason(
+                "continue deploy blocked: actor is not paused"
+            )
+        if not self.ur_hardware_ready:
+            return self._set_reason(
+                "continue deploy blocked: UR is not in Normal mode"
+            )
+        if not self.sharpa_hardware_ready:
+            return self._set_reason(
+                "continue deploy blocked: SharpA state is unavailable"
+            )
+        live_running = bool(
+            self.ur_state == UrState.RUNNING
+            and self.sharpa_state == SharpaState.RUNNING
+        )
+        if not self.execution_dry_run and not live_running:
+            return self._set_reason(
+                "continue deploy blocked: live actor gate is no longer running"
+            )
+        self.execution_paused = False
+        self._clear_reason()
+        return _ok()
+
+    def attempt_preview_deploy(self) -> Outcome:
+        """Enable Actor execution while keeping all hardware writes disabled."""
+        if self.mode != "deploy":
+            return self._set_reason(
+                f"preview deploy blocked: launch mode is {self.mode}, expected deploy"
+            )
+        if not self.ur_hardware_ready:
+            return self._set_reason(
+                "trajectory preview blocked: valid UR state is unavailable"
+            )
+        if not self.sharpa_hardware_ready:
+            return self._set_reason(
+                "trajectory preview blocked: valid SharpA state is unavailable"
+            )
+        if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
+            return self._set_reason(
+                "trajectory preview blocked: stop live machine execution first"
+            )
+        if self.execution_dry_run:
+            return self._set_reason("trajectory preview is already active")
+        if self.bias_phase not in {"done", "idle", ""}:
+            return self._set_reason(
+                f"trajectory preview blocked: bias phase is {self.bias_phase}"
+            )
+        self.execution_dry_run = True
+        self.execution_paused = False
+        self._clear_reason()
+        return _ok()
 
     def attempt_set_execution_provider(self, provider: str) -> Outcome:
         """Select the only executable-action producer actor may accept.
@@ -458,7 +560,11 @@ class GateMachine:
             return self._set_reason(
                 f"provider switch blocked: unsupported provider {requested!r}"
             )
-        if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
+        if (
+            self.ur_state == UrState.RUNNING
+            or self.sharpa_state == SharpaState.RUNNING
+            or self.execution_dry_run
+        ):
             return self._set_reason(
                 "provider switch blocked: stop the machine before switching"
             )
@@ -471,16 +577,48 @@ class GateMachine:
         if self.ur_state != UrState.RUNNING or self.sharpa_state != SharpaState.RUNNING:
             return self._set_reason("machine pause blocked: machine is not running")
         record_command = "stop" if self.record_state == RecordState.RECORDING else ""
-        self.ur_state = UrState.HOMED
+        # Preserve whether a real reset was completed. A deployment that began
+        # at an arbitrary current pose returns to STOPPED when paused, while a
+        # reset deployment remains HOMED. Both may be continued explicitly.
+        self.ur_state = UrState.HOMED if self.machine_ready else UrState.STOPPED
         self.sharpa_state = SharpaState.STOPPED
         self.record_state = RecordState.IDLE
         self.session_id = ""
+        self.execution_paused = False
+        self.execution_dry_run = False
         self.jog_preview = None
         self.gate_reason = "machine paused"
         return _ok(record_command=record_command, hardware_stop=True)
 
     def attempt_stop_deploy(self) -> Outcome:
-        return self.attempt_pause()
+        """End the deployment session and close the Actor/hardware gate."""
+        if self.execution_dry_run:
+            self.execution_dry_run = False
+            self.execution_paused = False
+            self.gate_reason = "trajectory preview stopped"
+            return _ok()
+        outcome = self.attempt_pause()
+        if outcome:
+            self.gate_reason = "deployment stopped"
+        return outcome
+
+    def attempt_pause_deploy(self) -> Outcome:
+        """Freeze actor publication without closing or clearing its chunk."""
+        if self.mode != "deploy":
+            return self._set_reason(
+                f"pause deploy blocked: launch mode is {self.mode}, expected deploy"
+            )
+        if self.execution_paused:
+            return self._set_reason("pause deploy blocked: actor is already paused")
+        live_running = bool(
+            self.ur_state == UrState.RUNNING
+            and self.sharpa_state == SharpaState.RUNNING
+        )
+        if not live_running and not self.execution_dry_run:
+            return self._set_reason("pause deploy blocked: actor is not running")
+        self.execution_paused = True
+        self.gate_reason = "actor paused"
+        return _ok()
 
     def attempt_start_sharpa(self) -> Outcome:
         if self.sharpa_state == SharpaState.RUNNING:
@@ -559,6 +697,8 @@ class GateMachine:
             "active_source": int(self.active_source),
             "mode": self.mode,
             "execution_provider": self.execution_provider,
+            "execution_paused": self.execution_paused,
+            "execution_dry_run": self.execution_dry_run,
             "machine_ready": self.machine_ready,
             "machine_running": self.ur_state == UrState.RUNNING and self.sharpa_state == SharpaState.RUNNING,
             "ur_hardware_ready": self.ur_hardware_ready,

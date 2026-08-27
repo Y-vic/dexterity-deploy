@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import re
 import shlex
 import subprocess
 import threading
@@ -11,11 +12,10 @@ import time
 from typing import Any, Callable
 
 
-REMOTE_ROOT = "/share/project/yenaisheng/dreamzero"
+REMOTE_ROOT = "/share/project/yenaisheng/sharpa-deploy"
 TMUX_SESSION = "ur_sharpa_policy_server"
 FAMILY_LAUNCHERS = {
     "cgp": "cgp",
-    "dreamzero": "dreamzero",
     "gcc": "gcc",
     "groot": "groot_n17",
     "groot_n17": "groot_n17",
@@ -25,6 +25,10 @@ FAMILY_LAUNCHERS = {
     "trex": "t_rex",
     "vitacformer": "vitacformer",
 }
+ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+LOG_TAIL_LINES = 120
+LOG_TAIL_CHARACTERS = 12000
 
 
 class ModelManagerError(RuntimeError):
@@ -76,6 +80,7 @@ class RemoteModelManager:
             "prompt": "",
             "port": 0,
             "detail": "",
+            "log_tail": "",
             "updated_at": time.time(),
         }
 
@@ -90,7 +95,7 @@ import json
 from pathlib import Path
 import sys
 
-root = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[1]).absolute()
 launchers = json.loads(sys.argv[2])
 tasks = []
 for path in sorted((root / "scripts/deploy/task_config").glob("*/task.json")):
@@ -180,12 +185,14 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
                 prompt=selected["task"]["prompt"],
                 port=0,
                 detail="正在创建远端模型进程",
+                log_tail="",
                 updated_at=time.time(),
             )
             state = deepcopy(self._state)
         self._notify(state)
         launch_run = deepcopy(selected["run"])
         launch_run.update(
+            task=task,
             task_id=selected["task"]["task_id"],
             prompt=selected["task"]["prompt"],
             dataset_path=selected["task"]["dataset_path"],
@@ -258,9 +265,11 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
                         if cancel.wait(1.0):
                             self._stop_remote_session()
                             return
+                        log_tail = self._captured_log()
+                        self._update_log(generation, log_tail)
                         if self._pane_dead():
                             raise ModelManagerError(
-                                self._captured_log() or "远端模型进程已退出"
+                                self._error_log(log_tail) or "远端模型进程已退出"
                             )
                         if self._healthy(port):
                             self._transition(
@@ -298,44 +307,10 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
         launch_script = f"scripts/deploy/{run['launcher']}/launch.sh"
         launcher_command = "bash {} {} {}".format(
             shlex.quote(launch_script),
-            shlex.quote(self.snapshot()["task"]),
+            shlex.quote(run["task"]),
             shlex.quote(run["id"]),
         )
-        if run["launcher"] == "groot_n17" and run["family"] == "groot_n17":
-            runtime_environment = {
-                "DZ_DEPLOY_TASK": run["task_id"],
-                "DZ_DEPLOY_ID": run["id"],
-                "DZ_DEPLOY_RUN_ID": run["run_id"],
-                "DZ_DEPLOY_DATASET": run["dataset_path"],
-                "DZ_DEPLOY_PROMPT": run["prompt"],
-                "DZ_DEPLOY_CHECKPOINT": run["checkpoint_path"],
-            }
-            runtime_env_command = "env " + " ".join(
-                f"{key}={shlex.quote(str(value))}"
-                for key, value in runtime_environment.items()
-            )
-            resolver_patch = shlex.quote(
-                "s|^dz_load_task_config groot .*|:|"
-            )
-            root_patch = shlex.quote(
-                f"s|^ROOT=.*$|ROOT={shlex.quote(self.remote_root)}|"
-            )
-            patched_script = "sed -e {} -e {} {}".format(
-                resolver_patch,
-                root_patch,
-                shlex.quote(launch_script),
-            )
-            launcher_command = "{} bash -c \"$({})\" {} {} {}".format(
-                runtime_env_command,
-                patched_script,
-                shlex.quote(launch_script),
-                shlex.quote(self.snapshot()["task"]),
-                shlex.quote(run["id"]),
-            )
-        inner = "exec env DZ_DEPLOY_HOST=127.0.0.1 DZ_DEPLOY_PORT={} {}".format(
-            int(port),
-            launcher_command,
-        )
+        inner = "exec {}".format(launcher_command)
         remote_command = " && ".join(
             [
                 "tmux new-session -d -s {} -c {} {}".format(
@@ -449,13 +424,36 @@ exit 0
 
     def _captured_log(self) -> str:
         result = self._ssh_raw(
-            "tmux capture-pane -p -t {}:0.0 -S -60 2>/dev/null".format(
+            "tmux capture-pane -pJ -t {}:0.0 -S -160 2>/dev/null".format(
                 shlex.quote(self.session_name)
             ),
             timeout_s=8.0,
         )
-        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        clean = ANSI_ESCAPE.sub("", result.stdout.replace("\r\n", "\n").replace("\r", "\n"))
+        lines = [
+            CONTROL_CHARACTER.sub("", line).rstrip()
+            for line in clean.splitlines()
+        ]
+        while lines and not lines[0]:
+            lines.pop(0)
+        while lines and not lines[-1]:
+            lines.pop()
+        return "\n".join(lines[-LOG_TAIL_LINES:])[-LOG_TAIL_CHARACTERS:]
+
+    @staticmethod
+    def _error_log(log_tail: str) -> str:
+        lines = [line.strip() for line in log_tail.splitlines() if line.strip()]
         return " | ".join(lines[-8:])[-1200:]
+
+    def _update_log(self, generation: int, log_tail: str) -> None:
+        if not log_tail:
+            return
+        with self._lock:
+            if generation != self._generation or log_tail == self._state["log_tail"]:
+                return
+            self._state["log_tail"] = log_tail
+            state = deepcopy(self._state)
+        self._notify(state)
 
     def _transition(
         self,
