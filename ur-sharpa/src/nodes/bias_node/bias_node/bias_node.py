@@ -50,7 +50,6 @@ from ur_common.safety import SafetyConfig
 
 from .home_pose import HomePoseError, both_home_joints
 from .trajectory import (
-    SHARPA_HOME_Q44,
     SHARPA_HOME_STEPS,
     SHARPA_HOME_STEP_DELAY_S,
     SHARPA_HOME_TOLERANCE_RAD,
@@ -377,7 +376,7 @@ class BiasNode(Node):
                     "no fresh /sharpa/state; cannot prepare a safe hand hold"
                 )
             start = measured
-            run.hand_target = SHARPA_HOME_Q44.copy()
+            run.hand_target = self._load_hand_bias_target_locked()
             run.hand_plan = interpolate(start, run.hand_target, self.sharpa_steps)
             # Before either device moves, send the measured pose as a hold
             # command.  sharpa_node treats its reserved step index as a
@@ -389,6 +388,9 @@ class BiasNode(Node):
         measured = self._measured_arm_joints()
         if measured is None:
             raise RuntimeError("no fresh /ur/state; cannot save bias")
+        measured_hand = self._measured_hand_joints()
+        if measured_hand is None:
+            raise RuntimeError("no fresh /sharpa/state; cannot save bias")
         payload = {
             "schema": "ur_sharpa_bias.v1",
             "saved_at": time.time(),
@@ -397,6 +399,8 @@ class BiasNode(Node):
             "left_eef": [float(v) for v in getattr(self._ur_state, "left_eef", [])],
             "right_eef": [float(v) for v in getattr(self._ur_state, "right_eef", [])],
             "eef_frame": str(getattr(self._ur_state, "eef_frame", "canonical")),
+            "left_hand_joint": [float(v) for v in measured_hand[:22]],
+            "right_hand_joint": [float(v) for v in measured_hand[22:]],
         }
         if len(payload["left_eef"]) != 9 or len(payload["right_eef"]) != 9:
             raise ValueError("/ur/state canonical EEF pose is incomplete")
@@ -421,6 +425,37 @@ class BiasNode(Node):
         except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
             self.get_logger().warning(f"ignoring invalid bias file {self.bias_file}: {exc}")
             return None
+
+    def _load_hand_bias_target_locked(self) -> np.ndarray:
+        """Load the configured 44D SharpA reset pose; never assume numeric zero."""
+        try:
+            payload = json.loads(self.bias_file.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                f"SharpA Bias target is missing: {self.bias_file}; "
+                "save the intended arm and hand pose before reset"
+            ) from exc
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"cannot read Bias file {self.bias_file}: {exc}") from exc
+
+        try:
+            left = np.asarray(payload["left_hand_joint"], dtype=np.float64)
+            right = np.asarray(payload["right_hand_joint"], dtype=np.float64)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Bias file {self.bias_file} must contain left_hand_joint and "
+                "right_hand_joint"
+            ) from exc
+        if (
+            left.shape != (22,)
+            or right.shape != (22,)
+            or not np.isfinite(left).all()
+            or not np.isfinite(right).all()
+        ):
+            raise RuntimeError(
+                "saved SharpA Bias joints must be finite 22D vectors per hand"
+            )
+        return np.concatenate((left, right))
 
     # -------------------------------------------------------------- trajectory
     def _tick(self) -> None:
@@ -599,6 +634,8 @@ class BiasNode(Node):
                 "last_result": dict(self._last_result),
                 "counts": dict(self._counts),
                 "config": {
+                    "bias_file": str(self.bias_file),
+                    "sharpa_target": "saved_hand_bias",
                     "ur_steps": self.ur_steps,
                     "ur_step_delay_s": self.ur_step_delay_s,
                     "ur_tolerance_rad": self.ur_tolerance_rad,

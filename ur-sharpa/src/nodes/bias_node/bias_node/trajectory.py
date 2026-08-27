@@ -8,12 +8,13 @@ tested without RTDE, ROS, or a robot.
 Shape comes from v3 `UrRtdePair.initialize_joints`
 (the legacy hardware driver): 120 steps at 0.02 s with a
 0.08 rad arrival tolerance, linear in joint space from the measured start pose.
-The SharpA counterpart there used 60 steps at the same delay and tolerance.
+The deployed v3 hardware configuration overrode the driver's 60-step default
+with 180 steps. Keep that production value here.
 
 The one behaviour that is NOT carried over is v3's blocking `time.sleep` loop.
 This node streams the same samples as ROS messages on a timer instead, so a
-homing move never blocks the executor. The step count, delay and tolerance are
-unchanged, so the motion profile on the wire is identical.
+homing move never blocks the executor. The production step count, delay and
+arrival tolerance are preserved.
 
 TIMEOUT IS A FAILURE, NOT A SUCCESS. v3 raised `HardwareCommandError` when the
 measured pose was still outside tolerance after the last step. Reporting success
@@ -29,21 +30,26 @@ from typing import Any
 
 import numpy as np
 
-# v3 initialize_joints defaults, kept verbatim.
+# UR v3 initialization profile, kept verbatim.
 UR_HOME_STEPS = 120
 UR_HOME_STEP_DELAY_S = 0.02
 UR_HOME_TOLERANCE_RAD = 0.08
 
-SHARPA_HOME_STEPS = 60
+SHARPA_HOME_STEPS = 180
 SHARPA_HOME_STEP_DELAY_S = 0.02
 SHARPA_HOME_TOLERANCE_RAD = 0.08
 
 UR_JOINTS_PER_ARM = 6
 SHARPA_JOINTS_TOTAL = 44
 SHARPA_JOINTS_PER_HAND = 22
-
-# SharpA home is the 44D zero vector: every hand joint at its neutral open pose.
-SHARPA_HOME_Q44 = np.zeros(SHARPA_JOINTS_TOTAL, dtype=np.float64)
+SHARPA_JOINT_NAMES = (
+    "thumb_CMC_FE", "thumb_CMC_AA", "thumb_MCP_FE", "thumb_MCP_AA",
+    "thumb_DIP", "index_MCP_FE", "index_MCP_AA", "index_PIP",
+    "index_DIP", "middle_MCP_FE", "middle_MCP_AA", "middle_PIP",
+    "middle_DIP", "ring_MCP_FE", "ring_MCP_AA", "ring_PIP",
+    "ring_DIP", "pinky_CMC_FE", "pinky_MCP_FE", "pinky_MCP_AA",
+    "pinky_PIP", "pinky_DIP",
+)
 
 TWO_PI = 2.0 * np.pi
 
@@ -127,10 +133,10 @@ def check_arm_arrival(
 
 def check_hand_arrival(
     measured: Any,
-    target: Any = None,
+    target: Any,
     tolerance_rad: float = SHARPA_HOME_TOLERANCE_RAD,
 ) -> ArrivalResult:
-    """44D hand pose within tolerance of the home pose (zeros by default).
+    """44D hand pose within tolerance of the configured Bias pose.
 
     No unwrapping here: v3's SharpA arrival check compared raw, because hand
     joints have a limited range and never wrap.
@@ -139,7 +145,11 @@ def check_hand_arrival(
         raise ValueError("tolerance_rad must be positive and finite")
     if measured is None:
         return ArrivalResult(False, float("inf"), "SharpA state unavailable")
-    target = SHARPA_HOME_Q44 if target is None else np.asarray(target, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if target.shape[0] != SHARPA_JOINTS_TOTAL or not np.isfinite(target).all():
+        raise ValueError(
+            f"SharpA Bias target must contain {SHARPA_JOINTS_TOTAL} finite values"
+        )
     measured = np.asarray(measured, dtype=np.float64).reshape(-1)
     if measured.shape[0] != SHARPA_JOINTS_TOTAL:
         return ArrivalResult(
@@ -154,10 +164,15 @@ def check_hand_arrival(
     worst = float(np.max(diff)) if diff.size else float("inf")
     failing = [s for s, e in errors.items() if not np.isfinite(e) or e > tolerance_rad]
     if failing:
+        worst_index = int(np.argmax(diff))
+        worst_side = "left" if worst_index < SHARPA_JOINTS_PER_HAND else "right"
+        local_index = worst_index % SHARPA_JOINTS_PER_HAND
         return ArrivalResult(
             False, worst,
-            f"{'/'.join(failing)} SharpA did not reach its initial joint target "
-            f"(max error {worst:.4f} rad > {tolerance_rad:.4f})",
+            f"{'/'.join(failing)} SharpA did not reach its saved Bias target "
+            f"(worst {worst_side} joint {local_index} "
+            f"{SHARPA_JOINT_NAMES[local_index]}, "
+            f"max error {worst:.4f} rad > {tolerance_rad:.4f})",
             errors,
         )
     return ArrivalResult(True, worst, "", errors)

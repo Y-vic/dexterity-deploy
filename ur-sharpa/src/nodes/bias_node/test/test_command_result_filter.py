@@ -13,7 +13,6 @@ from bias_node.bias_node import (
     REQUEST_HOME_UR,
 )
 from bias_node.bias_node import PHASE_SHARPA, REQUEST_HOME_SHARPA
-from bias_node.trajectory import SHARPA_HOME_Q44
 from ur_msgs.msg import ArmCommand
 
 
@@ -63,10 +62,12 @@ def test_bias_nack_fails_active_bias_run():
     assert node._counts["nacks"] == 1
 
 
-def test_sharpa_reset_targets_neutral_pose_from_nonzero_current_pose():
+def test_sharpa_reset_targets_saved_bias_from_nonzero_current_pose():
     node = object.__new__(BiasNode)
     node.sharpa_steps = 4
     node._measured_hand_joints = lambda: np.full(44, 0.7)
+    saved_bias = np.linspace(-0.2, 0.6, 44)
+    node._load_hand_bias_target_locked = lambda: saved_bias
     run = BiasRun(
         request=REQUEST_HOME_SHARPA,
         started_at=time.monotonic(),
@@ -75,8 +76,8 @@ def test_sharpa_reset_targets_neutral_pose_from_nonzero_current_pose():
 
     node._build_plans_locked(run)
 
-    np.testing.assert_array_equal(run.hand_target, SHARPA_HOME_Q44)
-    np.testing.assert_array_equal(run.hand_plan[-1], SHARPA_HOME_Q44)
+    np.testing.assert_array_equal(run.hand_target, saved_bias)
+    np.testing.assert_allclose(run.hand_plan[-1], saved_bias, atol=1e-15)
 
 
 def test_both_reset_waits_for_sharpa_preflight_before_moving_arms():

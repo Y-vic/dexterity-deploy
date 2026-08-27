@@ -6,8 +6,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
-        DeclareLaunchArgument("ur_steps", default_value="100"),
-        DeclareLaunchArgument("sharpa_steps", default_value="100"),
+        DeclareLaunchArgument("ur_steps", default_value="120"),
+        DeclareLaunchArgument("sharpa_steps", default_value="180"),
         DeclareLaunchArgument("enable_jump_gate", default_value="false"),
         DeclareLaunchArgument("enable_flip_hold", default_value="false"),
         DeclareLaunchArgument("enable_joint_clip", default_value="false"),
