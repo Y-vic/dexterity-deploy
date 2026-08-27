@@ -288,6 +288,7 @@ class BiasNode(Node):
                     f"{','.join(sorted(run.pending_devices))} ACK"
                 )
                 return
+            published_at = run.pending_since
             run.step += 1
             run.steps_sent += 1
             run.pending_step = None
@@ -298,7 +299,10 @@ class BiasNode(Node):
                 delays.append(self.ur_step_delay_s)
             if run.hand_plan is not None:
                 delays.append(self.sharpa_step_delay_s)
-            run.next_step_at = time.monotonic() + max(delays or [self._tick_period])
+            # Pace from publication, not ACK arrival. The ACK is a safety
+            # barrier inside this frame's existing period; starting another
+            # full delay after it accidentally halves a 50 Hz reset to 25 Hz.
+            run.next_step_at = published_at + max(delays or [self._tick_period])
             if run.step >= run.total_steps:
                 run.phase = PHASE_VERIFY
                 run.verify_deadline = time.monotonic() + self.arrival_timeout_s

@@ -81,6 +81,7 @@ def test_paired_step_does_not_advance_until_ur_and_sharpa_ack():
     assert node.hand_publications == [(0, "reset-current")]
     assert run.step == 0
     assert run.pending_devices == {"ur", "sharpa"}
+    published_at = run.pending_since
 
     node._on_command_result(_result(device="ur"))
     assert run.step == 0
@@ -89,6 +90,7 @@ def test_paired_step_does_not_advance_until_ur_and_sharpa_ack():
     node._on_command_result(_result(device="sharpa"))
     assert run.step == 1
     assert run.pending_step is None
+    assert run.next_step_at == published_at + 0.02
 
 
 def test_sharpa_nack_fails_pair_before_ur_can_advance_again():
