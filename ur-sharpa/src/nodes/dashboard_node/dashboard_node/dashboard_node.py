@@ -787,9 +787,6 @@ def main(args=None) -> None:
                 self._provider,
                 10,
             )
-            self.create_subscription(
-                String, "/robot_states/status", self._buffers, 10
-            )
             self.create_subscription(UrStateFrame, "/ur/state", self._ur, 10)
             self.create_subscription(
                 HandStateFrame, "/sharpa/state", self._sharpa, 10
@@ -854,7 +851,21 @@ def main(args=None) -> None:
             )
 
         def _policy(self, message: String) -> None:
-            state.update("policy", self._json(message))
+            payload = self._json(message)
+            state.update("policy", payload)
+            if isinstance(payload, dict) and isinstance(
+                payload.get("buffers"), dict
+            ):
+                state.update(
+                    "buffers",
+                    {
+                        "buffers": payload["buffers"],
+                        "metadata_format_id": str(
+                            (payload.get("metadata") or {}).get("format_id")
+                            or ""
+                        ),
+                    },
+                )
 
         def _actor_latency(self, message: String) -> None:
             state.update("actor_latency", self._json(message))
@@ -864,9 +875,6 @@ def main(args=None) -> None:
 
         def _provider(self, message: String) -> None:
             state.update("execution_provider", message.data.strip().lower() or "policy")
-
-        def _buffers(self, message: String) -> None:
-            state.update("buffers", self._json(message))
 
         def _bias(self, message: String) -> None:
             state.update("bias", self._json(message))

@@ -16,7 +16,6 @@
   <exec_depend>recording_node</exec_depend>
   <exec_depend>status_node</exec_depend>
   <exec_depend>monitor_node</exec_depend>
-  <exec_depend>robot_states_node</exec_depend>
   <exec_depend>policy_client_node</exec_depend>
   <exec_depend>actor_ik_node</exec_depend>
   <exec_depend>replay_node</exec_depend>

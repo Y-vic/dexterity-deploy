@@ -272,14 +272,27 @@ def main(args=None) -> None:
     import json
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
+    from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+    from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
-    from ur_msgs.msg import ControlStatus, ExecutableAction, ExecutionDone
-    from ur_msgs.srv import BuildObservation
+    from ur_msgs.msg import (
+        CameraSet,
+        ControlStatus,
+        DeformationFrame,
+        ExecutableAction,
+        ExecutionDone,
+        HandStateFrame,
+        TauFrame,
+        UrStateFrame,
+        WrenchFrame,
+    )
     from sharpa_interface.server.client import ServerClient, ServerConfig
-    from sharpa_interface.server.serialization import unpackb
     from sharpa_interface.sharpa import CANONICAL_EEF_FRAME
     from ur_common.execution_log import execution_event_json
+    from ur_common.observation_collector import ObservationCollector
+    from ur_common.policy_observation import ObservationNotReady
 
     class RosPolicyClientNode(Node):
         def __init__(self):
@@ -326,12 +339,13 @@ def main(args=None) -> None:
             self._last_error = ""
             self._request_metrics = PolicyRequestMetrics()
             self._last_waiting_reason = ""
+            self._observations = ObservationCollector()
+            self._observation_group = MutuallyExclusiveCallbackGroup()
             self._status = self.create_publisher(String, "/policy/status", 10)
             self._execution_event_pub = self.create_publisher(
                 String, "/deploy/execution_event", 100
             )
             self._action_pub = self.create_publisher(ExecutableAction, "/policy/executable_action", 10)
-            self._build_client = self.create_client(BuildObservation, "/policy/build_observation")
             self.create_subscription(String, "/policy/action_result_json", self._action, 10)
             self.create_subscription(String, "/policy/execution_done_json", self._done, 10)
             self.create_subscription(ExecutionDone, "/policy/execution_done", self._done_msg, 10)
@@ -343,6 +357,53 @@ def main(args=None) -> None:
                 10,
             )
             self.create_subscription(String, "/model/status", self._model_status, 10)
+            self.create_subscription(
+                UrStateFrame,
+                "/ur/state",
+                self._ur,
+                10,
+                callback_group=self._observation_group,
+            )
+            self.create_subscription(
+                HandStateFrame,
+                "/sharpa/state",
+                self._hand,
+                10,
+                callback_group=self._observation_group,
+            )
+            camera_qos = QoSProfile(
+                depth=1,
+                history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+            )
+            self.create_subscription(
+                CameraSet,
+                "/camera/set",
+                self._camera,
+                camera_qos,
+                callback_group=self._observation_group,
+            )
+            self.create_subscription(
+                TauFrame,
+                "/sharpa/tau",
+                self._tau,
+                10,
+                callback_group=self._observation_group,
+            )
+            self.create_subscription(
+                WrenchFrame,
+                "/sharpa/wrench",
+                self._wrench,
+                10,
+                callback_group=self._observation_group,
+            )
+            self.create_subscription(
+                DeformationFrame,
+                "/sharpa/deformation",
+                self._deformation,
+                1,
+                callback_group=self._observation_group,
+            )
             self._timer = self.create_timer(0.1, self._tick)
             self._status_timer = self.create_timer(1.0, lambda: self._publish({}))
 
@@ -378,9 +439,103 @@ def main(args=None) -> None:
                 "last_request_id": self._request_metrics.last_request_id,
                 "latency_s": self._request_metrics.latency_s,
                 "metadata": summarize_metadata(self._metadata),
+                "buffers": self._observations.status(),
             }
             result.update(payload)
             message = String(); message.data = json.dumps(result, separators=(",", ":")); self._status.publish(message)
+
+        def _collect(self, source, operation, *args, **kwargs):
+            try:
+                operation(*args, **kwargs)
+            except Exception as exc:
+                self.get_logger().warning(f"{source} buffer rejected: {exc}")
+
+        def _ur(self, message):
+            self._collect(
+                "state",
+                self._observations.push_ur,
+                timestamp_ns=message.timestamp_ns,
+                left_joint=message.left_joint,
+                right_joint=message.right_joint,
+                left_eef=message.left_eef,
+                right_eef=message.right_eef,
+                eef_frame=message.eef_frame,
+                valid=message.valid,
+            )
+
+        def _hand(self, message):
+            self._collect(
+                "state",
+                self._observations.push_hand,
+                timestamp_ns=message.timestamp_ns,
+                joints=message.q,
+                left_valid=message.left_valid,
+                right_valid=message.right_valid,
+            )
+
+        def _camera(self, message):
+            frames = (
+                (
+                    "ego_cam",
+                    message.ego,
+                    message.ego_timestamp_ns,
+                    message.ego_valid,
+                ),
+                (
+                    "left_wrist_cam",
+                    message.left_wrist,
+                    message.left_wrist_timestamp_ns,
+                    message.left_wrist_valid,
+                ),
+                (
+                    "right_wrist_cam",
+                    message.right_wrist,
+                    message.right_wrist_timestamp_ns,
+                    message.right_wrist_valid,
+                ),
+            )
+            for name, data, timestamp_ns, valid in frames:
+                self._collect(
+                    name,
+                    self._observations.push_camera,
+                    name,
+                    timestamp_ns=timestamp_ns,
+                    data=data,
+                    valid=valid,
+                )
+
+        def _tau(self, message):
+            self._collect(
+                "tau",
+                self._observations.push_tau,
+                timestamp_ns=message.timestamp_ns,
+                left=message.left,
+                right=message.right,
+                left_valid=message.left_valid,
+                right_valid=message.right_valid,
+            )
+
+        def _wrench(self, message):
+            self._collect(
+                "wrench",
+                self._observations.push_wrench,
+                timestamp_ns=message.timestamp_ns,
+                left=message.left,
+                right=message.right,
+                left_valid=message.left_valid,
+                right_valid=message.right_valid,
+            )
+
+        def _deformation(self, message):
+            self._collect(
+                "deformation",
+                self._observations.push_deformation,
+                timestamp_ns=message.timestamp_ns,
+                left=message.left,
+                right=message.right,
+                left_valid=message.left_valid,
+                right_valid=message.right_valid,
+            )
 
         def _model_status(self, message):
             try:
@@ -526,23 +681,7 @@ def main(args=None) -> None:
         def _request_observation(self, pending):
             if self._busy:
                 raise RuntimeError("another policy request is already in flight")
-            if not self._build_client.service_is_ready():
-                raise RuntimeError("observation builder service is not ready")
             self._pending = pending
-            request = BuildObservation.Request()
-            request.metadata_format_json = json.dumps(
-                self._metadata["metadata_format"], separators=(",", ":")
-            )
-            request.session_id = self._core.session_id
-            request.request_id = pending.request_id
-            request.timestamp_ns = self.get_clock().now().nanoseconds
-            request.prompt = self._active_prompt
-            request.execution_feedback_json = json.dumps(
-                pending.feedback, separators=(",", ":")
-            )
-            request.max_message_size = int(
-                self._metadata.get("max_message_size", 64 * 1024 * 1024)
-            )
             self._busy = True
             self._execution_event(
                 "observation_build_requested",
@@ -551,9 +690,53 @@ def main(args=None) -> None:
                 model_generation=int(self._model_generation),
                 model_port=int(self._model_port),
             )
-            self._build_client.call_async(request).add_done_callback(
-                self._observation_done
+            try:
+                payload = self._observations.build(
+                    self._metadata["metadata_format"],
+                    session_id=self._core.session_id,
+                    request_id=pending.request_id,
+                    timestamp_ns=self.get_clock().now().nanoseconds,
+                    prompt=self._active_prompt,
+                    execution_feedback=pending.feedback,
+                    max_message_size=int(
+                        self._metadata.get(
+                            "max_message_size", 64 * 1024 * 1024
+                        )
+                    ),
+                )
+            except ObservationNotReady as exc:
+                self._execution_event(
+                    "observation_build_failed",
+                    session_id=self._core.session_id,
+                    request_id=int(pending.request_id),
+                    success=False,
+                    retryable=True,
+                    error=str(exc),
+                )
+                self._core.cancel_request()
+                self._busy = False
+                self._publish({"phase": "waiting", "error": str(exc)})
+                return
+            except Exception as exc:
+                self._execution_event(
+                    "observation_build_failed",
+                    session_id=self._core.session_id,
+                    request_id=int(pending.request_id),
+                    success=False,
+                    retryable=False,
+                    error=str(exc),
+                )
+                self._core.cancel_request()
+                self._busy = False
+                self._publish({"phase": "waiting", "error": str(exc)})
+                return
+            self._execution_event(
+                "observation_build_completed",
+                session_id=self._core.session_id,
+                request_id=int(pending.request_id),
+                success=True,
             )
+            self._infer_observation(payload)
 
         def _reset_rollout(self):
             self._rollout_generation += 1
@@ -625,7 +808,6 @@ def main(args=None) -> None:
                     return
                 if not self._core.ready: return
                 if not self._control_ready: return
-                if not self._build_client.service_is_ready(): return
                 self._request_observation(self._core.begin())
             except Exception as exc:
                 self._execution_event(
@@ -640,18 +822,8 @@ def main(args=None) -> None:
                 )
                 self._publish({"phase": "fault", "error": str(exc)})
 
-        def _observation_done(self, future):
+        def _infer_observation(self, payload):
             try:
-                response = future.result()
-                if not response.success:
-                    self._execution_event(
-                        "observation_build_failed",
-                        session_id=self._core.session_id,
-                        request_id=int(self._pending.request_id),
-                        success=False,
-                        error=str(response.error_message),
-                    )
-                    self._core.cancel_request(); self._publish({"phase": "waiting", "error": response.error_message}); return
                 if not self._control_ready or self._execution_provider != "policy":
                     self._execution_event(
                         "inference_cancelled_before_request",
@@ -661,14 +833,6 @@ def main(args=None) -> None:
                         error="control state changed before inference",
                     )
                     self._core.cancel_request(); self._publish({"phase": "waiting", "reason": "control state changed before inference"}); return
-                self._execution_event(
-                    "observation_build_completed",
-                    session_id=self._core.session_id,
-                    request_id=int(self._pending.request_id),
-                    observation_bytes=len(response.observation_msgpack),
-                    success=True,
-                )
-                payload = unpackb(bytes(response.observation_msgpack), max_size=int(self._metadata.get("max_message_size", 64 * 1024 * 1024)))
                 self._execution_event(
                     "model_inference_started",
                     session_id=self._core.session_id,
@@ -793,11 +957,14 @@ def main(args=None) -> None:
                     self._publish({"phase": "fault", "error": str(exc)})
 
     rclpy.init(args=args); node = RosPolicyClientNode()
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
-    except (rclpy.executors.ExternalShutdownException, RCLError):
+        executor.spin()
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException, RCLError):
         pass
     finally:
+        executor.shutdown()
         node.destroy_node()
         node._client.close()
         if rclpy.ok():

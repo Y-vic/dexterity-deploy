@@ -1,4 +1,4 @@
-from ur_launch.launch_config import _ur_motion_parameters
+from ur_launch.launch_config import _deploy_nodes, _ur_motion_parameters
 
 
 def test_teleop_enables_final_ur_motion_guards():
@@ -9,3 +9,15 @@ def test_teleop_enables_final_ur_motion_guards():
     assert parameters["enable_joint_clip"] is True
     assert "max_abs_joint_rad" in parameters
     assert "max_joint_step_rad" in parameters
+
+
+def test_deploy_graph_builds_observations_inside_policy_client():
+    packages = [node.node_package for node in _deploy_nodes()]
+
+    assert packages == [
+        "dashboard_node",
+        "policy_client_node",
+        "actor_ik_node",
+        "replay_node",
+    ]
+    assert "robot_states_node" not in packages

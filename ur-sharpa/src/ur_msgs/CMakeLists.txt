@@ -19,13 +19,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ControlStatus.msg"
   "msg/HardwareCommandResult.msg"
   # deploy layer
-  "msg/PolicyObs.msg"
   "msg/ExecutableAction.msg"
   "msg/ActorTrajectory.msg"
   "msg/ExecutionDone.msg"
-  # services
-  "srv/BuildObservation.srv"
-  "srv/ResetPolicy.srv"
   DEPENDENCIES
     std_msgs
 )

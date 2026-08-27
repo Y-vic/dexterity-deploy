@@ -373,12 +373,6 @@ def _deploy_nodes() -> list[Node]:
             }],
         ),
         Node(
-            package="robot_states_node",
-            executable="robot_states_node",
-            name="robot_states_node",
-            output="screen",
-        ),
-        Node(
             package="policy_client_node",
             executable="policy_client_node",
             name="policy_client_node",

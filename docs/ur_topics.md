@@ -10,16 +10,16 @@
 
 | Topic | 类型 | Pub | Sub |
 |---|---|---|---|
-| `/ur/state` | `UrStateFrame` | `ur_node` | `robot_states_node` `bias_node` `vive_node` `dashboard_node` `recording_node` `foxglove_node` |
+| `/ur/state` | `UrStateFrame` | `ur_node` | `policy_client_node` `bias_node` `vive_node` `dashboard_node` `recording_node` |
 | `/ur/command` | `ArmCommand` | `bias_node` `vive_node` `actor_ik_node` | `ur_node` |
 | `/ur/command_result` | `HardwareCommandResult` | `ur_node` | `actor_ik_node` `bias_node` `status_node` |
-| `/sharpa/state` | `HandStateFrame` | `sharpa_node` | `robot_states_node` `bias_node` `dashboard_node` `recording_node` `foxglove_node` |
+| `/sharpa/state` | `HandStateFrame` | `sharpa_node` | `policy_client_node` `bias_node` `dashboard_node` `recording_node` |
 | `/sharpa/command` | `HandCommand` | `bias_node` `manus_node` `actor_ik_node` | `sharpa_node` |
 | `/sharpa/command_result` | `HardwareCommandResult` | `sharpa_node` | `actor_ik_node` `bias_node` `status_node` |
-| `/sharpa/tau` | `TauFrame` | `sharpa_node` | `robot_states_node` `recording_node` |
-| `/sharpa/wrench` | `WrenchFrame` | `sharpa_node` | `robot_states_node` `recording_node` |
-| `/sharpa/deformation` | `DeformationFrame` | `sharpa_node` | `robot_states_node` `recording_node` |
-| `/camera/set` | `CameraSet` | `camera_node` | `robot_states_node` `recording_node` `dashboard_node` `status_node` |
+| `/sharpa/tau` | `TauFrame` | `sharpa_node` | `policy_client_node` `recording_node` |
+| `/sharpa/wrench` | `WrenchFrame` | `sharpa_node` | `policy_client_node` `recording_node` |
+| `/sharpa/deformation` | `DeformationFrame` | `sharpa_node` | `policy_client_node` `recording_node` |
+| `/camera/set` | `CameraSet` | `camera_node` | `policy_client_node` `recording_node` `dashboard_node` `status_node` |
 | `/hardware/stop` | `std_msgs/Bool` | `status_node` | `ur_node` `sharpa_node` |
 
 ## 控制层
@@ -49,16 +49,13 @@
 
 | Topic | 类型 | Pub | Sub |
 |---|---|---|---|
-| `/policy/obs` | `PolicyObs` | `robot_states_node` | `policy_client_node` `dashboard_node` |
-| `/policy/executable_action` | `ExecutableAction` | `policy_client_node` `replay_node` | `actor_ik_node` `dashboard_node` |
-| `/policy/execution_done` | `ExecutionDone` | `actor_ik_node` | `policy_client_node` `dashboard_node` |
+| `/policy/executable_action` | `ExecutableAction` | `policy_client_node` `replay_node` | `actor_ik_node` |
+| `/policy/execution_done` | `ExecutionDone` | `actor_ik_node` | `policy_client_node` |
 | `/policy/status` | `std_msgs/String` | `policy_client_node` | `status_node` `dashboard_node` |
-| `/policy/joint_plan` | `ArmCommand` | `actor_ik_node` | `dashboard_node` |
 
-服务：`/policy/build_observation`（`BuildObservation`，`robot_states_node` 提供）、
-`/policy/reset`（`ResetPolicy`，`policy_client_node` 提供）。
-
-`/policy/joint_plan` 只给 dashboard 面板 5 观测用，不参与执行——执行走 `/ur/command`。
+`policy_client_node` 在进程内维护七路 observation buffer，按模型 metadata 直接组装
+observation dict；不再通过 ROS service 传输 msgpack 大块数据。buffer 健康状态包含在
+`/policy/status` 的 `buffers` 字段中。
 
 ## 网页端口
 
@@ -66,7 +63,6 @@
 |---|---|
 | `status_node` | 8080 |
 | `dashboard_node` | 8088 |
-| `foxglove_node` bridge | 8765 |
 
 ## 仲裁
 
@@ -75,7 +71,7 @@
 
 | UR 状态 | 接受 |
 |---|---|
-| `UR_STOPPED` | 无 |
+| `UR_STOPPED` | 仅 `SOURCE_BIAS` |
 | `UR_HOMED` | 仅 `SOURCE_BIAS` |
 | `UR_RUNNING` | `SOURCE_BIAS` + 当前 `active_source` |
 
@@ -84,5 +80,5 @@
 
 ## QoS
 
-除相机和触觉外一律默认 `depth=10` reliable。`/camera/set` 和 `/sharpa/deformation` 数据量大，
-用 `depth=1` + `best_effort`（丢帧优于堆积；帧完整性由 `recording_node` 自己按时间戳判断）。
+除相机外默认 reliable。`/camera/set` 使用 `depth=1` + `best_effort`，丢帧优于堆积；
+policy client 与 dashboard 使用相同 QoS。`/sharpa/deformation` 使用 `depth=1` reliable。

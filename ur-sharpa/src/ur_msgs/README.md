@@ -14,7 +14,7 @@ deploy 执行链。dict 边界定义见 [interface_contract.md](../../../docs/in
 
 ### rot6d 约定
 
-`UrStateFrame`、`PolicyObs` 与 `ExecutableAction` 全部使用 interface 已冻结的
+`UrStateFrame` 与 `ExecutableAction` 全部使用 interface 已冻结的
 canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 只允许留在显式兼容 adapter 内部，不能出现在 ROS topic 或数据集边界。
 | wrench | 每手 `(5,6)`，展平 30 | N / N·m | 行 pinky→thumb；列 Fx,Fy,Fz,Tx,Ty,Tz |
@@ -38,17 +38,9 @@ canonical column-Rot6D：`[x,y,z,r00,r10,r20,r01,r11,r21]`。Legacy row-Rot6D
 | `DeformationFrame` | 每手 `uint8 (5,240,240)` 指尖形变图，行主序展平。 |
 | `ControlStatus` | UR(3 态)/SharpA(2 态)/Record(2 态) 三个状态机 + `gate_reason`。 |
 | `HardwareCommandResult` | 单步硬件指令的 ACK / 拒绝原因。 |
-| `PolicyObs` | FK 之后发布的聚合 observation 引用；内联小状态，大模态只留时间戳。 |
 | `ExecutableAction` | 截断后的 action slice，含完整 identity 与执行参数透传。 |
 | `ActorTrajectory` | Actor IK 后的统一 chunk 轨迹；Dashboard 与预览日志的唯一预测来源。 |
 | `ExecutionDone` | slice 的 fetch/done 双边沿；只有 `execute_done` 是终态，`executed_steps` 为**累计**语义。 |
-
-## Service
-
-| 类型 | 一句话职责 |
-| --- | --- |
-| `BuildObservation` | 按 metadata 组装一次 observation，返回 msgpack。 |
-| `ResetPolicy` | 重置 session 并重新协商 metadata format；fault 字段已展平。 |
 
 ## 三个状态机
 

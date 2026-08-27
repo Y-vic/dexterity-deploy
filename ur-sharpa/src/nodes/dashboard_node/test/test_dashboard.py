@@ -583,11 +583,17 @@ def test_dashboard_uses_urdf_keypoints_instead_of_approximate_hand_geometry():
 def test_camera_subscribers_match_best_effort_publisher_qos():
     nodes = Path(__file__).parents[2]
     dashboard = (nodes / "dashboard_node" / "dashboard_node" / "dashboard_node.py").read_text(encoding="utf-8")
-    robot_states = (nodes / "robot_states_node" / "robot_states_node" / "robot_states_node.py").read_text(encoding="utf-8")
+    policy_client = (nodes / "policy_client_node" / "policy_client_node" / "policy_client_node.py").read_text(encoding="utf-8")
 
-    for source in (dashboard, robot_states):
+    for source in (dashboard, policy_client):
         assert "reliability=ReliabilityPolicy.BEST_EFFORT" in source
-        assert 'CameraSet, "/camera/set", self._camera, camera_qos' in source
+        assert "CameraSet," in source
+        assert '"/camera/set",' in source
+        assert "self._camera," in source
+        assert "camera_qos" in source
+
+    assert '"/robot_states/status"' not in dashboard
+    assert 'payload.get("buffers")' in dashboard
 
 
 def test_model_picker_only_shows_launchable_runs():
