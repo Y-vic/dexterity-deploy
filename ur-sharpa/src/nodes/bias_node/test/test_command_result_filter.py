@@ -2,7 +2,18 @@ import threading
 import time
 from types import SimpleNamespace
 
-from bias_node.bias_node import BiasNode, BiasRun, PHASE_UR, REQUEST_HOME_UR
+import numpy as np
+
+from bias_node.bias_node import (
+    BIAS_PREPARE_STEP,
+    BiasNode,
+    BiasRun,
+    PHASE_UR,
+    REQUEST_HOME_BOTH,
+    REQUEST_HOME_UR,
+)
+from bias_node.bias_node import PHASE_SHARPA, REQUEST_HOME_SHARPA
+from bias_node.trajectory import SHARPA_HOME_Q44
 from ur_msgs.msg import ArmCommand
 
 
@@ -50,3 +61,68 @@ def test_bias_nack_fails_active_bias_run():
         "ur rejected a bias step: arbitration_rejected command source is not active"
     ]
     assert node._counts["nacks"] == 1
+
+
+def test_sharpa_reset_targets_neutral_pose_from_nonzero_current_pose():
+    node = object.__new__(BiasNode)
+    node.sharpa_steps = 4
+    node._measured_hand_joints = lambda: np.full(44, 0.7)
+    run = BiasRun(
+        request=REQUEST_HOME_SHARPA,
+        started_at=time.monotonic(),
+        phase=PHASE_SHARPA,
+    )
+
+    node._build_plans_locked(run)
+
+    np.testing.assert_array_equal(run.hand_target, SHARPA_HOME_Q44)
+    np.testing.assert_array_equal(run.hand_plan[-1], SHARPA_HOME_Q44)
+
+
+def test_both_reset_waits_for_sharpa_preflight_before_moving_arms():
+    node = object.__new__(BiasNode)
+    node.arrival_timeout_s = 3.0
+    node._counts = {"arm_steps": 0, "hand_steps": 0}
+    arm_steps = []
+    hand_steps = []
+    node._publish_arm_step = lambda left, right, step: arm_steps.append(step)
+    node._publish_hand_step = lambda target, step: hand_steps.append(step)
+    run = BiasRun(
+        request=REQUEST_HOME_BOTH,
+        started_at=time.monotonic(),
+        phase=PHASE_UR,
+        arm_plan=np.zeros((2, 12)),
+        hand_plan=np.zeros((2, 44)),
+        hand_prepare_target=np.full(44, 0.3),
+    )
+
+    node._stream_step_locked(run)
+
+    assert arm_steps == []
+    assert hand_steps == [BIAS_PREPARE_STEP]
+    assert run.step == 0
+
+
+def test_sharpa_preflight_ack_unlocks_both_reset_stream():
+    node, _failures = _active_node()
+    node._run = BiasRun(
+        request=REQUEST_HOME_BOTH,
+        started_at=time.monotonic(),
+        phase=PHASE_UR,
+        arm_plan=np.zeros((2, 12)),
+        hand_plan=np.zeros((2, 44)),
+        hand_prepare_target=np.zeros(44),
+        hand_prepare_sent_at=time.monotonic(),
+    )
+    ack = SimpleNamespace(
+        source=ArmCommand.SOURCE_BIAS,
+        success=True,
+        device="sharpa",
+        step_index=BIAS_PREPARE_STEP,
+        failure_code="",
+        failure_message="",
+    )
+
+    node._on_command_result(ack)
+
+    assert node._run.hand_ready is True

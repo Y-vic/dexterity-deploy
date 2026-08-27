@@ -74,6 +74,7 @@ PHASE_SHARPA = "homing_sharpa"
 PHASE_VERIFY = "verifying"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
+BIAS_PREPARE_STEP = (1 << 32) - 1
 
 
 @dataclass
@@ -91,6 +92,9 @@ class BiasRun:
     detail: str = ""
     verify_deadline: float = 0.0
     steps_sent: int = 0
+    hand_prepare_target: np.ndarray | None = None
+    hand_prepare_sent_at: float = 0.0
+    hand_ready: bool = False
 
     @property
     def wants_ur(self) -> bool:
@@ -248,12 +252,25 @@ class BiasNode(Node):
         """A NACK on a bias step is a real failure: the arm did not take it."""
         if int(msg.source) != ArmCommand.SOURCE_BIAS:
             return
-        if msg.success:
-            return
         with self._lock:
+            run = self._run
+            if (
+                msg.success
+                and str(msg.device) == "sharpa"
+                and int(msg.step_index) == BIAS_PREPARE_STEP
+                and run is not None
+                and run.wants_sharpa
+                and run.hand_prepare_sent_at > 0.0
+                and not run.hand_ready
+            ):
+                run.hand_ready = True
+                run.detail = "SharpA SDK/POSITION preflight verified"
+                return
+            if msg.success:
+                return
             self._counts["nacks"] += 1
             self._last_nack = f"{msg.device}:{msg.failure_code}"
-            if self._run is not None and self._run.phase in (PHASE_UR, PHASE_SHARPA):
+            if run is not None and run.phase in (PHASE_UR, PHASE_SHARPA):
                 self._fail_locked(
                     f"{msg.device} rejected a bias step: {msg.failure_code} "
                     f"{msg.failure_message}".strip()
@@ -355,24 +372,23 @@ class BiasNode(Node):
 
         if run.wants_sharpa:
             measured = self._measured_hand_joints()
-            start = SHARPA_HOME_Q44 if measured is None else measured
             if measured is None:
-                run.detail = "sharpa state unavailable; ramping from zeros"
-            saved_hand_target = self._load_bias_hand_target_locked()
-            run.hand_target = (
-                SHARPA_HOME_Q44.copy()
-                if saved_hand_target is None
-                else saved_hand_target
-            )
+                raise RuntimeError(
+                    "no fresh /sharpa/state; cannot prepare a safe hand hold"
+                )
+            start = measured
+            run.hand_target = SHARPA_HOME_Q44.copy()
             run.hand_plan = interpolate(start, run.hand_target, self.sharpa_steps)
+            # Before either device moves, send the measured pose as a hold
+            # command.  sharpa_node treats its reserved step index as a
+            # mandatory SDK/POSITION set+readback handshake.  Only its ACK
+            # unlocks the real hand and wrist ramps.
+            run.hand_prepare_target = np.asarray(start, dtype=np.float64).copy()
 
     def _save_current_bias_locked(self) -> None:
         measured = self._measured_arm_joints()
         if measured is None:
             raise RuntimeError("no fresh /ur/state; cannot save bias")
-        measured_hands = self._measured_hand_joints()
-        if measured_hands is None:
-            raise RuntimeError("no fresh /sharpa/state; cannot save SharpA bias")
         payload = {
             "schema": "ur_sharpa_bias.v1",
             "saved_at": time.time(),
@@ -381,8 +397,6 @@ class BiasNode(Node):
             "left_eef": [float(v) for v in getattr(self._ur_state, "left_eef", [])],
             "right_eef": [float(v) for v in getattr(self._ur_state, "right_eef", [])],
             "eef_frame": str(getattr(self._ur_state, "eef_frame", "canonical")),
-            "left_hand_joint": [float(v) for v in measured_hands[:22]],
-            "right_hand_joint": [float(v) for v in measured_hands[22:]],
         }
         if len(payload["left_eef"]) != 9 or len(payload["right_eef"]) != 9:
             raise ValueError("/ur/state canonical EEF pose is incomplete")
@@ -393,23 +407,6 @@ class BiasNode(Node):
         self._last_result = {"request": "save_current", "phase": PHASE_DONE,
                              "detail": f"saved {self.bias_file}",
                              "max_error_rad": None, "finished_at": time.time()}
-
-    def _load_bias_hand_target_locked(self) -> np.ndarray | None:
-        try:
-            payload = json.loads(self.bias_file.read_text(encoding="utf-8"))
-            left = np.asarray(payload["left_hand_joint"], dtype=np.float64)
-            right = np.asarray(payload["right_hand_joint"], dtype=np.float64)
-            if left.shape != (22,) or right.shape != (22,):
-                raise ValueError("saved SharpA bias joints must be 22D per hand")
-            target = np.concatenate((left, right))
-            if not np.all(np.isfinite(target)):
-                raise ValueError("saved SharpA bias joints must be finite")
-            return target
-        except FileNotFoundError:
-            return None
-        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            self.get_logger().warning(f"ignoring invalid SharpA bias in {self.bias_file}: {exc}")
-            return None
 
     def _load_bias_targets_locked(self) -> dict | None:
         try:
@@ -438,6 +435,18 @@ class BiasNode(Node):
 
     def _stream_step_locked(self, run: BiasRun) -> None:
         """Emit one sample of each active ramp, then move to verification."""
+        if run.hand_plan is not None and not run.hand_ready:
+            now = time.monotonic()
+            if run.hand_prepare_sent_at <= 0.0:
+                self._publish_hand_step(
+                    run.hand_prepare_target, BIAS_PREPARE_STEP
+                )
+                run.hand_prepare_sent_at = now
+                run.detail = "waiting for SharpA SDK/POSITION preflight"
+            elif now - run.hand_prepare_sent_at > self.arrival_timeout_s:
+                self._fail_locked("SharpA control-mode preflight ACK timeout")
+            return
+
         idx = run.step
         emitted = False
 

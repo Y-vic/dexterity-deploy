@@ -1,15 +1,22 @@
 import json
+from pathlib import Path
 import re
 import subprocess
 import time
 
 import pytest
 
-from dashboard_node.model_manager import ModelManagerError, RemoteModelManager
+from dashboard_node.model_manager import (
+    ModelManagerError,
+    RemoteModelManager,
+    ServerProfile,
+    load_server_profiles,
+)
 
 
 def catalog_payload(*, launchable=True):
     return {
+        "models": ["groot_n17"],
         "tasks": [
             {
                 "name": "ur_pick_place_push",
@@ -19,8 +26,7 @@ def catalog_payload(*, launchable=True):
                 "compatible": True,
                 "runs": [
                     {
-                        "family": "groot",
-                        "launcher": "groot_n17",
+                        "model": "groot_n17",
                         "id": "groot_n17_baseline",
                         "run_id": "full-run-id",
                         "checkpoint_path": "/remote/checkpoint",
@@ -31,7 +37,6 @@ def catalog_payload(*, launchable=True):
                         "checkpoint_exists": launchable,
                         "launchable": launchable,
                         "disabled_reason": "checkpoint 不存在" if not launchable else "",
-                        "selected": True,
                     }
                 ],
             }
@@ -97,7 +102,7 @@ def test_catalog_and_start_use_only_catalog_launcher():
         startup_timeout_s=2.0,
     )
 
-    state = manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    state = manager.start("ur_pick_place_push", "full-run-id")
     assert state["phase"] == "starting"
     wait_phase(manager, "running")
 
@@ -105,7 +110,7 @@ def test_catalog_and_start_use_only_catalog_launcher():
     launch = next(command for command in remote_commands if "tmux new-session" in command)
     assert "scripts/deploy/groot_n17/launch.sh" in launch
     assert "ur_pick_place_push" in launch
-    assert "groot_n17_baseline" in launch
+    assert "full-run-id" in launch
     assert manager.snapshot()["phase"] == "running"
     assert manager.snapshot()["port"] == 5500
     assert "exec env" not in launch
@@ -115,17 +120,59 @@ def test_catalog_and_start_use_only_catalog_launcher():
         "running",
     ]
     assert manager.snapshot()["task_id"] == "ur_pick_place_push"
-    assert manager.snapshot()["checkpoint_run_id"] == "full-run-id"
+    assert manager.snapshot()["run_id"] == "full-run-id"
+    assert manager.snapshot()["model"] == "groot_n17"
 
 
 def test_start_rejects_unlaunchable_and_unknown_runs():
     manager = RemoteModelManager(runner=FakeRunner(catalog_payload(launchable=False)))
     with pytest.raises(ModelManagerError, match="checkpoint"):
-        manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+        manager.start("ur_pick_place_push", "full-run-id")
 
     manager = RemoteModelManager(runner=FakeRunner(catalog_payload()))
     with pytest.raises(ModelManagerError, match="catalog"):
-        manager.start("ur_pick_place_push", "groot", "not-a-run")
+        manager.start("ur_pick_place_push", "not-a-run")
+
+
+def test_server_switch_changes_both_lifecycle_and_policy_connection():
+    runner = FakeRunner(catalog_payload())
+    profiles = {
+        "baai": ServerProfile(
+            "baai", "BAAI", "BAAI", "/remote/baai", "/assets/baai",
+            "/remote/baai/scripts/deploy/task_config",
+        ),
+        "ps": ServerProfile(
+            "ps", "PS", "ps", "/remote/ps", "/assets/ps",
+            "/remote/ps/scripts/deploy/task_config",
+        ),
+    }
+    manager = RemoteModelManager(
+        profiles=profiles,
+        default_server="baai",
+        runner=runner,
+        startup_timeout_s=2.0,
+    )
+
+    state = manager.select_server("ps")
+
+    assert state["server_id"] == "ps"
+    assert state["ssh_host"] == "ps"
+    assert state["repo_root"] == "/remote/ps"
+    assert state["server_url"] == "ws://127.0.0.1:5500/infer"
+    manager.catalog()
+    assert runner.commands[-1][0][-2] == "ps"
+
+
+def test_checked_in_profiles_define_baai_and_ps_code_and_asset_roots():
+    path = Path(__file__).resolve().parents[4] / "config" / "model_servers.json"
+
+    profiles, default = load_server_profiles(path)
+
+    assert default == "baai"
+    assert profiles["baai"].repo_root == "/share/project/yenaisheng/dreamzero"
+    assert profiles["ps"].repo_root == "/home/ps/dexterity/repos/dreamzero"
+    assert profiles["ps"].asset_root == "/home/ps/dexterity/assets"
+    assert profiles["ps"].ssh_host == "ps"
 
 
 def test_start_always_reuses_fixed_default_port():
@@ -133,7 +180,7 @@ def test_start_always_reuses_fixed_default_port():
     runner.in_use_ports.add(5500)
     manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
 
-    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
 
     assert manager.snapshot()["port"] == 5500
@@ -147,13 +194,13 @@ def test_launch_does_not_patch_method_specific_configuration():
     runner = FakeRunner(catalog_payload())
     manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
 
-    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
 
     launch = next(
         command[-1] for command, _ in runner.commands if "tmux new-session" in command[-1]
     )
-    assert "bash scripts/deploy/groot_n17/launch.sh ur_pick_place_push groot_n17_baseline" in launch
+    assert "bash scripts/deploy/groot_n17/launch.sh ur_pick_place_push full-run-id" in launch
     assert "exec env" not in launch
     assert "sed -e" not in launch
 
@@ -169,7 +216,7 @@ def test_start_retries_once_on_the_same_fixed_port_after_process_failure():
     runner = FailFirstRunner(catalog_payload())
     manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
 
-    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running", timeout_s=4.0)
 
     assert runner.launch_count == 2
@@ -192,7 +239,7 @@ def test_loading_log_is_sanitized_and_kept_in_snapshot():
         runner=LogRunner(catalog_payload()), startup_timeout_s=2.0
     )
 
-    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
 
     assert manager.snapshot()["log_tail"] == "Loading checkpoint\nshard 3/3"
@@ -202,7 +249,7 @@ def test_loading_log_is_sanitized_and_kept_in_snapshot():
 def test_stop_kills_managed_server_and_releases_fixed_port():
     runner = FakeRunner(catalog_payload())
     manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
-    manager.start("ur_pick_place_push", "groot", "groot_n17_baseline")
+    manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
 
     manager.stop()

@@ -980,7 +980,7 @@ class SharpADevicePair:
         self,
         *,
         sdk_root: str | Path,
-        discovery_timeout_s: float = 5.0,
+        discovery_timeout_s: float = 15.0,
         speed_coefficient: float = 0.5,
         current_coefficient: float = 0.6,
         enable_control: bool = False,
@@ -1272,7 +1272,13 @@ class SharpADevicePair:
         return {side: targets[side].copy() for side in active}
 
     def set_control_mode(self, mode: Any) -> None:
-        """Set a control mode on each connected hand."""
+        """Set and verify a control mode on each connected hand.
+
+        The two SDK calls are not atomic.  In particular, the left hand may
+        accept a mode change before the right hand reports an error.  Never
+        let callers infer the hardware mode from the fact that this method was
+        entered: only a successful readback from every connected hand counts.
+        """
         if not self.enable_control:
             return
         if self.sdk is None:
@@ -1286,6 +1292,48 @@ class SharpADevicePair:
                 raise HardwareCommandError(
                     f"SharpA {side} control mode failed: {getattr(error, 'message', '')}"
                 )
+        self._verify_control_setting("mode", mode)
+
+    def set_control_source(self, source: Any) -> None:
+        """Set and verify the command source on each connected hand."""
+        if not self.enable_control:
+            return
+        if self.sdk is None:
+            raise HardwareCommandError("SharpA SDK is unavailable")
+        for side in SIDES:
+            hand = self.hands.get(side)
+            if hand is None:
+                continue
+            error = hand.set_control_source(source)
+            if getattr(error, "code", -1) != 0:
+                raise HardwareCommandError(
+                    f"SharpA {side} control source failed: "
+                    f"{getattr(error, 'message', '')}"
+                )
+        self._verify_control_setting("source", source)
+
+    def _verify_control_setting(self, setting: str, expected: Any) -> None:
+        getter_name = f"get_control_{setting}"
+        for side in SIDES:
+            hand = self.hands.get(side)
+            if hand is None:
+                continue
+            try:
+                error, actual = getattr(hand, getter_name)()
+            except Exception as exc:
+                raise HardwareCommandError(
+                    f"SharpA {side} control {setting} readback failed: {exc}"
+                ) from exc
+            if getattr(error, "code", -1) != 0:
+                raise HardwareCommandError(
+                    f"SharpA {side} control {setting} readback failed: "
+                    f"{getattr(error, 'message', '')}"
+                )
+            if actual != expected:
+                raise HardwareCommandError(
+                    f"SharpA {side} control {setting} readback mismatch: "
+                    f"expected {expected!r}, got {actual!r}"
+                )
 
     def set_floating(self) -> None:
         """Enable gravity compensation for manual hand adjustment."""
@@ -1293,8 +1341,12 @@ class SharpADevicePair:
             self.set_control_mode(self.sdk.ControlMode.FLOATING)
 
     def set_position_control(self) -> None:
-        """Restore SDK position control before a commanded trajectory."""
+        """Restore and verify the complete SDK position-control chain."""
         if self.sdk is not None:
+            # The SDK documents that a source change must precede commands.
+            # Reassert it for every new active trajectory so a stale firmware
+            # mode or a partially applied two-hand transition cannot survive.
+            self.set_control_source(self.sdk.ControlSource.SDK)
             self.set_control_mode(self.sdk.ControlMode.POSITION)
 
     def move_joint_ramp(

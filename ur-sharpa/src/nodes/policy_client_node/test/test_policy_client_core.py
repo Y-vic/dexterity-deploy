@@ -243,6 +243,9 @@ def test_metadata_summary_keeps_only_operator_fields():
 
 def test_metadata_identity_must_match_selected_task_and_run():
     metadata = {
+        "policy_family": "groot",
+        "model_id": "groot_n17",
+        "model_name": "groot_n17",
         "task_id": "ur_twist_tube",
         "run_id": "twist-run",
         "prompt": "twist the tube",
@@ -250,22 +253,27 @@ def test_metadata_identity_must_match_selected_task_and_run():
 
     assert not metadata_identity_error(
         metadata,
+        expected_model="groot_n17",
         expected_task_id="ur_twist_tube",
         expected_run_id="twist-run",
         expected_prompt="twist the tube",
     )
     error = metadata_identity_error(
         metadata,
+        expected_model="pace",
         expected_task_id="ur_pick_place_push",
         expected_run_id="push-run",
     )
 
     assert "模型身份不匹配" in error
+    assert "model groot_n17 != pace" in error
     assert "ur_twist_tube" in error
     assert "twist-run" in error
 
 
-@pytest.mark.parametrize("policy_family", ["groot_n17", "pi05", "gcc", "pace", ""])
+@pytest.mark.parametrize(
+    "policy_family", ["groot", "groot_rtc", "pi05", "gcc", "pace", ""]
+)
 def test_every_model_uses_the_same_canonical_absolute_eef_contract(policy_family):
     validate_server_eef_contract(
         {

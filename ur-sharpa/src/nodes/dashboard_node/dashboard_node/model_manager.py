@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import dataclass
 import json
+from pathlib import Path
 import re
 import shlex
 import subprocess
@@ -14,25 +16,86 @@ from typing import Any, Callable
 
 REMOTE_ROOT = "/share/project/yenaisheng/sharpa-deploy"
 TMUX_SESSION = "ur_sharpa_policy_server"
-FAMILY_LAUNCHERS = {
-    "cgp": "cgp",
-    "gcc": "gcc",
-    "groot": "groot_n17",
-    "groot_n17": "groot_n17",
-    "pace": "pace",
-    "pi05": "pi05",
-    "t_rex": "t_rex",
-    "trex": "t_rex",
-    "vitacformer": "vitacformer",
-}
 ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SAFE_ID = re.compile(r"[A-Za-z0-9._-]+")
 LOG_TAIL_LINES = 120
 LOG_TAIL_CHARACTERS = 12000
 
 
 class ModelManagerError(RuntimeError):
     """Raised when a requested model operation is unsafe or unavailable."""
+
+
+@dataclass(frozen=True)
+class ServerProfile:
+    server_id: str
+    label: str
+    ssh_host: str
+    repo_root: str
+    asset_root: str
+    task_config_root: str
+    remote_host: str = "127.0.0.1"
+    port: int = 5500
+    env_file: str = ""
+
+    @classmethod
+    def from_mapping(cls, server_id: str, value: Any) -> "ServerProfile":
+        if not SAFE_ID.fullmatch(server_id) or not isinstance(value, dict):
+            raise ModelManagerError(f"无效的模型 server profile: {server_id!r}")
+        repo_root = str(value.get("repo_root") or "").strip()
+        ssh_host = str(value.get("ssh_host") or "").strip()
+        if not repo_root.startswith("/") or not ssh_host:
+            raise ModelManagerError(f"server profile {server_id!r} 缺少 ssh_host/repo_root")
+        port = int(value.get("port", 5500))
+        if not 1 <= port <= 65535:
+            raise ModelManagerError(f"server profile {server_id!r} 端口无效")
+        return cls(
+            server_id=server_id,
+            label=str(value.get("label") or server_id),
+            ssh_host=ssh_host,
+            repo_root=repo_root,
+            asset_root=str(value.get("asset_root") or repo_root),
+            task_config_root=str(
+                value.get("task_config_root")
+                or f"{repo_root}/scripts/deploy/task_config"
+            ),
+            remote_host=str(value.get("remote_host") or "127.0.0.1"),
+            port=port,
+            env_file=str(value.get("env_file") or ""),
+        )
+
+    def public(self) -> dict[str, Any]:
+        return {
+            "id": self.server_id,
+            "label": self.label,
+            "ssh_host": self.ssh_host,
+            "repo_root": self.repo_root,
+            "asset_root": self.asset_root,
+            "remote_host": self.remote_host,
+            "port": self.port,
+        }
+
+
+def load_server_profiles(path: str | Path) -> tuple[dict[str, ServerProfile], str]:
+    source = Path(path).expanduser().absolute()
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ModelManagerError(f"无法读取模型 server 配置: {source}") from exc
+    if payload.get("schema") != "ur_sharpa.model_servers.v1":
+        raise ModelManagerError(f"模型 server 配置 schema 错误: {source}")
+    raw_servers = payload.get("servers")
+    if not isinstance(raw_servers, dict) or not raw_servers:
+        raise ModelManagerError("模型 server 配置没有 servers")
+    profiles = {
+        server_id: ServerProfile.from_mapping(server_id, value)
+        for server_id, value in raw_servers.items()
+    }
+    default = str(payload.get("default") or "")
+    if default not in profiles:
+        raise ModelManagerError(f"默认模型 server {default!r} 不存在")
+    return profiles, default
 
 
 def run_command(command: list[str], timeout_s: float) -> subprocess.CompletedProcess[str]:
@@ -57,14 +120,35 @@ class RemoteModelManager:
         startup_timeout_s: float = 180.0,
         base_port: int = 5500,
         port_candidates: int = 16,
+        profile_path: str | Path | None = None,
+        profiles: dict[str, ServerProfile] | None = None,
+        default_server: str | None = None,
     ) -> None:
-        self.ssh_host = ssh_host
-        self.remote_root = remote_root
+        if profiles is None and profile_path is not None:
+            profiles, configured_default = load_server_profiles(profile_path)
+            default_server = default_server or configured_default
+        if profiles is None:
+            profiles = {
+                "default": ServerProfile(
+                    server_id="default",
+                    label="Default",
+                    ssh_host=ssh_host,
+                    repo_root=remote_root,
+                    asset_root=remote_root,
+                    task_config_root=f"{remote_root}/scripts/deploy/task_config",
+                    port=int(base_port),
+                )
+            }
+            default_server = "default"
+        if default_server not in profiles:
+            raise ModelManagerError(f"模型 server {default_server!r} 不存在")
+        self._profiles = dict(profiles)
+        self._server_id = str(default_server)
         self.session_name = session_name
         self.runner = runner
         self.event_callback = event_callback
         self.startup_timeout_s = startup_timeout_s
-        self.base_port = int(base_port)
+        self.base_port = int(self._profiles[self._server_id].port)
         self.port_candidates = int(port_candidates)
         self._lock = threading.Lock()
         self._generation = 0
@@ -74,81 +158,145 @@ class RemoteModelManager:
             "generation": 0,
             "task": "",
             "task_id": "",
-            "family": "",
+            "model": "",
             "run_id": "",
-            "checkpoint_run_id": "",
             "prompt": "",
             "port": 0,
             "detail": "",
             "log_tail": "",
             "updated_at": time.time(),
+            **self._connection_state(self._profiles[self._server_id]),
         }
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return deepcopy(self._state)
 
+    @staticmethod
+    def _connection_state(profile: ServerProfile) -> dict[str, Any]:
+        return {
+            "server_id": profile.server_id,
+            "server_label": profile.label,
+            "ssh_host": profile.ssh_host,
+            "repo_root": profile.repo_root,
+            "asset_root": profile.asset_root,
+            "remote_host": profile.remote_host,
+            "server_url": f"ws://127.0.0.1:{profile.port}/infer",
+        }
+
+    def servers(self) -> dict[str, Any]:
+        with self._lock:
+            selected = self._server_id
+        return {
+            "selected": selected,
+            "servers": [profile.public() for profile in self._profiles.values()],
+        }
+
+    def select_server(self, server_id: str) -> dict[str, Any]:
+        with self._lock:
+            if server_id not in self._profiles:
+                raise ModelManagerError(f"未知模型 server: {server_id}")
+            if self._state["phase"] not in {"stopped", "fault"}:
+                raise ModelManagerError("请先停止当前模型再切换 server")
+            self._server_id = server_id
+            profile = self._profiles[server_id]
+            self.base_port = profile.port
+            self._generation += 1
+            self._state.update(
+                phase="stopped",
+                generation=self._generation,
+                task="",
+                task_id="",
+                model="",
+                run_id="",
+                prompt="",
+                port=0,
+                detail=f"已切换到 {profile.label}",
+                log_tail="",
+                updated_at=time.time(),
+                **self._connection_state(profile),
+            )
+            state = deepcopy(self._state)
+        self._notify(state)
+        return state
+
+    def _active_profile(self) -> ServerProfile:
+        with self._lock:
+            return self._profiles[self._server_id]
+
     def catalog(self) -> dict[str, Any]:
-        launchers = json.dumps(FAMILY_LAUNCHERS, separators=(",", ":"))
         script = """
 import json
 from pathlib import Path
 import sys
 
 root = Path(sys.argv[1]).absolute()
-launchers = json.loads(sys.argv[2])
+asset_root = Path(sys.argv[2]).absolute()
+config_root = Path(sys.argv[3]).absolute()
+models = sorted(
+    path.parent.name
+    for path in (root / "scripts/deploy").glob("*/launch.sh")
+    if path.is_file() and path.parent.name != "task_config"
+)
 tasks = []
-for path in sorted((root / "scripts/deploy/task_config").glob("*/task.json")):
+for path in sorted(config_root.glob("*/task.json")):
     data = json.loads(path.read_text(encoding="utf-8"))
     task_name = path.parent.name
     compatible = task_name.startswith("ur_")
     runs = []
-    for family, entries in sorted((data.get("runs") or {}).items()):
-        launcher = launchers.get(family, "")
-        launcher_exists = bool(launcher) and (root / "scripts/deploy" / launcher / "launch.sh").is_file()
-        for entry in entries or []:
-            checkpoint = str(entry.get("checkpoint") or "")
-            checkpoint_path = str((root / checkpoint).resolve()) if checkpoint else ""
-            checkpoint_exists = bool(checkpoint_path) and Path(checkpoint_path).exists()
-            eligible = bool((entry.get("deployment") or {}).get("eligible", False))
-            reasons = []
-            if not compatible:
-                reasons.append("不是 UR task")
-            if not eligible:
-                reasons.append(str((entry.get("deployment") or {}).get("reason") or "未标记为可部署"))
-            if not launcher_exists:
-                reasons.append("缺少启动脚本")
-            if not checkpoint_exists:
-                reasons.append("checkpoint 不存在")
-            runs.append({
-                "family": family,
-                "launcher": launcher,
-                "id": str(entry.get("id") or ""),
-                "run_id": str(entry.get("run_id") or ""),
-                "checkpoint_path": checkpoint_path,
-                "variant": str(entry.get("variant") or ""),
-                "stage": str(entry.get("stage") or ""),
-                "status": str(entry.get("status") or ""),
-                "eligible": eligible,
-                "checkpoint_exists": checkpoint_exists,
-                "launchable": not reasons,
-                "disabled_reason": "；".join(reasons),
-                "selected": (data.get("selected") or {}).get(family) == entry.get("id"),
-            })
+    entries = data.get("runs") or []
+    if not isinstance(entries, list):
+        entries = []
+    for entry in entries:
+        model = str(entry.get("model") or "")
+        launcher_exists = model in models
+        checkpoint = str(entry.get("checkpoint") or "")
+        checkpoint_path = str((asset_root / checkpoint).resolve()) if checkpoint else ""
+        checkpoint_exists = bool(checkpoint_path) and Path(checkpoint_path).is_dir()
+        eligible = bool((entry.get("deployment") or {}).get("eligible", False))
+        status = str(entry.get("status") or "")
+        reasons = []
+        if not compatible:
+            reasons.append("不是 UR task")
+        if not model:
+            reasons.append("run.model 缺失")
+        if not eligible:
+            reasons.append(str((entry.get("deployment") or {}).get("reason") or "未标记为可部署"))
+        if status not in {"complete", "in_progress"}:
+            reasons.append(f"run status={status or '<missing>'}")
+        if not launcher_exists:
+            reasons.append(f"缺少 scripts/deploy/{model}/launch.sh")
+        if not checkpoint_exists:
+            reasons.append("checkpoint 不存在")
+        runs.append({
+            "model": model,
+            "id": str(entry.get("id") or ""),
+            "run_id": str(entry.get("run_id") or ""),
+            "checkpoint_path": checkpoint_path,
+            "variant": str(entry.get("variant") or ""),
+            "stage": str(entry.get("stage") or ""),
+            "status": status,
+            "eligible": eligible,
+            "checkpoint_exists": checkpoint_exists,
+            "launchable": not reasons,
+            "disabled_reason": "；".join(reasons),
+        })
     tasks.append({
         "name": task_name,
         "task_id": str((data.get("task") or {}).get("id") or task_name),
         "prompt": str((data.get("task") or {}).get("prompt") or ""),
-        "dataset_path": str((root / str((data.get("task") or {}).get("dataset") or "")).resolve()),
+        "dataset_path": str((asset_root / str((data.get("task") or {}).get("dataset") or "")).resolve()),
         "compatible": compatible,
         "runs": runs,
     })
-print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
+print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
 """
-        remote_command = "python3 -c {} {} {}".format(
+        profile = self._active_profile()
+        remote_command = "python3 -c {} {} {} {}".format(
             shlex.quote(script),
-            shlex.quote(self.remote_root),
-            shlex.quote(launchers),
+            shlex.quote(profile.repo_root),
+            shlex.quote(profile.asset_root),
+            shlex.quote(profile.task_config_root),
         )
         result = self._ssh(remote_command, timeout_s=20.0)
         try:
@@ -157,10 +305,11 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
             raise ModelManagerError("远端 task catalog 不是有效 JSON") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
             raise ModelManagerError("远端 task catalog 格式错误")
+        payload["server"] = profile.public()
         return payload
 
-    def start(self, task: str, family: str, run_id: str) -> dict[str, Any]:
-        selected = self._find_run(task, family, run_id)
+    def start(self, task: str, run_id: str) -> dict[str, Any]:
+        selected = self._find_run(task, run_id)
         if not selected["run"]["launchable"]:
             raise ModelManagerError(selected["run"]["disabled_reason"] or "该模型不可部署")
         with self._lock:
@@ -179,9 +328,8 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
                 generation=generation,
                 task=task,
                 task_id=selected["task"]["task_id"],
-                family=family,
+                model=selected["run"]["model"],
                 run_id=run_id,
-                checkpoint_run_id=selected["run"]["run_id"],
                 prompt=selected["task"]["prompt"],
                 port=0,
                 detail="正在创建远端模型进程",
@@ -228,13 +376,13 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
         ).start()
         return state
 
-    def _find_run(self, task: str, family: str, run_id: str) -> dict[str, Any]:
+    def _find_run(self, task: str, run_id: str) -> dict[str, Any]:
         catalog = self.catalog()
         for task_entry in catalog["tasks"]:
             if task_entry["name"] != task:
                 continue
             for run in task_entry["runs"]:
-                if run["family"] == family and run["id"] == run_id:
+                if run["run_id"] == run_id:
                     return {"task": task_entry, "run": run}
         raise ModelManagerError("所选 task / run 不在远端 catalog 中")
 
@@ -257,7 +405,7 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
                     self._transition(
                         generation,
                         "loading",
-                        f"正在端口 {port} 加载 {run['id']} checkpoint",
+                        f"正在端口 {port} 加载 {run['run_id']} checkpoint",
                         port=port,
                     )
                     deadline = time.monotonic() + self.startup_timeout_s
@@ -304,18 +452,36 @@ print(json.dumps({"tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
                 self._transition(generation, "fault", str(exc))
 
     def _launch_remote(self, run: dict[str, Any], port: int) -> None:
-        launch_script = f"scripts/deploy/{run['launcher']}/launch.sh"
+        profile = self._active_profile()
+        launch_script = f"scripts/deploy/{run['model']}/launch.sh"
         launcher_command = "bash {} {} {}".format(
             shlex.quote(launch_script),
             shlex.quote(run["task"]),
-            shlex.quote(run["id"]),
+            shlex.quote(run["run_id"]),
         )
-        inner = "exec {}".format(launcher_command)
+        setup = []
+        if profile.env_file:
+            setup.append(
+                "set -a && . {} && set +a".format(shlex.quote(profile.env_file))
+            )
+        setup.extend(
+            [
+                "export SHARPA_DEPLOY_ASSET_ROOT={}".format(
+                    shlex.quote(profile.asset_root)
+                ),
+                "export SHARPA_DEPLOY_TASK_CONFIG_ROOT={}".format(
+                    shlex.quote(profile.task_config_root)
+                ),
+                "export SHARPA_DEPLOY_PORT={}".format(int(port)),
+                "exec {}".format(launcher_command),
+            ]
+        )
+        inner = " && ".join(setup)
         remote_command = " && ".join(
             [
                 "tmux new-session -d -s {} -c {} {}".format(
                     shlex.quote(self.session_name),
-                    shlex.quote(self.remote_root),
+                    shlex.quote(profile.repo_root),
                     shlex.quote(inner),
                 ),
                 "tmux set-option -t {} remain-on-exit on".format(
@@ -491,6 +657,7 @@ exit 0
     def _ssh_raw(
         self, remote_command: str, *, timeout_s: float
     ) -> subprocess.CompletedProcess[str]:
+        profile = self._active_profile()
         command = [
             "/usr/bin/ssh",
             "-T",
@@ -500,7 +667,7 @@ exit 0
             "ForwardX11=no",
             "-o",
             "ConnectTimeout=8",
-            self.ssh_host,
+            profile.ssh_host,
             remote_command,
         ]
         try:

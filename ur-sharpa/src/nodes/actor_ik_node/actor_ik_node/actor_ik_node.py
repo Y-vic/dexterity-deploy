@@ -20,6 +20,7 @@ from .trajectory import ExecutionTraceWriter, build_trajectory_payload
 
 ARM_MAX_STEP_RAD = 0.25
 HAND_MAX_STEP_RAD = 0.4
+HARDWARE_ACK_TIMEOUT_S = 1.5
 
 
 @dataclass(frozen=True)
@@ -1048,7 +1049,19 @@ def main(args=None) -> None:
             hand.dry_run = bool(self._execution_dry_run)
             key = (action.action_id, int(action.revision), step)
             published_at = time.monotonic()
-            self._pending[key] = {"action": action, "plan": plan, "step": step, "acks": set(), "failed": "", "dry_run": bool(self._execution_dry_run), "started": published_at, "published_at": published_at, "timeout": max(0.5, 4.0 / float(action.frequency_hz))}
+            self._pending[key] = {
+                "action": action,
+                "plan": plan,
+                "step": step,
+                "acks": set(),
+                "failed": "",
+                "dry_run": bool(self._execution_dry_run),
+                "started": published_at,
+                "published_at": published_at,
+                "timeout": max(
+                    HARDWARE_ACK_TIMEOUT_S, 4.0 / float(action.frequency_hz)
+                ),
+            }
             self._arm_pub.publish(arm)
             self._hand_pub.publish(hand)
             self._trace.event(

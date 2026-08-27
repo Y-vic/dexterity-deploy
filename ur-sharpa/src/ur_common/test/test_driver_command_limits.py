@@ -108,6 +108,29 @@ class FakeHand:
         return SimpleNamespace(code=0, message="")
 
 
+class FakeControlledHand(FakeHand):
+    def __init__(self, *, mode=10, source=7, ignore_mode_write=False):
+        super().__init__()
+        self.mode = mode
+        self.source = source
+        self.ignore_mode_write = ignore_mode_write
+
+    def set_control_mode(self, mode):
+        if not self.ignore_mode_write:
+            self.mode = mode
+        return SimpleNamespace(code=0, message="")
+
+    def get_control_mode(self):
+        return SimpleNamespace(code=0, message=""), self.mode
+
+    def set_control_source(self, source):
+        self.source = source
+        return SimpleNamespace(code=0, message="")
+
+    def get_control_source(self):
+        return SimpleNamespace(code=0, message=""), self.source
+
+
 def test_ur_rejects_large_live_target_without_sending_servoj():
     driver = UrRtdePair(enable_control=True, enable_motion_limits=True, max_joint_step_rad=0.35)
     driver.receivers = {side: FakeReceiver() for side in ("left", "right")}
@@ -361,6 +384,38 @@ def test_sharpa_commands_connected_left_without_right_hand():
 
     assert set(dispatched) == {"left"}
     np.testing.assert_allclose(driver.hands["left"].commands[-1], 0.4)
+
+
+def test_sharpa_position_preflight_repairs_stale_mode_on_both_hands():
+    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
+    driver.sdk = SimpleNamespace(
+        ControlMode=SimpleNamespace(POSITION=13),
+        ControlSource=SimpleNamespace(SDK=4),
+    )
+    driver.hands = {
+        side: FakeControlledHand(mode=10, source=7)
+        for side in ("left", "right")
+    }
+
+    driver.set_position_control()
+
+    assert all(hand.mode == 13 for hand in driver.hands.values())
+    assert all(hand.source == 4 for hand in driver.hands.values())
+
+
+def test_sharpa_position_preflight_rejects_false_success_from_sdk():
+    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
+    driver.sdk = SimpleNamespace(
+        ControlMode=SimpleNamespace(POSITION=13),
+        ControlSource=SimpleNamespace(SDK=4),
+    )
+    driver.hands = {
+        "left": FakeControlledHand(mode=10, source=7, ignore_mode_write=True),
+        "right": FakeControlledHand(mode=10, source=7),
+    }
+
+    with pytest.raises(HardwareCommandError, match="readback mismatch"):
+        driver.set_position_control()
 
 
 def test_ur_single_arm_command_does_not_servo_disabled_arm():

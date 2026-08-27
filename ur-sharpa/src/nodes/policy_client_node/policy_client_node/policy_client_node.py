@@ -201,16 +201,24 @@ def deployment_ready(
 def metadata_identity_error(
     metadata: dict[str, Any] | None,
     *,
+    expected_model: str = "",
     expected_task_id: str,
     expected_run_id: str,
     expected_prompt: str = "",
 ) -> str:
     if not isinstance(metadata, dict):
         return "模型 metadata 缺失"
+    actual_model = str(
+        metadata.get("model_id") or metadata.get("model_name") or ""
+    )
     actual_task_id = str(metadata.get("task_id") or "")
     actual_run_id = str(metadata.get("run_id") or "")
     actual_prompt = str(metadata.get("prompt") or "")
     mismatches = []
+    if not expected_model or actual_model != expected_model:
+        mismatches.append(
+            "model " f"{actual_model or '<missing>'} != {expected_model or '<missing>'}"
+        )
     if not expected_task_id or actual_task_id != expected_task_id:
         mismatches.append(f"task {actual_task_id or '<missing>'} != {expected_task_id or '<missing>'}")
     if not expected_run_id or actual_run_id != expected_run_id:
@@ -249,6 +257,8 @@ def summarize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         add(name, sensors.get(name))
     return {
         "policy_family": str(metadata.get("policy_family") or ""),
+        "model_id": str(metadata.get("model_id") or metadata.get("model_name") or ""),
+        "model_name": str(metadata.get("model_name") or ""),
         "task_id": str(metadata.get("task_id") or ""),
         "run_id": str(metadata.get("run_id") or ""),
         "checkpoint_id": str(metadata.get("checkpoint_id") or ""),
@@ -280,7 +290,8 @@ def main(args=None) -> None:
             self.declare_parameter("ssh_host", "BAAI")
             self.declare_parameter("ssh_remote_host", "127.0.0.1")
             self.declare_parameter("ssh_remote_port", 5500)
-            self._core = PolicyClientCore(str(self.get_parameter("session_id").value))
+            self._base_session_id = str(self.get_parameter("session_id").value)
+            self._core = PolicyClientCore(self._base_session_id)
             self._fallback_prompt = str(self.get_parameter("prompt").value)
             self._server_config = ServerConfig(
                 url=str(self.get_parameter("server_url").value),
@@ -294,11 +305,15 @@ def main(args=None) -> None:
             self._metadata = None; self._started = False; self._busy = False; self._pending = None
             self._control_ready = False
             self._machine_control_ready = False
+            self._actor_gate_running = False
+            self._rollout_reset_pending = False
+            self._rollout_generation = 0
             self._execution_provider = "policy"
             self._model_available = False
             self._model_generation = -1
             self._model_phase = "stopped"
             self._model_port = self._default_remote_port
+            self._expected_model = ""
             self._expected_task_id = ""
             self._expected_run_id = ""
             self._expected_prompt = ""
@@ -374,15 +389,23 @@ def main(args=None) -> None:
                 phase = str(payload.get("phase", "stopped"))
                 remote_port = int(payload.get("port") or self._default_remote_port)
                 expected_task_id = str(payload.get("task_id") or "")
-                expected_run_id = str(payload.get("checkpoint_run_id") or "")
+                expected_model = str(payload.get("model") or "")
+                expected_run_id = str(payload.get("run_id") or "")
                 expected_prompt = str(payload.get("prompt") or "")
+                server_url = str(payload.get("server_url") or self._server_config.url)
+                ssh_host = str(payload.get("ssh_host") or "")
+                remote_host = str(payload.get("remote_host") or "127.0.0.1")
                 signature = (
                     generation,
                     phase,
                     remote_port,
+                    expected_model,
                     expected_task_id,
                     expected_run_id,
                     expected_prompt,
+                    server_url,
+                    ssh_host,
+                    remote_host,
                 )
                 if signature == self._model_status_signature:
                     return
@@ -390,6 +413,7 @@ def main(args=None) -> None:
                 self._model_generation = generation
                 self._model_phase = phase
                 self._model_port = remote_port
+                self._expected_model = expected_model
                 self._expected_task_id = expected_task_id
                 self._expected_run_id = expected_run_id
                 self._expected_prompt = expected_prompt
@@ -399,6 +423,8 @@ def main(args=None) -> None:
                     generation=generation,
                     phase=phase,
                     model_port=remote_port,
+                    model=expected_model,
+                    server_id=str(payload.get("server_id") or ""),
                     task_id=expected_task_id,
                     run_id=expected_run_id,
                     detail=str(payload.get("detail") or ""),
@@ -408,6 +434,9 @@ def main(args=None) -> None:
                 self._client.close()
                 self._server_config = replace(
                     self._server_config,
+                    url=server_url,
+                    ssh_host=ssh_host,
+                    ssh_remote_host=remote_host,
                     ssh_remote_port=remote_port,
                 )
                 self._client = ServerClient(self._server_config)
@@ -418,7 +447,10 @@ def main(args=None) -> None:
                 self._started = False
                 self._busy = False
                 self._pending = None
-                self._core.reset()
+                self._core = PolicyClientCore(self._base_session_id)
+                self._actor_gate_running = False
+                self._rollout_reset_pending = False
+                self._rollout_generation = 0
                 self._request_metrics.reset()
                 self._reason = "" if self._model_available else f"模型状态: {phase}"
                 self._last_error = ""
@@ -438,6 +470,8 @@ def main(args=None) -> None:
                 )
                 and self._execution_provider == "policy"
             )
+            rollout_started = actor_gate_running and not self._actor_gate_running
+            self._actor_gate_running = actor_gate_running
             recovered = self._core.update_actor_gate(actor_gate_running)
             self._machine_control_ready = deployment_ready(
                 message.ur_state,
@@ -447,17 +481,29 @@ def main(args=None) -> None:
                 message.execution_dry_run,
             )
             self._control_ready = bool(
-                self._machine_control_ready and self._execution_provider == "policy"
+                self._machine_control_ready
+                and self._execution_provider == "policy"
+                and not self._rollout_reset_pending
             )
-            reason = "" if self._control_ready else (
-                "policy disabled: replay provider selected"
-                if self._execution_provider != "policy"
-                else (
-                    "policy paused: waiting for continue"
-                    if message.execution_paused
-                    else "waiting for live or preview Actor control"
+            if rollout_started:
+                self._rollout_reset_pending = True
+                self._control_ready = False
+                self._publish(
+                    {
+                        "phase": "resetting",
+                        "reason": "new rollout: resetting server history",
+                    }
                 )
-            )
+            if self._rollout_reset_pending:
+                reason = "new rollout: resetting server history"
+            elif self._control_ready:
+                reason = ""
+            elif self._execution_provider != "policy":
+                reason = "policy disabled: replay provider selected"
+            elif message.execution_paused:
+                reason = "policy paused: waiting for continue"
+            else:
+                reason = "waiting for live or preview Actor control"
             if reason and reason != self._last_waiting_reason:
                 self._publish({"phase": "waiting", "reason": reason})
             elif recovered:
@@ -509,8 +555,40 @@ def main(args=None) -> None:
                 self._observation_done
             )
 
+        def _reset_rollout(self):
+            self._rollout_generation += 1
+            session_id = (
+                f"{self._base_session_id}-m{self._model_generation}"
+                f"-r{self._rollout_generation}"
+            )
+            self._client.reset(session_id, request_id=0)
+            self._core = PolicyClientCore(session_id)
+            self._pending = None
+            self._busy = False
+            self._request_metrics.reset()
+            self._rollout_reset_pending = False
+            self._control_ready = bool(
+                self._machine_control_ready
+                and self._execution_provider == "policy"
+            )
+            self._execution_event(
+                "rollout_reset",
+                session_id=session_id,
+                request_id=0,
+                model_generation=int(self._model_generation),
+                rollout_generation=int(self._rollout_generation),
+            )
+            self._publish(
+                {
+                    "phase": "ready",
+                    "reason": "",
+                    "error": "",
+                    "rollout_generation": self._rollout_generation,
+                }
+            )
+
         def _tick(self):
-            if self._busy or not self._core.ready: return
+            if self._busy: return
             try:
                 if self._execution_provider != "policy": return
                 if not self._model_available: return
@@ -519,6 +597,7 @@ def main(args=None) -> None:
                     validate_server_eef_contract(self._metadata)
                     identity_error = metadata_identity_error(
                         self._metadata,
+                        expected_model=self._expected_model,
                         expected_task_id=self._expected_task_id,
                         expected_run_id=self._expected_run_id,
                         expected_prompt=self._expected_prompt,
@@ -541,6 +620,10 @@ def main(args=None) -> None:
                     self._reason = ""
                     self._last_error = ""
                     self._publish({"phase": "connected", "metadata_format_id": self._metadata["metadata_format"]["format_id"]}); return
+                if self._rollout_reset_pending:
+                    self._reset_rollout()
+                    return
+                if not self._core.ready: return
                 if not self._control_ready: return
                 if not self._build_client.service_is_ready(): return
                 self._request_observation(self._core.begin())

@@ -540,6 +540,9 @@ def make_handler(
                 except ModelManagerError as exc:
                     self._send_json({"error": str(exc)}, 502)
                 return
+            if self.path == "/api/servers":
+                self._send_json(model_manager.servers())
+                return
             if self.path == "/" or self.path.startswith("/index"):
                 body = Path(__file__).with_name("dashboard.html").read_bytes()
                 self._send(body, "text/html; charset=utf-8")
@@ -632,7 +635,6 @@ def make_handler(
                 if self.path == "/api/model/start":
                     result = model_manager.start(
                         str(payload.get("task", "")),
-                        str(payload.get("family", "")),
                         str(payload.get("run_id", "")),
                     )
                     self._send_json({"accepted": True, "model": result}, 202)
@@ -651,6 +653,12 @@ def make_handler(
                         },
                         202,
                     )
+                    return
+                if self.path == "/api/server/select":
+                    result = model_manager.select_server(
+                        str(payload.get("server_id", ""))
+                    )
+                    self._send_json({"accepted": True, "model": result})
                     return
                 self.send_error(404)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -722,17 +730,27 @@ def main(args=None) -> None:
                 "model_remote_root",
                 "/share/project/yenaisheng/sharpa-deploy",
             )
+            self.declare_parameter("model_server_config", "")
             self._model_status_pub = self.create_publisher(
                 String, "/model/status", 10
             )
             self._replay_command_pub = self.create_publisher(
                 String, "/replay/command", 10
             )
-            self.model_manager = RemoteModelManager(
-                ssh_host=str(self.get_parameter("model_ssh_host").value),
-                remote_root=str(self.get_parameter("model_remote_root").value),
-                event_callback=self._model_event,
-            )
+            server_config = str(
+                self.get_parameter("model_server_config").value
+            ).strip()
+            manager_options: dict[str, Any] = {
+                "event_callback": self._model_event,
+            }
+            if server_config:
+                manager_options["profile_path"] = server_config
+            else:
+                manager_options.update(
+                    ssh_host=str(self.get_parameter("model_ssh_host").value),
+                    remote_root=str(self.get_parameter("model_remote_root").value),
+                )
+            self.model_manager = RemoteModelManager(**manager_options)
             self.create_timer(
                 0.5,
                 lambda: self._model_event(self.model_manager.snapshot()),

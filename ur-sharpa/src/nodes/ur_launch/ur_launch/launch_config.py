@@ -337,6 +337,10 @@ def _teleop_nodes() -> list[Node]:
 def _deploy_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
     return [
         _argument("dashboard_port", "8088"),
+        _argument(
+            "model_server_config",
+            str(workspace_root / "config" / "model_servers.json"),
+        ),
         _argument("policy_server_url", "ws://127.0.0.1:5500/infer"),
         _argument("policy_prompt", ""),
         _argument(
@@ -364,7 +368,8 @@ def _deploy_nodes() -> list[Node]:
             name="dashboard_node",
             output="screen",
             parameters=[{
-                "port": ParameterValue(LaunchConfiguration("dashboard_port"), value_type=int)
+                "port": ParameterValue(LaunchConfiguration("dashboard_port"), value_type=int),
+                "model_server_config": LaunchConfiguration("model_server_config"),
             }],
         ),
         Node(

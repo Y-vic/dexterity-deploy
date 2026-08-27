@@ -1,0 +1,26 @@
+{
+  "schema": "ur_sharpa.model_servers.v1",
+  "default": "baai",
+  "servers": {
+    "baai": {
+      "label": "BAAI",
+      "ssh_host": "BAAI",
+      "repo_root": "/share/project/yenaisheng/dreamzero",
+      "asset_root": "/share/project/yenaisheng/dreamzero",
+      "task_config_root": "/share/project/yenaisheng/dreamzero/scripts/deploy/task_config",
+      "remote_host": "127.0.0.1",
+      "port": 5500,
+      "env_file": ""
+    },
+    "ps": {
+      "label": "PS 4090",
+      "ssh_host": "ps",
+      "repo_root": "/home/ps/dexterity/repos/dreamzero",
+      "asset_root": "/home/ps/dexterity/assets",
+      "task_config_root": "/home/ps/dexterity/repos/dreamzero/scripts/deploy/task_config",
+      "remote_host": "127.0.0.1",
+      "port": 5500,
+      "env_file": "/home/ps/dexterity/profile.env"
+    }
+  }
+}

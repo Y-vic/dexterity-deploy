@@ -32,6 +32,7 @@ def test_dashboard_exposes_machine_and_model_controls():
         "machineContinue",
         "machinePreview",
         "modelSelect",
+        "modelServer",
         "modelStart",
         "modelStop",
         "sourcePolicy",
@@ -61,6 +62,8 @@ def test_dashboard_exposes_machine_and_model_controls():
     }
     assert "/api/model/start" in page
     assert "/api/model/stop" in page
+    assert "/api/servers" in page
+    assert "/api/server/select" in page
     assert 'onclick="startModel()"' in page
     assert "if(selectedTask&&selectedRun)await startSelectedModel()" in page
     assert "模型启动中" in page

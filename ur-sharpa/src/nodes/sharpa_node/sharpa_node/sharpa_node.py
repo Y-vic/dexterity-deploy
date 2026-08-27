@@ -12,6 +12,7 @@ import numpy as np
 
 
 ACTOR_SOURCE = 3
+BIAS_PREPARE_STEP = (1 << 32) - 1
 
 
 def validate_hand_command(command: Any) -> tuple[np.ndarray, int, bool, bool, bool]:
@@ -195,33 +196,40 @@ def main(args=None) -> None:
         def _set_floating(self):
             with self._sdk_lock:
                 self._command_cache.invalidate()
-                if self._floating:
-                    return
                 try:
                     self.driver.set_floating()
                     self._floating = True
                 except Exception as exc:
+                    # A two-hand mode change may have partially succeeded.
+                    # Unknown is safer than retaining a stale cached value.
+                    self._floating = None
                     self.get_logger().error(f"failed to set SharpA floating mode: {exc}")
 
-        def _set_position_control(self):
+        def _set_position_control(self, *, required=False):
             with self._sdk_lock:
-                if not self._floating:
-                    return
                 self._command_cache.invalidate()
                 try:
                     self.driver.set_position_control()
                     self._floating = False
                 except Exception as exc:
+                    self._floating = None
                     self.get_logger().error(
                         f"failed to restore SharpA position mode: {exc}"
                     )
+                    if required:
+                        raise
 
         def _stop(self, message):
             with self._sdk_lock:
+                was_stopped = self._stopped
                 self._stopped = bool(message.data)
-                if self._stopped:
+                if self._stopped and not was_stopped:
                     self._set_floating()
-                elif self._sharpa_state == SharpaState.RUNNING:
+                elif (
+                    not self._stopped
+                    and was_stopped
+                    and self._sharpa_state == SharpaState.RUNNING
+                ):
                     self._set_position_control()
 
         def _state(self):
@@ -286,10 +294,16 @@ def main(args=None) -> None:
                 with self._sdk_lock:
                     if self._stopped:
                         raise RuntimeError("hardware stop asserted")
-                    if command_source == Source.BIAS and self._floating:
-                        # Reset/homing is an active machine operation and therefore
-                        # uses the same POSITION mode as normal running.
-                        self._set_position_control()
+                    if (
+                        command_source == Source.BIAS
+                        and int(command.step_index) == BIAS_PREPARE_STEP
+                    ):
+                        # This is the reset preflight handshake.  It must
+                        # reassert SDK/POSITION even when the local cache says
+                        # POSITION, then verify both hands by readback.  A
+                        # failure becomes a NACK and bias_node will not start
+                        # either the hand or wrist trajectory.
+                        self._set_position_control(required=True)
                     decision = arbitrate(
                         self._sharpa_state, self._active_source, command_source
                     )
