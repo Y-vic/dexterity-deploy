@@ -207,14 +207,7 @@ def launch_live_replay(
 ) -> dict[str, Any]:
     """Synchronously arm and start Replay while observing every async gate."""
     before = state.snapshot()
-    control = before.get("control") or {}
     replay_before = before.get("replay") or {}
-    if int(control.get("ur_state", -1)) not in {0, 1}:
-        raise ModelManagerError(
-            "Replay 真实启动要求机器执行门处于关闭状态"
-        )
-    if int(control.get("sharpa_state", -1)) != 0:
-        raise ModelManagerError("真实启动前 SharpA 必须处于停止状态")
     if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
         raise ModelManagerError("Replay 仍在执行或预览，请先停止")
     if (

@@ -324,9 +324,10 @@ def test_wait_for_dashboard_state_observes_async_transition():
 
 def test_live_replay_launch_waits_for_each_gate_before_starting():
     state = DashboardState()
-    # A reset is optional: live Replay may open the gate from STOPPED and its
-    # own alignment phase handles the move to the sample's first frame.
-    state.update("control", {"ur_state": 0, "sharpa_state": 0})
+    # Replay must delegate hardware lifecycle validation to the shared machine
+    # gate. A completed reset leaves UR/SharpA in HOMED, which is a valid and
+    # direct start state.
+    state.update("control", {"ur_state": 1, "sharpa_state": 3})
     state.update(
         "replay",
         {
@@ -396,7 +397,7 @@ def test_dashboard_start_button_does_not_require_reset_state():
 
 def test_live_replay_continue_reuses_loaded_execution_and_cursor():
     state = DashboardState()
-    state.update("control", {"ur_state": 1, "sharpa_state": 0})
+    state.update("control", {"ur_state": 1, "sharpa_state": 3})
     state.update(
         "replay",
         {
