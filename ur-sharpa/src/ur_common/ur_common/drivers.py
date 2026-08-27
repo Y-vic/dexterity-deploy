@@ -999,6 +999,8 @@ class SharpADevicePair:
         self.sdk: ModuleType | None = None
         self.manager: Any = None
         self.hands: dict[str, Any] = {}
+        self.device_sn: dict[str, str] = {}
+        self.connection_errors: dict[str, str] = {}
         # channel id -> {"wrench": (6,), "deformation": (240,240)}, filled by
         # the SDK's tactile callback thread.
         self._tactile: dict[str, dict[int, dict[str, np.ndarray]]] = {
@@ -1010,6 +1012,15 @@ class SharpADevicePair:
 
     # ---- lifecycle ----------------------------------------------------
     def connect(self) -> None:
+        """Discover and connect every hand without hiding a partial failure.
+
+        The Wave manager can discover both hands while only one TCP control
+        connection succeeds.  Keep the working side available for telemetry,
+        but retain a per-side diagnostic so the ROS gate cannot mistake a
+        partial pair for healthy hardware.  Every new SDK connection enters
+        POSITION exactly once. ``reconnect_missing`` retries only the absent
+        side later; it never rewrites settings on a working hand.
+        """
         ensure_optional_runtime_paths()
         self.sdk = load_sharpa_sdk(self.sdk_root)
         try:
@@ -1018,51 +1029,148 @@ class SharpADevicePair:
             raise HardwareConnectionError(
                 f"SharpA Wave manager unavailable: {exc}"
             ) from exc
-        deadline = time.monotonic() + self.discovery_timeout_s
-        devices: list[Any] = []
-        while time.monotonic() < deadline:
+        devices = self._discover_hands(wait_for_pair=True)
+        discovered_sides = {self._device_side(device) for device in devices}
+        for side in SIDES:
+            if side not in discovered_sides:
+                self.connection_errors[side] = (
+                    f"SharpA {side} not discovered on the hand network"
+                )
+        self._connect_devices(devices)
+        if not self.hands:
+            detail = self.connection_error or "no hand heartbeat discovered"
+            raise HardwareConnectionError(
+                f"no SharpA hand is connected: {detail}"
+            )
+
+    def reconnect_missing(self) -> bool:
+        """Reconnect absent hands and leave every healthy hand untouched."""
+        if self.sdk is None or self.manager is None:
+            self.connect()
+            return self.connected
+        self._drop_manager_disconnected_hands()
+        devices = self._discover_hands(wait_for_pair=False)
+        discovered_sides = {self._device_side(device) for device in devices}
+        for side in SIDES:
+            if side not in self.hands and side not in discovered_sides:
+                self.connection_errors[side] = (
+                    f"SharpA {side} not discovered on the hand network"
+                )
+        self._connect_devices(devices)
+        return self.connected
+
+    def _drop_manager_disconnected_hands(self) -> None:
+        assert self.manager is not None
+        is_connected = getattr(self.manager, "is_connected", None)
+        if not callable(is_connected):
+            return
+        for side, serial_number in tuple(self.device_sn.items()):
+            try:
+                connected = bool(is_connected(serial_number))
+            except Exception as exc:
+                self.connection_errors[side] = (
+                    f"SharpA {side} connection health check failed "
+                    f"(sn={serial_number}): {exc}"
+                )
+                continue
+            if connected:
+                self.connection_errors.pop(side, None)
+                continue
+            hand = self.hands.pop(side, None)
+            self.device_sn.pop(side, None)
+            if hand is not None:
+                self._release_hand(hand)
+            try:
+                self.manager.disconnect(serial_number)
+            except Exception:
+                pass
+            self.connection_errors[side] = (
+                f"SharpA {side} manager connection lost (sn={serial_number})"
+            )
+
+    def _discover_hands(self, *, wait_for_pair: bool) -> list[Any]:
+        assert self.sdk is not None
+        assert self.manager is not None
+        deadline = time.monotonic() + (self.discovery_timeout_s if wait_for_pair else 0.0)
+        while True:
             devices = [
                 device
                 for device in self.manager.get_all_devices()
                 if device.device_type == self.sdk.DeviceType.HAND
             ]
             if {self._device_side(device) for device in devices} == set(SIDES):
-                break
+                return devices
+            if not wait_for_pair or time.monotonic() >= deadline:
+                return devices
             time.sleep(0.1)
+
+    def _connect_devices(self, devices: list[Any]) -> None:
         for device in devices:
             side = self._device_side(device)
             if side in self.hands:
                 continue
-            hand = None
-            try:
-                hand = (
-                    self.manager.connect(device.sn, True)
-                    if self.skip_tactile
-                    else self.manager.connect(device.sn)
-                )
-                self._check_error(hand.set_control_mode(self.sdk.ControlMode.POSITION))
-                self._check_error(hand.set_control_source(self.sdk.ControlSource.SDK))
-                self._check_error(hand.set_speed_coeff(self.speed_coefficient))
-                self._check_error(hand.set_current_coeff(self.current_coefficient))
-                if not self.skip_tactile:
-                    hand.set_tactile_callback(self._tactile_callback(side))
-                if not hand.start():
-                    raise HardwareConnectionError(f"SharpA {side} hand failed to start")
-                self.hands[side] = hand
-            except Exception:
-                if hand is not None:
-                    try:
-                        hand.stop()
-                    except Exception:
-                        pass
-                continue
-        if not self.hands:
-            found = sorted(self.hands) or ["none"]
-            self.close()
-            raise HardwareConnectionError(
-                "no SharpA hand is connected; "
-                f"discovered: {', '.join(found)}"
+            self._connect_device(device, side=side)
+
+    def _connect_device(self, device: Any, *, side: str) -> None:
+        assert self.sdk is not None
+        assert self.manager is not None
+        serial_number = str(device.sn)
+        ip = str(getattr(device, "ip", "unknown"))
+        hand = None
+        stage = "manager.connect"
+        try:
+            is_connected = getattr(self.manager, "is_connected", None)
+            if callable(is_connected) and bool(is_connected(serial_number)):
+                self.manager.disconnect(serial_number)
+                time.sleep(0.05)
+            hand = (
+                self.manager.connect(serial_number, True)
+                if self.skip_tactile
+                else self.manager.connect(serial_number)
             )
+            # POSITION is a connection invariant. The Wave setter is a trigger,
+            # so call it exactly once for this newly-created SDK connection and
+            # never as part of stop/reset/start state transitions.
+            stage = "set_control_mode(position)"
+            self._check_error(hand.set_control_mode(self.sdk.ControlMode.POSITION))
+            stage = "set_control_source(SDK)"
+            self._check_error(hand.set_control_source(self.sdk.ControlSource.SDK))
+            stage = "set_speed_coeff"
+            self._check_error(hand.set_speed_coeff(self.speed_coefficient))
+            stage = "set_current_coeff"
+            self._check_error(hand.set_current_coeff(self.current_coefficient))
+            if not self.skip_tactile:
+                stage = "set_tactile_callback"
+                hand.set_tactile_callback(self._tactile_callback(side))
+            stage = "start"
+            if not hand.start():
+                retry = getattr(hand, "retry_tactile_alternate_port", None)
+                if not callable(retry) or not bool(retry()):
+                    raise HardwareConnectionError("hand failed to start")
+            self.hands[side] = hand
+            self.device_sn[side] = serial_number
+            self.connection_errors.pop(side, None)
+        except Exception as exc:
+            if hand is not None:
+                self._release_hand(hand)
+            try:
+                self.manager.disconnect(serial_number)
+            except Exception:
+                pass
+            self.hands.pop(side, None)
+            self.device_sn.pop(side, None)
+            self.connection_errors[side] = (
+                f"SharpA {side} {stage} failed "
+                f"(sn={serial_number}, ip={ip}): {exc}"
+            )
+
+    @property
+    def connection_error(self) -> str:
+        return "; ".join(
+            self.connection_errors[side]
+            for side in SIDES
+            if side in self.connection_errors
+        )
 
     def _device_side(self, device: Any) -> str:
         assert self.sdk is not None
@@ -1072,6 +1180,18 @@ class SharpADevicePair:
     def _check_error(error: Any) -> None:
         if getattr(error, "code", -1) != 0:
             raise HardwareConnectionError(getattr(error, "message", "SharpA SDK error"))
+
+    @staticmethod
+    def _release_hand(hand: Any) -> None:
+        """Release both control and tactile resources for one SDK object."""
+        for method_name in ("stop", "destroy"):
+            method = getattr(hand, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                method()
+            except Exception:
+                pass
 
     @property
     def connected(self) -> bool:
@@ -1271,55 +1391,6 @@ class SharpADevicePair:
         # action with the dispatched target rather than the pre-limit request.
         return {side: targets[side].copy() for side in active}
 
-    def set_control_mode(self, mode: Any) -> None:
-        """Trigger one control-mode transition on each connected hand.
-
-        Wave control-mode setters are edge-triggered operations, not
-        idempotent configuration writes. Lifecycle ownership therefore lives
-        in sharpa_node: this method is called once when its state crosses the
-        FLOATING/POSITION boundary and never as a health probe.
-        """
-        if not self.enable_control:
-            return
-        if self.sdk is None:
-            raise HardwareCommandError("SharpA SDK is unavailable")
-        for side in SIDES:
-            hand = self.hands.get(side)
-            if hand is None:
-                continue
-            error = hand.set_control_mode(mode)
-            if getattr(error, "code", -1) != 0:
-                raise HardwareCommandError(
-                    f"SharpA {side} control mode failed: {getattr(error, 'message', '')}"
-                )
-
-    def set_control_source(self, source: Any) -> None:
-        """Trigger one command-source transition on each connected hand."""
-        if not self.enable_control:
-            return
-        if self.sdk is None:
-            raise HardwareCommandError("SharpA SDK is unavailable")
-        for side in SIDES:
-            hand = self.hands.get(side)
-            if hand is None:
-                continue
-            error = hand.set_control_source(source)
-            if getattr(error, "code", -1) != 0:
-                raise HardwareCommandError(
-                    f"SharpA {side} control source failed: "
-                    f"{getattr(error, 'message', '')}"
-                )
-
-    def set_floating(self) -> None:
-        """Enable gravity compensation for manual hand adjustment."""
-        if self.sdk is not None:
-            self.set_control_mode(self.sdk.ControlMode.FLOATING)
-
-    def set_position_control(self) -> None:
-        """Enter POSITION once; the SDK source was established at connect."""
-        if self.sdk is not None:
-            self.set_control_mode(self.sdk.ControlMode.POSITION)
-
     def move_joint_ramp(
         self,
         left_joint: Any,
@@ -1418,11 +1489,10 @@ class SharpADevicePair:
     def close(self) -> None:
         self.hold()
         for hand in tuple(self.hands.values()):
-            try:
-                hand.stop()
-            except Exception:
-                pass
+            self._release_hand(hand)
         self.hands.clear()
+        self.device_sn.clear()
+        self.connection_errors.clear()
         if self.manager is not None:
             try:
                 self.manager.disconnect_all()

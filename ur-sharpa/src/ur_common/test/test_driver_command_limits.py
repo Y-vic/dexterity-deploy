@@ -144,6 +144,54 @@ class FakeControlledHand(FakeHand):
         return SimpleNamespace(code=0, message=""), self.source
 
 
+class FakeConnectHand(FakeControlledHand):
+    def __init__(self):
+        super().__init__()
+        self.started = False
+
+    def set_speed_coeff(self, _value):
+        return SimpleNamespace(code=0, message="")
+
+    def set_current_coeff(self, _value):
+        return SimpleNamespace(code=0, message="")
+
+    def set_tactile_callback(self, _callback):
+        pass
+
+    def start(self):
+        self.started = True
+        return True
+
+    def stop(self):
+        self.started = False
+
+
+class FakeWaveManager:
+    def __init__(self, devices, *, fail_serial=""):
+        self.devices = list(devices)
+        self.fail_serial = fail_serial
+        self.connected = {}
+
+    def get_all_devices(self):
+        return list(self.devices)
+
+    def is_connected(self, serial_number):
+        return serial_number in self.connected
+
+    def connect(self, serial_number, _skip_tactile=False):
+        if serial_number == self.fail_serial:
+            raise RuntimeError("socket refused")
+        hand = FakeConnectHand()
+        self.connected[serial_number] = hand
+        return hand
+
+    def disconnect(self, serial_number):
+        self.connected.pop(serial_number, None)
+
+    def disconnect_all(self):
+        self.connected.clear()
+
+
 def test_ur_rejects_large_live_target_without_sending_servoj():
     driver = UrRtdePair(enable_control=True, enable_motion_limits=True, max_joint_step_rad=0.35)
     driver.receivers = {side: FakeReceiver() for side in ("left", "right")}
@@ -399,57 +447,39 @@ def test_sharpa_commands_connected_left_without_right_hand():
     np.testing.assert_allclose(driver.hands["left"].commands[-1], 0.4)
 
 
-def test_sharpa_position_transition_triggers_mode_once_on_both_hands():
+def test_sharpa_partial_connect_reports_side_stage_and_reconnects_only_missing():
+    left = SimpleNamespace(
+        sn="left-sn", ip="192.168.10.10", hand_side=0, device_type=9
+    )
+    right = SimpleNamespace(
+        sn="right-sn", ip="192.168.10.20", hand_side=1, device_type=9
+    )
+    manager = FakeWaveManager([left, right], fail_serial="right-sn")
     driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
     driver.sdk = SimpleNamespace(
-        ControlMode=SimpleNamespace(POSITION=13),
+        DeviceType=SimpleNamespace(HAND=9),
+        HandSide=SimpleNamespace(LEFT=0),
+        ControlMode=SimpleNamespace(FLOATING=10, POSITION=13),
         ControlSource=SimpleNamespace(SDK=4),
     )
-    driver.hands = {
-        side: FakeControlledHand(mode=10, source=7)
-        for side in ("left", "right")
-    }
+    driver.manager = manager
 
-    driver.set_position_control()
+    driver._connect_devices([left, right])
 
-    assert all(hand.mode == 13 for hand in driver.hands.values())
-    assert all(hand.source == 7 for hand in driver.hands.values())
-    assert all(hand.mode_writes == 1 for hand in driver.hands.values())
-    assert all(hand.source_writes == 0 for hand in driver.hands.values())
+    assert set(driver.hands) == {"left"}
+    assert driver.hands["left"].mode == 13
+    assert driver.hands["left"].mode_writes == 1
+    assert "SharpA right manager.connect failed" in driver.connection_error
+    assert "ip=192.168.10.20" in driver.connection_error
 
+    left_hand = driver.hands["left"]
+    manager.fail_serial = ""
+    assert driver.reconnect_missing() is True
 
-def test_sharpa_position_transition_does_not_repeat_source_trigger():
-    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
-    driver.sdk = SimpleNamespace(
-        ControlMode=SimpleNamespace(POSITION=13),
-        ControlSource=SimpleNamespace(SDK=4),
-    )
-    driver.hands = {
-        side: FakeControlledHand(mode=10, source=4, fail_redundant_source_write=True)
-        for side in ("left", "right")
-    }
-
-    driver.set_position_control()
-
-    assert all(hand.mode == 13 for hand in driver.hands.values())
-    assert all(hand.source == 4 for hand in driver.hands.values())
-    assert all(hand.mode_writes == 1 for hand in driver.hands.values())
-    assert all(hand.source_writes == 0 for hand in driver.hands.values())
-
-
-def test_sharpa_position_transition_propagates_sdk_failure():
-    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
-    driver.sdk = SimpleNamespace(
-        ControlMode=SimpleNamespace(POSITION=13),
-        ControlSource=SimpleNamespace(SDK=4),
-    )
-    driver.hands = {
-        "left": FakeControlledHand(mode=13, source=7, fail_redundant_mode_write=True),
-        "right": FakeControlledHand(mode=10, source=7),
-    }
-
-    with pytest.raises(HardwareCommandError, match="control mode failed"):
-        driver.set_position_control()
+    assert driver.hands["left"] is left_hand
+    assert driver.hands["left"].mode_writes == 1
+    assert driver.hands["right"].mode == 13
+    assert driver.connection_error == ""
 
 
 def test_ur_single_arm_command_does_not_servo_disabled_arm():

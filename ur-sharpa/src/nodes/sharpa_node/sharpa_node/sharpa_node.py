@@ -14,22 +14,6 @@ import numpy as np
 ACTOR_SOURCE = 3
 
 
-def control_mode_transition(previous_state: int, next_state: int) -> str | None:
-    """Return the one Wave mode trigger required by a lifecycle edge.
-
-    HOMING, HOMED, STARTING, and RUNNING share POSITION mode, so moving among
-    them must not call the trigger-based SDK setter again. Hardware-stop is
-    deliberately absent from this function; it gates commands but does not
-    own mode.
-    """
-    position_states = {1, 2, 3, 4}
-    was_position = int(previous_state) in position_states
-    is_position = int(next_state) in position_states
-    if was_position == is_position:
-        return None
-    return "position" if is_position else "floating"
-
-
 def validate_hand_command(command: Any) -> tuple[np.ndarray, int, bool, bool, bool]:
     """Validate a command before either dry-run ACK or SDK dispatch."""
     source = int(command.source)
@@ -157,23 +141,19 @@ def main(args=None) -> None:
             self._control_mode = "unknown"
             self._control_error = ""
             try:
+                # POSITION is a connection invariant. Stop/reset/start only
+                # change command gates; they never trigger a Wave mode setter.
                 self.driver.connect()
             except Exception as exc:
                 # Hardware absence is a runtime state, not a reason to kill the
                 # graph. Keep publishing invalid facts so status/recording can
                 # explain why the gate is closed.
                 self._driver_error = str(exc)
-                self._control_error = str(exc)
+                self._refresh_control_error()
                 self.get_logger().error(f"SharpA hardware unavailable: {exc}")
             else:
-                try:
-                    self.driver.set_floating()
-                    self._control_mode = "floating"
-                except Exception as exc:
-                    self._control_error = str(exc)
-                    self.get_logger().error(
-                        f"failed to set initial SharpA floating mode: {exc}"
-                    )
+                self._control_mode = "position"
+                self._refresh_control_error()
             self.pub = self.create_publisher(HandStateFrame, "/sharpa/state", 10)
             self.tau_pub = self.create_publisher(TauFrame, "/sharpa/tau", 10)
             self.wrench_pub = self.create_publisher(WrenchFrame, "/sharpa/wrench", 10)
@@ -185,15 +165,63 @@ def main(args=None) -> None:
             self._sharpa_state = SharpaState.STOPPED
             self._active_source = Source.UNKNOWN
             self._stopped = False
+            self._closing = False
+            self._reconnect_running = False
+            self._last_connection_report = self._control_error
             self._command_cache = SuccessfulHandCommandCache()
             self.create_subscription(HandCommand, "/sharpa/command", self._command, 10)
             self.create_subscription(ControlStatus, "/control/status", self._status, 10)
             self.create_subscription(Bool, "/hardware/stop", self._stop, 10)
             self.timer = self.create_timer(1.0 / 30.0, self._state)
+            self.reconnect_timer = self.create_timer(2.0, self._schedule_reconnect)
+
+        def _refresh_control_error(self):
+            parts = [
+                str(self._driver_error).strip(),
+                str(self.driver.connection_error).strip(),
+            ]
+            unique = []
+            for part in parts:
+                if part and part not in unique:
+                    unique.append(part)
+            self._control_error = "; ".join(unique)
+
+        def _schedule_reconnect(self):
+            # Reconnection owns SDK connection state and may block briefly.
+            # Run it off the ROS executor so status publishing stays alive.
+            if (
+                self._closing
+                or self._reconnect_running
+                or self._sharpa_state != SharpaState.STOPPED
+            ):
+                return
+            self._reconnect_running = True
+            threading.Thread(target=self._reconnect_missing, daemon=True).start()
+
+        def _reconnect_missing(self):
+            try:
+                with self._sdk_lock:
+                    try:
+                        self.driver.reconnect_missing()
+                    except Exception as exc:
+                        self._driver_error = str(exc)
+                    else:
+                        if self.driver.hands:
+                            self._driver_error = ""
+                            self._control_mode = "position"
+                    self._refresh_control_error()
+                    report = self._control_error
+                if report != self._last_connection_report:
+                    if report:
+                        self.get_logger().warning(report)
+                    else:
+                        self.get_logger().info("SharpA left and right hands connected")
+                    self._last_connection_report = report
+            finally:
+                self._reconnect_running = False
 
         def _status(self, message):
             with self._sdk_lock:
-                previous_state = self._sharpa_state
                 previous_source = self._active_source
                 try:
                     self._sharpa_state = SharpaState(int(message.sharpa_state))
@@ -206,41 +234,6 @@ def main(args=None) -> None:
 
                 if self._active_source != previous_source:
                     self._command_cache.invalidate()
-                transition = control_mode_transition(
-                    int(previous_state), int(self._sharpa_state)
-                )
-                if transition == "floating":
-                    self._set_floating()
-                elif transition == "position":
-                    self._set_position_control()
-
-        def _set_floating(self):
-            with self._sdk_lock:
-                self._command_cache.invalidate()
-                try:
-                    self.driver.set_floating()
-                    self._control_mode = "floating"
-                    self._control_error = ""
-                except Exception as exc:
-                    # A two-hand mode change may have partially succeeded.
-                    # Unknown is safer than retaining a stale cached value.
-                    self._control_mode = "unknown"
-                    self._control_error = str(exc)
-                    self.get_logger().error(f"failed to set SharpA floating mode: {exc}")
-
-        def _set_position_control(self):
-            with self._sdk_lock:
-                self._command_cache.invalidate()
-                try:
-                    self.driver.set_position_control()
-                    self._control_mode = "position"
-                    self._control_error = ""
-                except Exception as exc:
-                    self._control_mode = "unknown"
-                    self._control_error = str(exc)
-                    self.get_logger().error(
-                        f"failed to restore SharpA position mode: {exc}"
-                    )
 
         def _stop(self, message):
             with self._sdk_lock:
@@ -407,7 +400,10 @@ def main(args=None) -> None:
             )
 
         def destroy_node(self):
-            self.driver.close(); return super().destroy_node()
+            self._closing = True
+            with self._sdk_lock:
+                self.driver.close()
+            return super().destroy_node()
 
     rclpy.init(args=args); node = RosSharpaNode()
     try: rclpy.spin(node)

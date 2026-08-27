@@ -4,7 +4,6 @@ import pytest
 from sharpa_node.arbitration import SharpaState, Source, arbitrate
 from sharpa_node.sharpa_node import (
     SuccessfulHandCommandCache,
-    control_mode_transition,
     validate_hand_command,
 )
 
@@ -36,16 +35,6 @@ def test_running_accepts_only_active_streaming_source():
 
 def test_unknown_source_is_rejected():
     assert not arbitrate(SharpaState.RUNNING, Source.UNKNOWN, Source.UNKNOWN)
-
-
-def test_mode_is_triggered_only_when_crossing_stopped_boundary():
-    assert control_mode_transition(SharpaState.STOPPED, SharpaState.HOMING) == "position"
-    assert control_mode_transition(SharpaState.STOPPED, SharpaState.STARTING) == "position"
-    assert control_mode_transition(SharpaState.STARTING, SharpaState.RUNNING) is None
-    assert control_mode_transition(SharpaState.HOMING, SharpaState.HOMED) is None
-    assert control_mode_transition(SharpaState.HOMED, SharpaState.RUNNING) is None
-    assert control_mode_transition(SharpaState.RUNNING, SharpaState.STOPPED) == "floating"
-    assert control_mode_transition(SharpaState.STOPPED, SharpaState.STOPPED) is None
 
 
 def test_successful_hand_command_cache_holds_full_command():
