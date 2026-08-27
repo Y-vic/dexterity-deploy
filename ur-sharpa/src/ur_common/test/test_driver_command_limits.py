@@ -111,16 +111,21 @@ class FakeHand:
 class FakeControlledHand(FakeHand):
     def __init__(
         self, *, mode=10, source=7, ignore_mode_write=False,
-        fail_redundant_source_write=False,
+        fail_redundant_mode_write=False, fail_redundant_source_write=False,
     ):
         super().__init__()
         self.mode = mode
         self.source = source
         self.ignore_mode_write = ignore_mode_write
+        self.fail_redundant_mode_write = fail_redundant_mode_write
         self.fail_redundant_source_write = fail_redundant_source_write
+        self.mode_writes = 0
         self.source_writes = 0
 
     def set_control_mode(self, mode):
+        self.mode_writes += 1
+        if self.fail_redundant_mode_write and self.mode == mode:
+            return SimpleNamespace(code=2, message="Failure to connect to server")
         if not self.ignore_mode_write:
             self.mode = mode
         return SimpleNamespace(code=0, message="")
@@ -411,7 +416,7 @@ def test_sharpa_position_preflight_repairs_stale_mode_on_both_hands():
     assert all(hand.source == 4 for hand in driver.hands.values())
 
 
-def test_sharpa_position_preflight_does_not_rewrite_unchanged_sdk_source():
+def test_sharpa_position_preflight_does_not_repeat_triggered_settings():
     driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
     driver.sdk = SimpleNamespace(
         ControlMode=SimpleNamespace(POSITION=13),
@@ -419,7 +424,10 @@ def test_sharpa_position_preflight_does_not_rewrite_unchanged_sdk_source():
     )
     driver.hands = {
         side: FakeControlledHand(
-            mode=10, source=4, fail_redundant_source_write=True
+            mode=13,
+            source=4,
+            fail_redundant_mode_write=True,
+            fail_redundant_source_write=True,
         )
         for side in ("left", "right")
     }
@@ -428,6 +436,7 @@ def test_sharpa_position_preflight_does_not_rewrite_unchanged_sdk_source():
 
     assert all(hand.mode == 13 for hand in driver.hands.values())
     assert all(hand.source == 4 for hand in driver.hands.values())
+    assert all(hand.mode_writes == 0 for hand in driver.hands.values())
     assert all(hand.source_writes == 0 for hand in driver.hands.values())
 
 

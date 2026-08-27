@@ -1322,34 +1322,43 @@ class SharpADevicePair:
         unconditional write. A failed read or a failed repair still closes the
         reset gate.
         """
+        self._ensure_control_setting("source", source)
+
+    def ensure_control_mode(self, mode: Any) -> None:
+        """Verify the mode and trigger a transition only when it differs."""
+        self._ensure_control_setting("mode", mode)
+
+    def _ensure_control_setting(self, setting: str, expected: Any) -> None:
         if not self.enable_control:
             return
         if self.sdk is None:
             raise HardwareCommandError("SharpA SDK is unavailable")
+        getter_name = f"get_control_{setting}"
+        setter_name = f"set_control_{setting}"
         for side in SIDES:
             hand = self.hands.get(side)
             if hand is None:
                 continue
             try:
-                error, actual = hand.get_control_source()
+                error, actual = getattr(hand, getter_name)()
             except Exception as exc:
                 raise HardwareCommandError(
-                    f"SharpA {side} control source readback failed: {exc}"
+                    f"SharpA {side} control {setting} readback failed: {exc}"
                 ) from exc
             if getattr(error, "code", -1) != 0:
                 raise HardwareCommandError(
-                    f"SharpA {side} control source readback failed: "
+                    f"SharpA {side} control {setting} readback failed: "
                     f"{getattr(error, 'message', '')}"
                 )
-            if actual == source:
+            if actual == expected:
                 continue
-            error = hand.set_control_source(source)
+            error = getattr(hand, setter_name)(expected)
             if getattr(error, "code", -1) != 0:
                 raise HardwareCommandError(
-                    f"SharpA {side} control source failed: "
+                    f"SharpA {side} control {setting} failed: "
                     f"{getattr(error, 'message', '')}"
                 )
-        self._verify_control_setting("source", source)
+        self._verify_control_setting(setting, expected)
 
     def _verify_control_setting(self, setting: str, expected: Any) -> None:
         getter_name = f"get_control_{setting}"
@@ -1382,11 +1391,10 @@ class SharpADevicePair:
     def set_position_control(self) -> None:
         """Restore and verify the complete SDK position-control chain."""
         if self.sdk is not None:
-            # Stop changes POSITION -> FLOATING but leaves ControlSource alone.
-            # Restore the changed setting first. Then verify/repair the source
-            # idempotently; an unconditional source write is unreliable on the
-            # right hand in Wave SDK 5.x while leaving zero-force mode.
-            self.set_control_mode(self.sdk.ControlMode.POSITION)
+            # Both settings are trigger-based. Read first and transition only
+            # when the reported state differs; repeated setter calls are not a
+            # valid health check and are unreliable in Wave SDK 5.x.
+            self.ensure_control_mode(self.sdk.ControlMode.POSITION)
             self.ensure_control_source(self.sdk.ControlSource.SDK)
 
     def move_joint_ramp(
