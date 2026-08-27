@@ -3,7 +3,7 @@
   "default": "baai",
   "servers": {
     "baai": {
-      "label": "Server BAAI H100",
+      "label": "BAAI H100",
       "ssh_host": "BAAI",
       "repo_root": "/share/project/yenaisheng/dreamzero",
       "asset_root": "/share/project/yenaisheng/dreamzero",
@@ -13,7 +13,7 @@
       "env_file": ""
     },
     "ps": {
-      "label": "Server PS 4090",
+      "label": "PS 4090",
       "ssh_host": "ps",
       "repo_root": "/home/ps/dexterity/repos/dexhand",
       "asset_root": "/home/ps/dexterity/assets",
