@@ -109,11 +109,16 @@ class FakeHand:
 
 
 class FakeControlledHand(FakeHand):
-    def __init__(self, *, mode=10, source=7, ignore_mode_write=False):
+    def __init__(
+        self, *, mode=10, source=7, ignore_mode_write=False,
+        fail_redundant_source_write=False,
+    ):
         super().__init__()
         self.mode = mode
         self.source = source
         self.ignore_mode_write = ignore_mode_write
+        self.fail_redundant_source_write = fail_redundant_source_write
+        self.source_writes = 0
 
     def set_control_mode(self, mode):
         if not self.ignore_mode_write:
@@ -124,6 +129,9 @@ class FakeControlledHand(FakeHand):
         return SimpleNamespace(code=0, message=""), self.mode
 
     def set_control_source(self, source):
+        self.source_writes += 1
+        if self.fail_redundant_source_write and self.source == source:
+            return SimpleNamespace(code=2, message="Failure to connect to server")
         self.source = source
         return SimpleNamespace(code=0, message="")
 
@@ -401,6 +409,26 @@ def test_sharpa_position_preflight_repairs_stale_mode_on_both_hands():
 
     assert all(hand.mode == 13 for hand in driver.hands.values())
     assert all(hand.source == 4 for hand in driver.hands.values())
+
+
+def test_sharpa_position_preflight_does_not_rewrite_unchanged_sdk_source():
+    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
+    driver.sdk = SimpleNamespace(
+        ControlMode=SimpleNamespace(POSITION=13),
+        ControlSource=SimpleNamespace(SDK=4),
+    )
+    driver.hands = {
+        side: FakeControlledHand(
+            mode=10, source=4, fail_redundant_source_write=True
+        )
+        for side in ("left", "right")
+    }
+
+    driver.set_position_control()
+
+    assert all(hand.mode == 13 for hand in driver.hands.values())
+    assert all(hand.source == 4 for hand in driver.hands.values())
+    assert all(hand.source_writes == 0 for hand in driver.hands.values())
 
 
 def test_sharpa_position_preflight_rejects_false_success_from_sdk():

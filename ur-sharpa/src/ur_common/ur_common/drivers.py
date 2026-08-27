@@ -1312,6 +1312,45 @@ class SharpADevicePair:
                 )
         self._verify_control_setting("source", source)
 
+    def ensure_control_source(self, source: Any) -> None:
+        """Verify the source and write it only when the firmware reports drift.
+
+        Wave SDK 5.x can return ``FAILURE_TO_CONNECT_TO_SERVER`` when
+        ``set_control_source(SDK)`` is repeated while a hand is leaving
+        zero-force mode. Stopping does not change the source, so the correct
+        recovery is an idempotent read/repair operation rather than an
+        unconditional write. A failed read or a failed repair still closes the
+        reset gate.
+        """
+        if not self.enable_control:
+            return
+        if self.sdk is None:
+            raise HardwareCommandError("SharpA SDK is unavailable")
+        for side in SIDES:
+            hand = self.hands.get(side)
+            if hand is None:
+                continue
+            try:
+                error, actual = hand.get_control_source()
+            except Exception as exc:
+                raise HardwareCommandError(
+                    f"SharpA {side} control source readback failed: {exc}"
+                ) from exc
+            if getattr(error, "code", -1) != 0:
+                raise HardwareCommandError(
+                    f"SharpA {side} control source readback failed: "
+                    f"{getattr(error, 'message', '')}"
+                )
+            if actual == source:
+                continue
+            error = hand.set_control_source(source)
+            if getattr(error, "code", -1) != 0:
+                raise HardwareCommandError(
+                    f"SharpA {side} control source failed: "
+                    f"{getattr(error, 'message', '')}"
+                )
+        self._verify_control_setting("source", source)
+
     def _verify_control_setting(self, setting: str, expected: Any) -> None:
         getter_name = f"get_control_{setting}"
         for side in SIDES:
@@ -1343,11 +1382,12 @@ class SharpADevicePair:
     def set_position_control(self) -> None:
         """Restore and verify the complete SDK position-control chain."""
         if self.sdk is not None:
-            # The SDK documents that a source change must precede commands.
-            # Reassert it for every new active trajectory so a stale firmware
-            # mode or a partially applied two-hand transition cannot survive.
-            self.set_control_source(self.sdk.ControlSource.SDK)
+            # Stop changes POSITION -> FLOATING but leaves ControlSource alone.
+            # Restore the changed setting first. Then verify/repair the source
+            # idempotently; an unconditional source write is unreliable on the
+            # right hand in Wave SDK 5.x while leaving zero-force mode.
             self.set_control_mode(self.sdk.ControlMode.POSITION)
+            self.ensure_control_source(self.sdk.ControlSource.SDK)
 
     def move_joint_ramp(
         self,
