@@ -169,7 +169,7 @@ def test_checked_in_profiles_define_baai_and_ps_code_and_asset_roots():
     profiles, default = load_server_profiles(path)
 
     assert default == "baai"
-    assert profiles["baai"].repo_root == "/share/project/yenaisheng/dexhand"
+    assert profiles["baai"].repo_root == "/share/project/yenaisheng/dreamzero"
     assert profiles["ps"].repo_root == "/home/ps/dexterity/repos/dexhand"
     assert profiles["ps"].asset_root == "/home/ps/dexterity/assets"
     assert profiles["ps"].ssh_host == "ps"
