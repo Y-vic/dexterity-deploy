@@ -12,12 +12,16 @@ def test_teleop_enables_final_ur_motion_guards():
 
 
 def test_deploy_graph_builds_observations_inside_policy_client():
-    packages = [node.node_package for node in _deploy_nodes()]
-
-    assert packages == [
-        "dashboard_node",
-        "policy_client_node",
-        "actor_ik_node",
-        "replay_node",
+    nodes = _deploy_nodes()
+    executables = [
+        (node.node_package, node.node_executable) for node in nodes
     ]
-    assert "robot_states_node" not in packages
+
+    assert executables == [
+        ("dashboard_node", "dashboard_node"),
+        ("policy_client_node", "policy_client_node"),
+        ("actor_ik_node", "actor_ik_node"),
+        ("actor_ik_node", "hand_tracking_node"),
+        ("replay_node", "replay_node"),
+    ]
+    assert "robot_states_node" not in [node.node_package for node in nodes]

@@ -403,6 +403,12 @@ def _deploy_nodes() -> list[Node]:
             }],
         ),
         Node(
+            package="actor_ik_node",
+            executable="hand_tracking_node",
+            name="hand_tracking_node",
+            output="screen",
+        ),
+        Node(
             package="replay_node",
             executable="replay_node",
             name="replay_node",

@@ -14,5 +14,10 @@ setup(
     install_requires=["setuptools", "numpy"],
     tests_require=["pytest"],
     zip_safe=True,
-    entry_points={"console_scripts": ["actor_ik_node = actor_ik_node.actor_ik_node:main"]},
+    entry_points={
+        "console_scripts": [
+            "actor_ik_node = actor_ik_node.actor_ik_node:main",
+            "hand_tracking_node = actor_ik_node.hand_tracking:main",
+        ]
+    },
 )
