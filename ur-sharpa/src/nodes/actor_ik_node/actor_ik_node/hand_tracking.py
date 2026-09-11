@@ -3,7 +3,7 @@
 This executable deliberately runs outside ``actor_ik_node`` and
 ``sharpa_node``.  Tracking I/O must never share an executor with command ACKs
 or the hardware SDK path: a slow disk may lose diagnostics, but it must not
-delay motion or turn a successful hardware command into an ACK timeout.
+delay motion or distort command/ACK latency measurements.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 
-TRACKING_SCHEMA = "sharpa.hand_tracking.v1"
+TRACKING_SCHEMA = "sharpa.hand_tracking.v2"
 HAND_JOINTS = 44
 JOINTS_PER_SIDE = 22
 
@@ -106,10 +106,17 @@ def tracking_record(
     command_match_max_abs_rad: float | None = None,
     recorded_at_ns: int | None = None,
     recorded_monotonic_ns: int | None = None,
+    measured_tau: Any | None = None,
+    tau_valid: bool = False,
 ) -> dict[str, Any]:
     """Build one JSON-safe, same-snapshot hand tracking record."""
     measured = _vector(measured_q, "measured_q")
     dispatched = _vector(dispatched_q_cmd, "dispatched_q_cmd")
+    tau = (
+        np.zeros(HAND_JOINTS, dtype=np.float64)
+        if measured_tau is None
+        else _vector(measured_tau, "measured_tau")
+    )
     state_valid = bool(left_valid and right_valid)
     command_valid = bool(q_cmd_valid)
     tracking_valid = bool(state_valid and command_valid)
@@ -132,6 +139,14 @@ def tracking_record(
         "position_control_ready": bool(position_control_ready),
         "control_error": str(control_error),
         "q": measured.tolist(),
+        "tau": tau.tolist(),
+        "tau_valid": bool(tau_valid),
+        "left_max_abs_tau_nm": (
+            float(np.max(np.abs(tau[:JOINTS_PER_SIDE]))) if tau_valid else None
+        ),
+        "right_max_abs_tau_nm": (
+            float(np.max(np.abs(tau[JOINTS_PER_SIDE:]))) if tau_valid else None
+        ),
         "q_cmd": dispatched.tolist(),
         "q_cmd_valid": command_valid,
         "q_cmd_timestamp_ns": int(q_cmd_timestamp_ns),
@@ -246,8 +261,12 @@ def main(args=None) -> None:
         def _control(self, message) -> None:
             active = bool(
                 (
-                    int(message.ur_state) == int(ControlStatus.UR_RUNNING)
-                    and int(message.sharpa_state) == int(ControlStatus.SHARPA_RUNNING)
+                    int(message.sharpa_state) == int(ControlStatus.SHARPA_RUNNING)
+                    and (
+                        int(message.execution_scope)
+                        == int(ControlStatus.EXECUTION_SCOPE_HANDS_ONLY)
+                        or int(message.ur_state) == int(ControlStatus.UR_RUNNING)
+                    )
                 )
                 or bool(message.execution_dry_run)
             )
@@ -301,6 +320,8 @@ def main(args=None) -> None:
                     control_error=message.control_error,
                     command=command,
                     command_match_max_abs_rad=match_error,
+                    measured_tau=message.tau,
+                    tau_valid=message.tau_valid,
                 )
                 self._writer.append(record)
             except (OSError, ValueError) as exc:

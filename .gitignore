@@ -27,6 +27,7 @@ ur-sharpa/build_*/
 ur-sharpa/install_*/
 ur-sharpa/log_*/
 ur-sharpa/episodes/
+ur-sharpa/demo_recordings/
 ur-sharpa/rosbag2_*/
 ur-sharpa/core
 ur-sharpa/core.*

@@ -196,8 +196,10 @@ if ROS_AVAILABLE:
                 "stop_record": self.machine.attempt_stop_recording,
                 "discard_record": self.machine.attempt_discard_recording,
                 "start_deploy": self.machine.attempt_start_deploy,
+                "start_hands_deploy": self.machine.attempt_start_hands_deploy,
                 "continue_deploy": self.machine.attempt_continue_deploy,
                 "preview_deploy": self.machine.attempt_preview_deploy,
+                "preview_hands_deploy": self.machine.attempt_preview_hands_deploy,
                 "pause_deploy": self.machine.attempt_pause_deploy,
                 "stop_deploy": self.machine.attempt_stop_deploy,
                 "select_policy": lambda: self.machine.attempt_set_execution_provider("policy"),
@@ -247,6 +249,7 @@ if ROS_AVAILABLE:
             msg.active_source = int(state.active_source)
             msg.execution_paused = bool(state.execution_paused)
             msg.execution_dry_run = bool(state.execution_dry_run)
+            msg.execution_scope = int(state.execution_scope)
             msg.gate_reason = state.gate_reason or state.camera_gate_reason()
             msg.session_id = state.session_id
             self.status_pub.publish(msg)

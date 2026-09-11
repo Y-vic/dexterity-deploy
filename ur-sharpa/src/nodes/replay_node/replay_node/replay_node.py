@@ -289,6 +289,7 @@ class ReplayConfig:
     frequency_hz: float = 30.0
     loop: bool = False
     dry_run: bool = True
+    execution_scope: str = "full"
 
     def __post_init__(self) -> None:
         if (
@@ -308,6 +309,8 @@ class ReplayConfig:
             raise ValueError("loop and dry_run must be boolean")
         if self.loop:
             raise ValueError("loop replay is disabled; clear progress to run again")
+        if self.execution_scope not in {"full", "hands_only"}:
+            raise ValueError("execution_scope must be full or hands_only")
 
 
 class ReplaySequencer:
@@ -376,6 +379,7 @@ def main(args=None) -> None:
             self.declare_parameter("joint_source", "measured")
             self.declare_parameter("loop", False)
             self.declare_parameter("dry_run", True)
+            self.declare_parameter("execution_scope", "full")
             self._lock = threading.RLock()
             self._sample: ReplaySample | None = None
             self._sequencer: ReplaySequencer | None = None
@@ -415,6 +419,7 @@ def main(args=None) -> None:
                         float(self.get_parameter("frequency_hz").value),
                         bool(self.get_parameter("loop").value),
                         bool(self.get_parameter("dry_run").value),
+                        str(self.get_parameter("execution_scope").value),
                     ),
                     str(self.get_parameter("joint_source").value),
                 )
@@ -516,8 +521,12 @@ def main(args=None) -> None:
             with self._lock:
                 running = bool(
                     (
-                        message.ur_state == ControlStatus.UR_RUNNING
-                        and message.sharpa_state == ControlStatus.SHARPA_RUNNING
+                        message.sharpa_state == ControlStatus.SHARPA_RUNNING
+                        and (
+                            int(message.execution_scope)
+                            == int(ControlStatus.EXECUTION_SCOPE_HANDS_ONLY)
+                            or message.ur_state == ControlStatus.UR_RUNNING
+                        )
                     )
                     or message.execution_dry_run
                 )
@@ -549,22 +558,38 @@ def main(args=None) -> None:
             if (
                 sample is None
                 or sequencer is None
-                or self._ur_joint is None
                 or self._hand_joint is None
+                or (
+                    sequencer.config.execution_scope == "full"
+                    and self._ur_joint is None
+                )
             ):
-                raise RuntimeError("valid current UR and SharpA states are required")
+                required = (
+                    "SharpA"
+                    if sequencer is not None
+                    and sequencer.config.execution_scope == "hands_only"
+                    else "UR and SharpA"
+                )
+                raise RuntimeError(f"valid current {required} states are required")
             target_row = min(sequencer.next_row, sample.row_count - 1)
             arm_target = sample.arm_joint[target_row]
             hand_target = sample.hand_joint[target_row]
-            arm_delta = float(np.max(np.abs(arm_target - self._ur_joint)))
             hand_delta = float(np.max(np.abs(hand_target - self._hand_joint)))
-            steps = max(
-                math.ceil(arm_delta / 0.04), math.ceil(hand_delta / 0.08)
-            ) + 1
+            if sequencer.config.execution_scope == "hands_only":
+                steps = math.ceil(hand_delta / 0.08) + 1
+            else:
+                arm_delta = float(np.max(np.abs(arm_target - self._ur_joint)))
+                steps = max(
+                    math.ceil(arm_delta / 0.04), math.ceil(hand_delta / 0.08)
+                ) + 1
             if steps <= 1:
                 return None
             steps = min(300, int(steps))
-            arm = np.linspace(self._ur_joint, arm_target, steps, dtype=np.float32)
+            arm = (
+                np.repeat(arm_target[None, :], steps, axis=0).astype(np.float32)
+                if self._ur_joint is None
+                else np.linspace(self._ur_joint, arm_target, steps, dtype=np.float32)
+            )
             hand = np.linspace(self._hand_joint, hand_target, steps, dtype=np.float32)
             return {
                 **sequencer.next_identity(f"alignment_{sequencer.cycle}_{target_row}"),
@@ -691,6 +716,7 @@ def main(args=None) -> None:
                         body.get("frequency_hz", current.frequency_hz),
                         body.get("loop", current.loop),
                         body.get("dry_run", current.dry_run),
+                        str(body.get("execution_scope", current.execution_scope)),
                     )
                     self._load(
                         str(body.get("sample_dir") or self.get_parameter("sample_dir").value),
@@ -758,6 +784,7 @@ def main(args=None) -> None:
                     "frequency_hz": config.frequency_hz,
                     "loop": config.loop,
                     "dry_run": config.dry_run,
+                    "execution_scope": config.execution_scope,
                     "waiting_action_id": self._waiting_action_id,
                     "waiting_kind": self._waiting_kind,
                     "last_done": dict(self._last_done),

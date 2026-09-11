@@ -56,7 +56,7 @@
     .source-field { display: flex; align-items: center; min-width: 0; height: 42px; padding: 0 11px; border: 1px solid var(--line); border-radius: 9px; background: #07151a; color: var(--text); font-size: 12px; overflow: hidden; }
     .source-field input, .source-field select { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; }
     .source-field strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .replay-fields { display: grid; grid-template-columns: minmax(260px, 1fr) 112px 112px; gap: 8px; }
+    .replay-fields { display: grid; grid-template-columns: minmax(240px, 1fr) 150px 92px 92px; gap: 8px; }
     .source-number { gap: 7px; }
     .source-number span { flex: 0 0 auto; color: var(--muted); font: 700 9px ui-monospace, monospace; letter-spacing: .04em; text-transform: uppercase; }
     .source-number input { text-align: right; font-weight: 750; }
@@ -204,6 +204,32 @@
     @media (max-width: 1180px) { .status-grid { grid-template-columns: repeat(2, 1fr); } .wide-grid { grid-template-columns: 1fr; } }
     @media (max-width: 900px) { .replay-layout { grid-template-columns: 1fr; } .replay-config { border-right: 0; border-bottom: 1px solid var(--line); } .visual-grid { grid-template-columns: 1fr; } }
     @media (max-width: 780px) { .shell { width: min(100% - 22px, 1560px); margin-top: 18px; } header { align-items: start; flex-direction: column; } .header-actions { width: 100%; justify-content: space-between; } .source-grid, .machine-strip { grid-template-columns: 1fr; } .replay-fields { grid-template-columns: 1fr 1fr; } .replay-fields > :first-child { grid-column: 1 / -1; } .machine-actions { grid-template-columns: 1fr; } .camera-grid { grid-template-columns: 1fr; } .buffer-list { grid-template-columns: repeat(2, 1fr); } canvas { height: 390px; } }
+    .demo-section { padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 18px 0; }
+    .demo-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .demo-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .demo-actions button { appearance: none; border: 1px solid #31545b; border-radius: 6px; background: #0c2026; color: #e4edef; font: inherit; font-size: 13px; padding: 10px 14px; min-height: 40px; cursor: pointer; }
+    .demo-actions button[data-tone="go"] { border-color: #1cae98; background: #113c37; }
+    .demo-actions button[data-tone="stop"] { border-color: #d97777; background: #49272a; }
+    .demo-actions button[data-tone="delete"] { border-color: #a94b55; background: #35191d; color: #ffd9dc; }
+    .demo-actions button:hover { filter: brightness(1.2); }
+    .demo-actions button:disabled { opacity: .45; cursor: default; }
+    .demo-actions button:focus-visible { outline: 2px solid #5bdcba; outline-offset: 3px; }
+    .demo-layout { display: grid; grid-template-columns: minmax(0, 640px) minmax(180px, 1fr); gap: 24px; align-items: start; }
+    .demo-view { background: #14171b; aspect-ratio: 960 / 964; position: relative; max-height: 520px; width: 100%; }
+    .demo-view img { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .demo-view img[hidden] { display: none; }
+    .demo-empty { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; color: #d4dae0; text-align: center; }
+    .demo-empty[hidden] { display: none; }
+    .demo-details { min-width: 0; overflow-wrap: anywhere; }
+    .demo-details p { margin: 0 0 12px; line-height: 1.6; }
+    .demo-config { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; margin-bottom: 14px; }
+    .demo-root { display: flex; align-items: center; gap: 10px; min-width: 0; height: 42px; padding: 0 11px; border: 1px solid var(--line); border-radius: 9px; background: #07151a; }
+    .demo-root span { flex: 0 0 auto; color: var(--muted); font-size: 11px; font-weight: 750; }
+    .demo-root input { width: 100%; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); font: 12px ui-monospace, monospace; }
+    .demo-root input:disabled { color: var(--muted); }
+    .demo-root-note { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    #demoToggle { min-width: 116px; }
+    @media (max-width: 780px) { .demo-layout { grid-template-columns: minmax(0, 1fr); gap: 14px; } .demo-view { max-height: none; } .demo-config { grid-template-columns: 1fr; } .demo-root-note { white-space: normal; } }
     @media (max-width: 480px) { .status-grid { grid-template-columns: 1fr; } .segments { grid-template-columns: 1fr; } .buffer-list { grid-template-columns: 1fr; } }
   </style>
 </head>
@@ -227,7 +253,7 @@
       </article>
       <article class="panel source-card" id="replayCard">
         <div class="source-card-head"><div><h2>Replay 样本</h2><p>加载已记录的双臂与双手关节轨迹</p></div><span class="state-chip" id="replayChip">IDLE</span></div>
-        <div class="replay-fields"><div class="source-field"><input id="replaySample" aria-label="Replay 样本路径" value="/media/yns/T9/0824_yns_unscrew_cap/success/2026-08-24_16-01-44.683076"></div><label class="source-field source-number"><span>Chunk</span><input id="replaySteps" aria-label="Replay chunk size" type="number" min="1" max="1000" step="1" value="40"></label><label class="source-field source-number"><span>Hz</span><input id="replayFrequency" aria-label="Replay 执行频率" type="number" min="5" max="125" step="0.1" value="30"></label></div>
+        <div class="replay-fields"><div class="source-field"><input id="replaySample" aria-label="Replay 样本路径" value="/media/yns/T9/0824_yns_unscrew_cap/success/2026-08-24_16-01-44.683076"></div><label class="source-field source-number"><span>范围</span><select id="replayScope" aria-label="Replay 执行范围"><option value="full">机械臂 + 手部</option><option value="hands_only">仅手部</option></select></label><label class="source-field source-number"><span>Chunk</span><input id="replaySteps" aria-label="Replay chunk size" type="number" min="1" max="1000" step="1" value="40"></label><label class="source-field source-number"><span>Hz</span><input id="replayFrequency" aria-label="Replay 执行频率" type="number" min="5" max="125" step="0.1" value="30"></label></div>
         <div class="source-summary" id="replaySummary">路径 → 加载 → 使用下方统一机器控制</div>
         <div class="source-actions"><button id="replayLoad" onclick="loadReplay()">加载样本</button><button id="replayClear" onclick="clearReplay()">卸载样本</button></div>
       </article>
@@ -238,6 +264,15 @@
       <div class="machine-actions"><button id="machineReset" onclick="machineAction('reset_both')">机器复位</button><div class="machine-action-pair" aria-label="启动和停止"><button id="machineStart" data-tone="go" onclick="startSelectedExecution()">启动</button><button id="machineStop" data-tone="stop" onclick="stopSelectedExecution()">停止</button></div><button id="machinePreview" onclick="previewSelectedExecution()">预览</button><div class="machine-action-pair" aria-label="暂停和继续"><button id="machinePause" onclick="pauseSelectedExecution()">暂停</button><button id="machineContinue" data-tone="go" onclick="continueSelectedExecution()">继续</button></div></div>
     </section>
     <div class="feedback" id="feedback">选择 Policy 或 Replay，加载来源后使用统一机器控制。</div>
+
+    <section class="demo-section" aria-labelledby="demoTitle">
+      <div class="demo-head"><h2 class="block-title" id="demoTitle">Demo · RealSense D435</h2><div class="demo-actions"><span class="state-chip" id="demoState" role="status">未连接</span><button id="demoToggle" onclick="toggleDemo()" disabled>Demo 开始录制</button><button id="demoDelete" data-tone="delete" onclick="deleteDemo()" disabled>删除最近录制</button><button onclick="openDemoFullscreen()">全屏画面</button></div></div>
+      <div class="demo-config"><label class="demo-root"><span>录制目录</span><input id="demoRoot" aria-label="Demo 录制根目录" placeholder="/absolute/path" oninput="demoRootEdited=true"></label><span class="demo-root-note">自动创建当前时间命名的子文件夹</span></div>
+      <div class="demo-layout">
+        <div class="demo-view" id="demoView"><img id="demoImage" alt="D435 实时画面与双手十指触觉、关节平方和" hidden><div class="demo-empty" id="demoEmpty">等待 D435</div></div>
+        <div class="demo-details" aria-live="polite"><p id="demoCamera">D435 未连接</p><p id="demoProgress">尚未录制</p><p id="demoResult"></p><p id="demoError" role="alert"></p></div>
+      </div>
+    </section>
 
     <section class="status-grid">
       <article class="card"><h2>UR 双臂</h2><div class="value" id="urValue">等待状态</div><div class="detail" id="urDetail"></div></article>
@@ -281,6 +316,50 @@
   </div>
 
   <script>
+    let demoSnapshot={},demoBusy=false,demoFrameBusy=false,demoFrameUrl=null,demoRootEdited=false;
+    function paintDemo(){
+      const s=demoSnapshot,working=s.recording||s.saving;
+      document.getElementById('demoState').textContent=s.saving?'保存中':s.recording?'录制中':s.connected?'已连接':'未连接';
+      const button=document.getElementById('demoToggle');button.textContent=s.saving?'正在保存…':s.recording?'Demo 停止录制':'Demo 开始录制';button.disabled=demoBusy||s.saving||(!s.recording&&!s.connected);button.dataset.tone=s.recording?'stop':'go';
+      const root=document.getElementById('demoRoot');if(!demoRootEdited&&s.root)root.value=s.root;root.disabled=demoBusy||working;
+      const remove=document.getElementById('demoDelete');remove.disabled=demoBusy||working||!s.result?.path;
+      document.getElementById('demoCamera').textContent=s.connected?`${s.camera?.name||'D435'} · ${s.camera?.serial||''} · ${s.camera?.width||'--'}×${s.camera?.height||'--'} · ${s.camera?.fps||'--'} FPS · 实测 ${s.camera?.measured_fps??'--'} FPS`:(s.camera_error||'D435 未连接');
+      if(s.camera?.width&&s.camera?.height){document.getElementById('demoView').style.aspectRatio=`${s.camera.width} / ${s.camera.height}`;}
+      document.getElementById('demoProgress').textContent=working?`${Number(s.duration_s||0).toFixed(1)} 秒 · ${s.frames||0} 帧`:s.result?`已保存 · ${s.result.frames||0} 帧`:s.deleted_path?`最近录制已删除 · ${s.deleted_path}`:'尚未录制';
+      const result=s.result;document.getElementById('demoResult').textContent=result?`${result.complete?'数据完整':'数据存在缺失或异常'} · ${result.path}`:'';
+      const issues=[s.error,...(s.writer_errors||[]),...(result?.errors||[])];
+      if(result?.missing_topics?.length)issues.push(`缺失：${result.missing_topics.join(', ')}`);
+      if(result?.invalid_sources?.length)issues.push(`数据质量异常：${result.invalid_sources.join(', ')}`);
+      if(result?.invalid_overlay_frames)issues.push(`触觉或关节无效：${result.invalid_overlay_frames} 帧`);
+      const dropped=Object.values(s.dropped||result?.dropped||{}).reduce((a,b)=>a+b,0);if(dropped)issues.push(`丢帧：${dropped}`);
+      document.getElementById('demoError').textContent=issues.filter(Boolean).join(' · ');
+      if(!s.connected){document.getElementById('demoImage').hidden=true;document.getElementById('demoEmpty').hidden=false;document.getElementById('demoEmpty').textContent=s.camera_error||s.error||'等待 D435';}
+    }
+    async function refreshDemo(){
+      try{demoSnapshot=await requestJson('/api/demo/status')}catch(error){demoSnapshot={connected:false,error:error.message}}
+      paintDemo();setTimeout(refreshDemo,700);
+    }
+    async function toggleDemo(){
+      if(demoBusy)return;demoBusy=true;paintDemo();
+      const action=demoSnapshot.recording?'stop':'start',payload={action};if(action==='start'){payload.root=document.getElementById('demoRoot').value.trim();if(!payload.root){demoSnapshot.error='请填写绝对录制目录';demoBusy=false;paintDemo();return}}
+      try{demoSnapshot=await requestJson('/api/demo/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});demoRootEdited=false}
+      catch(error){demoSnapshot.error=error.message}finally{demoBusy=false;paintDemo()}
+    }
+    async function deleteDemo(){
+      const path=demoSnapshot.result?.path;if(demoBusy||!path||!window.confirm(`永久删除刚刚保存的 Demo？\n${path}`))return;demoBusy=true;paintDemo();
+      try{demoSnapshot=await requestJson('/api/demo/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'delete'})})}
+      catch(error){demoSnapshot.error=error.message}finally{demoBusy=false;paintDemo()}
+    }
+    async function refreshDemoFrame(){
+      if(demoSnapshot.connected&&!demoFrameBusy&&!document.hidden){
+        demoFrameBusy=true;
+        try{const response=await fetch('/api/demo/frame.jpg',{cache:'no-store'});if(!response.ok)throw new Error('D435 画面暂不可用');const url=URL.createObjectURL(await response.blob());const img=document.getElementById('demoImage');img.src=url;if(demoFrameUrl)URL.revokeObjectURL(demoFrameUrl);demoFrameUrl=url;img.hidden=false;document.getElementById('demoEmpty').hidden=true}
+        catch(error){document.getElementById('demoImage').hidden=true;document.getElementById('demoEmpty').hidden=false;document.getElementById('demoEmpty').textContent=error.message}
+        finally{demoFrameBusy=false}
+      }
+      setTimeout(refreshDemoFrame,100);
+    }
+    async function openDemoFullscreen(){try{await document.getElementById('demoView').requestFullscreen()}catch(error){document.getElementById('demoError').textContent=error.message}}
     const bufferNames={state:'机器人状态',tau:'关节力矩',wrench:'指尖六维力',deformation:'触觉形变'};
     const machineLabels={0:'已停止',1:'已复位',2:'部署中',3:'复位中',4:'启动准备中'};
     let latest={}; let commandBusy=false; let catalog=null; let selectedTask=null; let selectedRun=null; let launchOnPick=false;
@@ -311,7 +390,7 @@
       try{await requestJson('/api/server/select',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({server_id:modelServer.value})});catalog=null;selectedTask=null;selectedRun=null;modelSelection.innerHTML='<strong>尚未选择模型</strong>';setFeedback(`已切换模型 Server：${modelServer.options[modelServer.selectedIndex].textContent}`)}
       catch(error){setFeedback(error.message,true);await loadServers()}finally{commandBusy=false;await refresh()}
     }
-    function replayConfig(dryRun=false){return{sample_dir:replaySample.value.trim(),execution_steps:Number.parseInt(replaySteps.value,10),frequency_hz:Number(replayFrequency.value),joint_source:'measured',loop:false,dry_run:dryRun}}
+    function replayConfig(dryRun=false){return{sample_dir:replaySample.value.trim(),execution_steps:Number.parseInt(replaySteps.value,10),frequency_hz:Number(replayFrequency.value),joint_source:'measured',execution_scope:replayScope.value,loop:false,dry_run:dryRun}}
     async function runCommand(message,operation,success){
       if(commandBusy)return;commandBusy=true;paintControls();setFeedback(message);
       try{const result=await operation();setFeedback(typeof success==='function'?success(result):success)}
@@ -325,7 +404,7 @@
       const provider=latest.execution_provider||'policy';
       if(provider==='replay'){
         if(!replaySample.value.trim()){setFeedback('请填写 Replay 样本路径。',true);return}
-        await runCommand('正在通过 Actor IK 预览 Replay；UR / SharpA 仅校验并 ACK…',()=>requestJson('/api/replay/preview/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(replayConfig(true))}),result=>`Replay Actor 预览已开始 · execution ${String(result.execution_id||'').slice(0,8)}`);return
+        await runCommand(`正在通过 Actor 预览 Replay（${replayScope.value==='hands_only'?'仅手部':'机械臂 + 手部'}）…`,()=>requestJson('/api/replay/preview/start',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(replayConfig(true))}),result=>`Replay Actor 预览已开始 · execution ${String(result.execution_id||'').slice(0,8)}`);return
       }
       await machineAction('preview_deploy')
     }
@@ -383,16 +462,17 @@
 
     function paintControls(){
       const control=latest.control||{},ur=latest.ur||{},hand=latest.sharpa||{},model=latest.model||{},policy=latest.policy||{},replay=latest.replay||{},bias=latest.bias||{},provider=latest.execution_provider||'policy';
-      const resetting=bias.active===true||['requested','preparing','homing_ur','homing_sharpa','verifying'].includes(bias.phase),machineRunning=control.ur_state===2&&control.sharpa_state===1,machineStarting=control.execution_start_pending===true||control.ur_state===4||control.sharpa_state===4,executionDryRun=control.execution_dry_run===true,executionPaused=control.execution_paused===true,actorRunning=machineRunning||executionDryRun,actorActive=actorRunning&&!executionPaused,modelBusy=['starting','loading','stopping'].includes(model.phase),identityOk=policy.model_identity_ok===true,hardwareReady=ur.valid===true&&hand.left_valid===true&&hand.right_valid===true,replayActive=['playing','aligning'].includes(replay.state),replayPaused=replay.state==='paused',replayLocked=replayActive||replay.state==='stopping'||replay.preview_active===true||!!replay.waiting_action_id;
-      const replayPath=replaySample.value.trim(),loadedPath=String(replay.sample_dir||''),requestedSteps=Number.parseInt(replaySteps.value,10),requestedFrequency=Number(replayFrequency.value),replayConfigValid=Number.isInteger(requestedSteps)&&requestedSteps>=1&&requestedSteps<=1000&&Number.isFinite(requestedFrequency)&&requestedFrequency>=5&&requestedFrequency<=125,replayReady=['ready','paused'].includes(replay.state)&&replay.dry_run===false&&loadedPath===replayPath&&Number(replay.execution_steps)===requestedSteps&&Math.abs(Number(replay.frequency_hz)-requestedFrequency)<1e-6,sourceReady=provider==='policy'?(model.phase==='running'&&identityOk):replayReady,previewReady=provider==='policy'?(model.phase==='running'&&identityOk):Boolean(replayPath&&replayConfigValid&&replay.state!=='complete');
+      const selectedScope=replayScope.value,executionScope=control.execution_scope||'full',handsReady=hand.left_valid===true&&hand.right_valid===true,fullHardwareReady=ur.valid===true&&handsReady,hardwareReady=provider==='replay'&&selectedScope==='hands_only'?handsReady:fullHardwareReady;
+      const resetting=bias.active===true||['requested','preparing','homing_ur','homing_sharpa','verifying'].includes(bias.phase),machineRunning=control.sharpa_state===1&&(executionScope==='hands_only'||control.ur_state===2),machineStarting=control.execution_start_pending===true||control.ur_state===4||control.sharpa_state===4,executionDryRun=control.execution_dry_run===true,executionPaused=control.execution_paused===true,actorRunning=machineRunning||executionDryRun,actorActive=actorRunning&&!executionPaused,modelBusy=['starting','loading','stopping'].includes(model.phase),identityOk=policy.model_identity_ok===true,replayActive=['playing','aligning'].includes(replay.state),replayPaused=replay.state==='paused',replayLocked=replayActive||replay.state==='stopping'||replay.preview_active===true||!!replay.waiting_action_id;
+      const replayPath=replaySample.value.trim(),loadedPath=String(replay.sample_dir||''),requestedSteps=Number.parseInt(replaySteps.value,10),requestedFrequency=Number(replayFrequency.value),replayConfigValid=Number.isInteger(requestedSteps)&&requestedSteps>=1&&requestedSteps<=1000&&Number.isFinite(requestedFrequency)&&requestedFrequency>=5&&requestedFrequency<=125,replayReady=['ready','paused'].includes(replay.state)&&replay.dry_run===false&&loadedPath===replayPath&&Number(replay.execution_steps)===requestedSteps&&Math.abs(Number(replay.frequency_hz)-requestedFrequency)<1e-6&&String(replay.execution_scope||'full')===selectedScope,sourceReady=provider==='policy'?(model.phase==='running'&&identityOk):replayReady,previewReady=provider==='policy'?(model.phase==='running'&&identityOk):Boolean(replayPath&&replayConfigValid&&replay.state!=='complete');
       policyCard.classList.toggle('selected',provider==='policy');replayCard.classList.toggle('selected',provider==='replay');sourcePolicy.classList.toggle('active',provider==='policy');sourceReplay.classList.toggle('active',provider==='replay');sourcePolicy.disabled=commandBusy||actorRunning||replayLocked;sourceReplay.disabled=commandBusy||actorRunning||replayLocked;
       modelServer.disabled=commandBusy||modelBusy||actorRunning||model.phase==='running';modelSelect.disabled=commandBusy||modelBusy||actorRunning;modelStart.disabled=commandBusy||modelBusy||model.phase==='running'||actorRunning;modelStop.disabled=commandBusy||model.phase==='stopped';modelChip.textContent=model.phase==='starting'?'STARTING':model.phase==='loading'?'LOADING':model.phase==='running'?(identityOk?'READY':policy.model_identity_error?'MISMATCH':'VERIFYING'):(model.phase||'stopped').toUpperCase();
-      [replaySample,replaySteps,replayFrequency].forEach(input=>input.disabled=commandBusy||replayLocked||actorRunning);replayLoad.disabled=commandBusy||replayLocked||actorRunning||!replayPath||!replayConfigValid||replay.state==='complete';replayClear.disabled=commandBusy||(!replay.execution_id&&!replayActive&&!replay.preview_active);replayChip.textContent=replay.preview_active?'PREVIEW':(replay.state||'idle').toUpperCase();
+      [replaySample,replayScope,replaySteps,replayFrequency].forEach(input=>input.disabled=commandBusy||replayLocked||actorRunning);replayLoad.disabled=commandBusy||replayLocked||actorRunning||!replayPath||!replayConfigValid||replay.state==='complete';replayClear.disabled=commandBusy||(!replay.execution_id&&!replayActive&&!replay.preview_active);replayChip.textContent=replay.preview_active?'PREVIEW':(replay.state||'idle').toUpperCase();
       const canContinue=provider==='policy'?executionPaused:replayPaused,canStop=machineStarting||actorRunning||replayActive||replayPaused||(provider==='replay'&&replay.state==='complete');machineReset.classList.toggle('active',resetting);machineStart.classList.toggle('active',machineRunning&&!executionPaused);machinePreview.classList.toggle('active',executionDryRun&&!executionPaused);machinePause.classList.toggle('active',executionPaused||replayActive);machineContinue.classList.toggle('active',canContinue);machineStop.classList.toggle('active',!machineStarting&&!actorRunning&&!replayActive);machineReset.disabled=commandBusy||actorRunning||replayLocked;machineStart.disabled=commandBusy||resetting||machineStarting||actorRunning||replayPaused||!hardwareReady||!sourceReady;machinePreview.disabled=commandBusy||resetting||machineStarting||actorRunning||replayPaused||!hardwareReady||!previewReady;machinePause.disabled=commandBusy||!actorActive;machineContinue.disabled=commandBusy||!canContinue||!hardwareReady;machineStop.disabled=commandBusy||!canStop;
       machineChip.textContent=resetting?'RESETTING':machineStarting?'STARTING':executionPaused?'PAUSED':executionDryRun?'PREVIEW':machineRunning?'RUNNING':control.ur_state===1&&control.sharpa_state===3?'HOMED':'STOPPED';
       const policyIdentity=model.phase==='running'?(identityOk?'身份已校验':policy.model_identity_error||'等待身份校验'):'尚未加载';policySummary.textContent=[model.server_label,model.task,model.model&&model.run_id?`${model.model}:${model.run_id}`:'',policyIdentity].filter(Boolean).join(' · ');
-      const progress=replay.dry_run?(replay.preview_row||0):(replay.next_row||0),rowCount=Number(replay.row_count||0);replaySummary.textContent=replay.sample?[replay.sample,`${progress}/${rowCount} frames`,`chunk ${replay.execution_steps||0}`,`${Number(replay.frequency_hz||0).toFixed(1)} Hz 执行`,replay.dry_run?'预览模式':'真实执行轨迹',replay.error&&`ERROR ${replay.error}`].filter(Boolean).join(' · '):'路径 + Chunk + Hz → 加载 → 使用下方统一机器控制';
-      machineHint.textContent=commandBusy?'正在执行控制流程，请勿重复操作…':resetting?'正在等待机器复位完成…':machineStarting?'正在等待 SharpA POSITION 模式就绪，Actor 尚未获得执行权限…':!hardwareReady?'等待 UR 与 SharpA 有效状态…':executionPaused?'Actor 已暂停；当前 chunk 与 step 已保留，点击继续恢复':executionDryRun?`${provider==='replay'?'Replay':'Policy'} 正在 Actor 预览；硬件仅校验并 ACK`:machineRunning?`${provider==='replay'?'Replay':'Policy'} 正在真实执行`:replay.state==='complete'?'Replay 已完成；点击停止重置进度，已加载样本会保留':!sourceReady?(provider==='replay'?'请先加载当前 Replay 路径':'请先加载并校验 Policy 模型'):`${provider==='replay'?'Replay':'Policy'} 已就绪；可启动实机或先预览`;
+      const progress=replay.dry_run?(replay.preview_row||0):(replay.next_row||0),rowCount=Number(replay.row_count||0),scopeLabel=(replay.execution_scope||selectedScope)==='hands_only'?'仅手部 · UR 不发布命令':'机械臂 + 手部';replaySummary.textContent=replay.sample?[replay.sample,scopeLabel,`${progress}/${rowCount} frames`,`chunk ${replay.execution_steps||0}`,`${Number(replay.frequency_hz||0).toFixed(1)} Hz 执行`,replay.dry_run?'预览模式':'真实执行轨迹',replay.error&&`ERROR ${replay.error}`].filter(Boolean).join(' · '):'路径 + 执行范围 + Chunk + Hz → 加载 → 使用下方统一机器控制';
+      machineHint.textContent=commandBusy?'正在执行控制流程，请勿重复操作…':resetting?'正在等待机器复位完成…':machineStarting?'正在等待 SharpA POSITION 模式就绪，Actor 尚未获得执行权限…':!hardwareReady?(provider==='replay'&&selectedScope==='hands_only'?'等待 SharpA 双手有效状态…':'等待 UR 与 SharpA 有效状态…'):executionPaused?'Actor 已暂停；当前 chunk 与 step 已保留，点击继续恢复':executionDryRun?`${provider==='replay'?'Replay':'Policy'} 正在 Actor 预览；${executionScope==='hands_only'?'只校验手部命令':'硬件仅校验并 ACK'}`:machineRunning?`${provider==='replay'?'Replay':'Policy'} 正在真实执行${executionScope==='hands_only'?'（仅手部，UR 无命令）':''}`:replay.state==='complete'?'Replay 已完成；点击停止重置进度，已加载样本会保留':!sourceReady?(provider==='replay'?'请先加载当前 Replay 配置':'请先加载并校验 Policy 模型'):`${provider==='replay'?'Replay':'Policy'} 已就绪；可启动实机或先预览`;
       const traceDir=String((latest.prediction||{}).trace_dir||'');previewTrace.textContent=traceDir?`执行日志：${traceDir}`:'';previewTrace.title=traceDir;
     }
 
@@ -404,7 +484,7 @@
       if(provider==='replay'){sourceValueTitle.textContent='Replay 样本';executionValueTitle.textContent='Replay 执行';setValue('modelValue',replay.sample||'未加载',!!replay.sample);modelDetail.textContent=[replay.sample_dir,replay.duration_s!==undefined&&`duration ${replay.duration_s} s`,replay.dry_run?'DRY RUN':'LIVE EXECUTION',replay.joint_source].filter(Boolean).join('\n');const progress=replay.next_row||0;setValue('inferenceValue',`${progress} / ${replay.row_count||0}`,replay.preview_active===true||['playing','aligning','complete'].includes(replay.state));inferenceDetail.textContent=`${replay.state||'idle'} · ${Number(replay.frequency_hz||0).toFixed(1)} Hz\n${replay.last_done&&replay.last_done.action_id||'waiting'}`;outputTitle.textContent='输出 · Actor IK Replay 轨迹'}else{sourceValueTitle.textContent='远端模型';executionValueTitle.textContent='策略推理';const modelLabel=model.phase==='starting'?'模型启动中':model.phase==='loading'?'模型加载中':model.phase==='running'?(identityOk?'模型就绪':identityError?'模型错配':'身份校验中'):model.phase==='stopping'?'停止中':model.phase==='fault'?'启动失败':'未启动';const modelGood=model.phase==='running'&&identityOk;setValue('modelValue',modelLabel,modelGood?true:(model.phase==='fault'||!!identityError)?false:null);modelDetail.textContent=[model.server_label,model.task,model.model&&model.run_id?`${model.model}:${model.run_id}`:'',model.port?`remote port ${model.port}`:'',model.detail,['starting','loading'].includes(model.phase)?`elapsed ${elapsed.toFixed(1)} s`:'',identityError].filter(Boolean).join('\n');const count=Number(policy.inference_count||0);setValue('inferenceValue',`${count} 次`,policy.phase==='executing'||policy.phase==='ready');const latency=typeof policy.latency_s==='number'?`${(policy.latency_s*1000).toFixed(0)} ms`:'--';const requestId=policy.last_request_id===undefined?0:policy.last_request_id;inferenceDetail.textContent=`request ${requestId} · ${latency}\n${policy.phase||'waiting'}${policy.error?' · '+policy.error:''}`;outputTitle.textContent='输出 · Actor IK 模型轨迹'}
       const actorLatency=latest.actor_latency||{},latencySamples=Number(actorLatency.sample_count||0),currentChunkLatency=Number(actorLatency.current_latency_ms),averageChunkLatency=Number(actorLatency.average_latency_ms),hasChunkLatency=latencySamples>0&&Number.isFinite(currentChunkLatency)&&Number.isFinite(averageChunkLatency);
       setValue('chunkLatencyCurrent',hasChunkLatency?`${currentChunkLatency.toFixed(1)} ms`:'--',null);chunkLatencyAverage.textContent=hasChunkLatency?`平均 ${averageChunkLatency.toFixed(1)} ms · ${latencySamples} samples\nrequest ${actorLatency.previous_request_id} → ${actorLatency.current_request_id}`:(actorLatency.waiting_for_next_chunk?'当前 chunk 已完成，等待下一条 command':'平均 -- · 等待连续 chunk');
-      const allReady=ur.valid&&handsOk;overallText.textContent=control.execution_paused===true?'Actor 已暂停，等待继续':control.execution_dry_run===true?`${provider==='replay'?'Replay':'Policy'} 预览中`:control.ur_state===2?`${provider==='replay'?'Replay':'Policy'} 执行门已开启`:provider==='replay'?(replay.sample?'Replay 已加载，等待机器启动':'等待 Replay 样本'):model.phase==='starting'?'模型启动中':model.phase==='loading'?'模型加载中':model.phase==='running'&&!identityOk?'正在校验模型身份':model.phase==='running'?'模型就绪，等待机器启动':allReady?'硬件在线':'等待系统';overallDot.className='dot '+(allReady?'ok':ur.valid===false?'bad':'');
+      const handsOnly=control.execution_scope==='hands_only',allReady=(provider==='replay'&&replayScope.value==='hands_only')?handsOk:ur.valid&&handsOk,gateRunning=control.sharpa_state===1&&(handsOnly||control.ur_state===2);overallText.textContent=control.execution_paused===true?'Actor 已暂停，等待继续':control.execution_dry_run===true?`${provider==='replay'?'Replay':'Policy'} 预览中`:gateRunning?`${provider==='replay'?'Replay':'Policy'} 执行门已开启${handsOnly?'（仅手部）':''}`:provider==='replay'?(replay.sample?'Replay 已加载，等待机器启动':'等待 Replay 样本'):model.phase==='starting'?'模型启动中':model.phase==='loading'?'模型加载中':model.phase==='running'&&!identityOk?'正在校验模型身份':model.phase==='running'?'模型就绪，等待机器启动':allReady?'硬件在线':'等待系统';overallDot.className='dot '+(allReady?'ok':provider!=='replay'&&ur.valid===false?'bad':'');
     }
 
     function paintModelLog(){
@@ -459,7 +539,7 @@
       if(!freeze&&player.paused&&!player.stopped){player.startedAt+=now-player.pausedAt;player.paused=false;player.pausedAt=0;if(drawPrediction(now))predictionAnimation=requestAnimationFrame(animatePrediction)}
     }
     function syncPrediction(prediction){
-      const frames=Array.isArray(prediction.frames)?prediction.frames:[],key=predictionKey(prediction),control=latest.control||{},actorRunning=(control.ur_state===2&&control.sharpa_state===1)||control.execution_dry_run===true,paused=control.execution_paused===true;if(!frames.length){if(predictionAnimation)cancelAnimationFrame(predictionAnimation);predictionAnimation=0;predictionPlayer={key,frames:[],frequencyHz:1,startedAt:0,index:0,requestId:0,dryRun:false,paused:false,pausedAt:0,stopped:true};drawScene(outputCanvas,{},'等待 Actor IK 轨迹','ACTOR IK WRIST + HAND');outputStamp.textContent='等待 Actor 输出';return}if(key===predictionPlayer.key){syncPredictionPlayback(actorRunning,paused);return}
+      const frames=Array.isArray(prediction.frames)?prediction.frames:[],key=predictionKey(prediction),control=latest.control||{},actorRunning=(control.sharpa_state===1&&(control.execution_scope==='hands_only'||control.ur_state===2))||control.execution_dry_run===true,paused=control.execution_paused===true;if(!frames.length){if(predictionAnimation)cancelAnimationFrame(predictionAnimation);predictionAnimation=0;predictionPlayer={key,frames:[],frequencyHz:1,startedAt:0,index:0,requestId:0,dryRun:false,paused:false,pausedAt:0,stopped:true};drawScene(outputCanvas,{},'等待 Actor IK 轨迹','ACTOR IK WRIST + HAND');outputStamp.textContent='等待 Actor 输出';return}if(key===predictionPlayer.key){syncPredictionPlayback(actorRunning,paused);return}
       if(predictionAnimation)cancelAnimationFrame(predictionAnimation);predictionAnimation=0;const frequency=Number(prediction.frequency_hz),receivedAt=Number(prediction.received_at_unix_ms),age=Number.isFinite(receivedAt)?Math.max(0,Date.now()-receivedAt):0,now=performance.now(),frozen=!actorRunning||paused;predictionPlayer={key,frames,frequencyHz:Number.isFinite(frequency)&&frequency>0?frequency:1,startedAt:now-age,index:0,requestId:prediction.request_id,dryRun:prediction.dry_run===true,paused:frozen,pausedAt:frozen?now:0,stopped:!actorRunning};if(drawPrediction(now))predictionAnimation=requestAnimationFrame(animatePrediction)
     }
     function paintSkeletons(){const measured=latest.measured_motion||{},prediction=latest.prediction||{};drawScene(inputCanvas,measured,'等待机器人测量状态','CURRENT WRIST + HAND');inputStamp.textContent=measured.sample_count?`canonical · sample ${measured.sample_count}`:(measured.error?'FK 不可用':'等待硬件数据');syncPrediction(prediction)}
@@ -468,7 +548,7 @@
       try{latest=await requestJson('/api/status');paintControls();paintStatus();paintModelLog();paintCameras();paintBuffers();paintMetadata();paintSkeletons()}
       catch(error){overallText.textContent='Dashboard 断开';overallDot.className='dot bad';setFeedback(error.message,true)}
     }
-    window.addEventListener('resize',()=>{paintSkeletons();drawPrediction(performance.now())});loadServers();setInterval(refresh,500);refresh();
+    window.addEventListener('resize',()=>{paintSkeletons();drawPrediction(performance.now())});loadServers();setInterval(refresh,500);refresh();refreshDemo();refreshDemoFrame();
   </script>
 </body>
 </html>

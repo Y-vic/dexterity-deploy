@@ -92,8 +92,8 @@ namespace robots {
         public: int num_of_joints, num_free_parameters;
         Kinematics();
         ~Kinematics();
-        std::vector<float> forward(std::vector<float> joint_config);
-        std::vector<float> inverse(std::vector<float> ee_pose);
+        std::vector<double> forward(std::vector<double> joint_config);
+        std::vector<double> inverse(std::vector<double> ee_pose);
     };
     Kinematics::Kinematics() {
         #if IK_VERSION > 54
@@ -107,9 +107,9 @@ namespace robots {
         #endif
     }
     Kinematics::~Kinematics() { }
-    std::vector<float> Kinematics::forward(std::vector<float> joint_config) {
+    std::vector<double> Kinematics::forward(std::vector<double> joint_config) {
         IKREAL_TYPE eerot[9],eetrans[3];
-        std::vector<float> ee_pose;
+        std::vector<double> ee_pose;
 
         if( joint_config.size() != num_of_joints ) {
             printf("\nError: (forward kinematics) expects vector of %d values describing joint angles (in radians).\n\n", num_of_joints);
@@ -139,9 +139,9 @@ namespace robots {
 
         return ee_pose;
     }
-    std::vector<float> Kinematics::inverse(std::vector<float> ee_pose) {
+    std::vector<double> Kinematics::inverse(std::vector<double> ee_pose) {
         IKREAL_TYPE eerot[9],eetrans[3];
-        std::vector<float> joint_configs;
+        std::vector<double> joint_configs;
 
         if( ee_pose.size() == 7 )  // ik, given translation vector and quaternion pose
         {
@@ -164,14 +164,14 @@ namespace robots {
             double qx = ee_pose[4];
             double qy = ee_pose[5];
             double qz = ee_pose[6];
-            const double n = 1.0f/sqrt(qx*qx+qy*qy+qz*qz+qw*qw);
+            const double n = 1.0/sqrt(qx*qx+qy*qy+qz*qz+qw*qw);
             qw *= n;
             qx *= n;
             qy *= n;
             qz *= n;
-            eerot[0] = 1.0f - 2.0f*qy*qy - 2.0f*qz*qz;  eerot[1] = 2.0f*qx*qy - 2.0f*qz*qw;         eerot[2] = 2.0f*qx*qz + 2.0f*qy*qw;
-            eerot[3] = 2.0f*qx*qy + 2.0f*qz*qw;         eerot[4] = 1.0f - 2.0f*qx*qx - 2.0f*qz*qz;  eerot[5] = 2.0f*qy*qz - 2.0f*qx*qw;
-            eerot[6] = 2.0f*qx*qz - 2.0f*qy*qw;         eerot[7] = 2.0f*qy*qz + 2.0f*qx*qw;         eerot[8] = 1.0f - 2.0f*qx*qx - 2.0f*qy*qy;
+            eerot[0] = 1.0 - 2.0*qy*qy - 2.0*qz*qz;  eerot[1] = 2.0*qx*qy - 2.0*qz*qw;         eerot[2] = 2.0*qx*qz + 2.0*qy*qw;
+            eerot[3] = 2.0*qx*qy + 2.0*qz*qw;         eerot[4] = 1.0 - 2.0*qx*qx - 2.0*qz*qz;  eerot[5] = 2.0*qy*qz - 2.0*qx*qw;
+            eerot[6] = 2.0*qx*qz - 2.0*qy*qw;         eerot[7] = 2.0*qy*qz + 2.0*qx*qw;         eerot[8] = 1.0 - 2.0*qx*qx - 2.0*qy*qy;
 
             // For debugging, output the matrix
             /*

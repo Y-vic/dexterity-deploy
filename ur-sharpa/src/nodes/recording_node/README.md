@@ -1,5 +1,7 @@
 # recording_node（中文说明）
 
+部署网页的 D435/D435i Demo 录制是独立服务，保存原始 ROS bag、RGB 和十指信息叠加视频，新相机仅启用 RGB。启动参数、文件格式和指标定义见 [DEMO.md](DEMO.md)。
+
 ## 话题
 
 订阅 `/control/record_command`（`start`/`stop`）、`/ur/state`、`/sharpa/state`、`/sharpa/tau`、`/sharpa/wrench`、`/sharpa/deformation` 和 `/camera/set`；发布 `/control/record_status` JSON。普通话题 reliable depth=10；相机和 deformation 使用 best-effort depth=1。`/sharpa/state` 在同一反馈帧内携带实测 `q` 与最近一次成功交给 SharpA SDK 的完整 44 维 `q_cmd`；停止、来源切换、SDK 失败或单手命令都会使该命令失效。

@@ -150,13 +150,15 @@ FK → IK → FK 闭合实测精度（3000 个随机可达位姿）：
 
 | | median | p99 | max |
 | --- | --- | --- | --- |
-| 位置 | 3.0e-08 m | 5.8e-06 m | **1.3e-05 m** |
-| 旋转 | 7.3e-08 rad | 5.2e-07 rad | **1.3e-05 rad** |
+| 位置 | 6.5e-14 m | 2.3e-09 m | **6.4e-07 m** |
+| 旋转 | 6.8e-14 rad | 1.1e-09 rad | **8.8e-06 rad** |
 
-**达不到 1e-6 的 max，瓶颈是绑定层不是算法**：`ikfastpy.pyx` 声明的是 `vector[float]`，整个位姿以 float32 过 C++ 边界。已验证 `forward()` 输出恰好可被 float32 精确表示（截断误差 0.0），返回旋转的正交性误差约 5e-8，正是 float32 eps 量级。要做到 1e-6 得改成 `vector[double]` 重新生成绑定（见下方 TODO）。测试断言取在实测 max 之上一档（5e-05），没有进一步放宽。
+IKFast 的 C++ 内核和 Cython 包装层现在都使用 `double`。旧的
+`vector[float]` 会在解析分支边界附近丢掉当前连续解，甚至出现
+`IK(FK(q))` 只返回距离 q 约 2.47 rad 的另一构型。回归测试覆盖了
+真机 Vive 右臂上报过的该姿态。
 
 ## 6. TODO
 
-- `ikfastpy` 绑定是 float32（`vector[float]`），把 FK/IK 闭合精度限在 ~1.3e-05。改 `vector[double]` 重新生成可到 float64，但需要重编 `.so`，且要在真机上复核标定，暂未做。
 - `.so` 只有 cpython-310 一个构建产物，没有多版本 wheel。
 - `package.xml` 里 `python3-pinocchio` 按 rosdep 名字写；本机 pinocchio 实际装在 conda env 里，`colcon build` 前需确认解释器能 import。

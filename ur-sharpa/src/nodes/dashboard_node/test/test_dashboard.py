@@ -41,6 +41,7 @@ def test_dashboard_exposes_machine_and_model_controls():
         "replayClear",
         "replaySteps",
         "replayFrequency",
+        "replayScope",
         "cameraEgoState",
         "cameraLeftState",
         "cameraRightState",
@@ -53,8 +54,10 @@ def test_dashboard_exposes_machine_and_model_controls():
     assert DASHBOARD_ACTIONS == {
         "reset_both",
         "start_deploy",
+        "start_hands_deploy",
         "continue_deploy",
         "preview_deploy",
+        "preview_hands_deploy",
         "pause_deploy",
         "stop_deploy",
         "select_policy",
@@ -95,6 +98,8 @@ def test_dashboard_exposes_machine_and_model_controls():
     assert "/api/replay/preview/start" in page
     assert "execution_steps:Number.parseInt(replaySteps.value,10)" in page
     assert "frequency_hz:Number(replayFrequency.value)" in page
+    assert "execution_scope:replayScope.value" in page
+    assert '<option value="hands_only">仅手部</option>' in page
     assert "history ${history} · current ${current}" in page
     assert "/media/yns/T9/0824_yns_unscrew_cap/success/2026-08-24_16-01-44.683076" in page
 
@@ -263,12 +268,14 @@ def test_replay_command_validation_keeps_execution_parameters():
             "execution_steps": 40,
             "frequency_hz": 30,
             "joint_source": "measured",
+            "execution_scope": "hands_only",
             "loop": False,
             "dry_run": True,
         }
     )
     assert command["execution_steps"] == 40
     assert command["frequency_hz"] == 30.0
+    assert command["execution_scope"] == "hands_only"
     with pytest.raises(ValueError, match="frequency_hz"):
         validate_replay_command({**command, "frequency_hz": 0})
 
@@ -287,6 +294,34 @@ def test_live_replay_validation_always_disables_dry_run():
 
     assert command["action"] == "load"
     assert command["dry_run"] is False
+
+
+def test_replay_validation_rejects_unknown_execution_scope():
+    with pytest.raises(ValueError, match="execution_scope"):
+        validate_replay_command(
+            {
+                "action": "load",
+                "sample_dir": "/data/episode",
+                "execution_steps": 40,
+                "frequency_hz": 30,
+                "joint_source": "measured",
+                "execution_scope": "arms_only",
+                "loop": False,
+                "dry_run": False,
+            }
+        )
+
+
+def test_actor_execution_active_accepts_hands_only_gate_without_ur():
+    assert actor_execution_active(
+        {
+            "control": {
+                "ur_state": 0,
+                "sharpa_state": 1,
+                "execution_scope": "hands_only",
+            }
+        }
+    )
 
 
 def test_live_replay_loaded_config_matches_without_resetting_cursor():
@@ -383,6 +418,68 @@ def test_live_replay_launch_waits_for_each_gate_before_starting():
         ("replay", "load"),
         ("gate", "select_replay"),
         ("gate", "start_deploy"),
+        ("replay", "start"),
+    ]
+
+
+def test_hands_only_replay_opens_only_the_hands_gate():
+    state = DashboardState()
+    state.update("control", {"ur_state": 0, "sharpa_state": 0})
+    state.update(
+        "replay",
+        {
+            "state": "ready",
+            "execution_id": "hands-execution",
+            "sample_dir": "/data/episode",
+            "execution_steps": 40,
+            "frequency_hz": 30.0,
+            "joint_source": "measured",
+            "execution_scope": "hands_only",
+            "loop": False,
+            "dry_run": False,
+            "provider": "policy",
+            "machine_running": False,
+        },
+    )
+    events = []
+
+    def publish(command):
+        events.append(("replay", command["action"]))
+        replay = dict(state.snapshot()["replay"])
+        replay["state"] = "aligning"
+        state.update("replay", replay)
+
+    def forward(_url, action):
+        events.append(("gate", action))
+        replay = dict(state.snapshot()["replay"])
+        if action == "select_replay":
+            replay["provider"] = "replay"
+        elif action == "start_hands_deploy":
+            replay["machine_running"] = True
+        state.update("replay", replay)
+        return {"accepted": True}
+
+    result = launch_live_replay(
+        state,
+        "http://status/api/action",
+        publish,
+        {
+            "action": "load",
+            "sample_dir": "/data/episode",
+            "execution_steps": 40,
+            "frequency_hz": 30.0,
+            "joint_source": "measured",
+            "execution_scope": "hands_only",
+            "loop": False,
+            "dry_run": False,
+        },
+        forward=forward,
+    )
+
+    assert result["execution_id"] == "hands-execution"
+    assert events == [
+        ("gate", "select_replay"),
+        ("gate", "start_hands_deploy"),
         ("replay", "start"),
     ]
 

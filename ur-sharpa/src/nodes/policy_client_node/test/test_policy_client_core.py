@@ -5,12 +5,39 @@ from types import SimpleNamespace
 from policy_client_node.policy_client_node import (
     PolicyClientCore,
     PolicyRequestMetrics,
+    activate_reset_metadata,
     completion_belongs_to_session,
     deployment_ready,
     metadata_identity_error,
     summarize_metadata,
     validate_server_eef_contract,
 )
+
+
+def _metadata_format(format_id):
+    return {
+        "format_id": format_id,
+        "image": {},
+        "state": {"history_len": 0, "current": True},
+        "sensor": {},
+    }
+
+
+def test_reset_response_reactivates_trex_slow_format_for_request_zero():
+    metadata = {"metadata_format": _metadata_format("trex_fast_v1")}
+
+    activated = activate_reset_metadata(
+        metadata,
+        {"metadata_format": _metadata_format("trex_slow_v1")},
+    )
+
+    assert activated["metadata_format"]["format_id"] == "trex_slow_v1"
+    assert metadata["metadata_format"]["format_id"] == "trex_fast_v1"
+
+
+def test_reset_response_requires_an_explicit_metadata_format():
+    with pytest.raises(ValueError, match="missing metadata_format"):
+        activate_reset_metadata({}, {"reset": True})
 
 
 def action(session, request):

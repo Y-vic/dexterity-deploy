@@ -16,8 +16,9 @@ unique identity, and every chunk waits for a full identity-matched
 
 Dashboard commands are JSON on `/replay/command`: `load`, `start`, `pause`,
 `resume`, `stop`, and `unload`. Status is JSON on `/replay/status`. Dry run uses
-the same Actor IK chunk/ACK path as live execution, with hardware writes
-disabled by the execution gate. Pause retains the current cursor. Stop closes
+the same fixed-frequency Actor IK command path as live execution, with ACKs
+recorded as non-blocking diagnostics and hardware writes disabled by the
+execution gate. Pause retains the current cursor. Stop closes
 the gate and resets the cursor while retaining the validated sample in memory;
 unload additionally releases the sample and sequencer. A load that only changes
 execution settings reuses the same in-memory sample.

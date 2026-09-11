@@ -3,7 +3,7 @@ namespace robots {
         public: int num_of_joints, num_free_parameters;
         Kinematics();
         ~Kinematics();
-        std::vector<float> forward(std::vector<float> joint_config);
-        std::vector<float> inverse(std::vector<float> ee_pose);
+        std::vector<double> forward(std::vector<double> joint_config);
+        std::vector<double> inverse(std::vector<double> ee_pose);
     };
 }

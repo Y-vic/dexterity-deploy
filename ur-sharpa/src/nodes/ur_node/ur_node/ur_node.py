@@ -591,6 +591,7 @@ class UrNode(Node):
             success=bool(success),
             failure_code=str(failure_code),
             failure_message=str(failure_message),
+            result_publish_timestamp_ns=int(result.timestamp_ns),
         )
         self.last_command_acked = bool(success)
         self.last_command_message = "" if success else failure_message

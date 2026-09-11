@@ -6,17 +6,12 @@ stubbing the solver -- a faked result here would be worthless, since the point
 is to validate the real compiled UR5 chain.
 
 ACHIEVED TOLERANCE (measured, 3000 random reachable poses):
-    position   median 3.0e-08   p99 5.8e-06   max 1.3e-05  metres
-    rotation   median 7.3e-08   p99 5.2e-07   max 1.3e-05  rad
+    position   median 6.5e-14   p99 2.3e-09   max 6.4e-07  metres
+    rotation   median 6.8e-14   p99 1.1e-09   max 8.8e-06  rad
 
-The 1e-6 target is NOT reachable, and the limit is the binding, not the maths.
-`ikfastpy.pyx` declares `vector[float] forward(...)` / `inverse(...)`, i.e. the
-whole pose crosses the C++ boundary as float32. Verified: `forward()` output is
-exactly float32-representable (round-trip truncation error 0.0) and the returned
-rotation's orthonormality error is ~5e-8, which is float32 epsilon. Getting to
-1e-6 max would require regenerating the bindings with `vector[double]`.
-Assertions below sit just above the measured maximum; they are deliberately NOT
-loosened further.
+The bindings use float64 end to end. This matters near analytic branch
+boundaries: float32 rounding previously made IKFast omit the local solution
+even for IK(FK(q)), leaving only a remote shoulder/wrist branch.
 """
 
 from __future__ import annotations
@@ -39,8 +34,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Measured bounds plus a safety factor. See the module docstring.
-POS_TOL = 5.0e-05   # measured max 1.3e-05 m
-ROT_TOL = 5.0e-05   # measured max 1.3e-05 rad
+POS_TOL = 5.0e-05   # measured max 6.4e-07 m
+ROT_TOL = 5.0e-05   # measured max 8.8e-06 rad
 SIDES = ("left", "right")
 
 
@@ -79,7 +74,7 @@ def test_solver_is_six_dof(kin: UrCommonKinematics) -> None:
 
 def test_arm_fk_is_a_valid_transform(kin: UrCommonKinematics) -> None:
     t = kin.arm_fk(np.zeros(6))
-    # float32 bindings, so validate with a matching tolerance.
+    # Validate the rigid-transform contract independently of IK selection.
     assert t.shape == (4, 4)
     assert np.allclose(t[3], (0, 0, 0, 1))
     r = t[:3, :3]
@@ -124,9 +119,8 @@ def test_arm_fk_rtde_matches_arm_fk(kin: UrCommonKinematics) -> None:
         t = kin.arm_fk(q)
         rtde = kin.arm_fk_rtde(q)
         assert np.allclose(rtde[:3], t[:3, 3], atol=1.0e-12)
-        # arm_fk's rotation comes from the float32 bindings, so it is only
-        # orthonormal to ~3e-8. matrix_to_rotvec normalises via quaternion,
-        # which cleans that up slightly -- hence 1e-6, not 1e-9.
+        # matrix_to_rotvec normalises through a quaternion, so compare the
+        # equivalent reconstructed rotation rather than raw vector values.
         assert np.allclose(g.rotvec_to_matrix(rtde[3:]), t[:3, :3], atol=1.0e-6)
 
 
@@ -174,7 +168,8 @@ def test_fk_ik_fk_roundtrip_closure(kin: UrCommonKinematics) -> None:
         f"rotation closure max {rot.max():.3e} rad exceeds {ROT_TOL:.1e} "
         f"(median {np.median(rot):.3e})"
     )
-    # The float32 binding is the limiter, so the median should still be tiny.
+    # Typical closure should be near machine precision; rare analytic branch
+    # degeneracies account for the looser worst-case tolerance above.
     assert np.median(pos) < 1.0e-6
     assert np.median(rot) < 1.0e-6
 
@@ -192,6 +187,33 @@ def test_fk_ik_returns_exact_seed_when_seeded_at_solution(kin: UrCommonKinematic
         if np.allclose(solved, q, atol=1.0e-3):
             exact += 1
     assert exact > trials * 0.9, f"only {exact}/{trials} recovered the seed joints"
+
+
+def test_fk_ik_preserves_vive_branch_at_reported_float32_failure() -> None:
+    """Regression for the right-arm stutter observed near an IK branch edge.
+
+    With the old vector[float] wrapper, IK(FK(q)) returned four solutions but
+    omitted q's branch; the nearest result jumped 2.474 rad and was correctly
+    rejected as WRIST_FLIP_HOLD. A double-precision binding must recover q.
+    """
+    q = np.array([
+        -1.4261,
+        -1.4635,
+        -2.0773,
+        -2.7544,
+        -1.8597,
+        2.5286,
+    ])
+    local_kin = UrCommonKinematics(SafetyConfig(enable_flip_hold=True))
+    solved = local_kin.arm_ik(
+        local_kin.arm_fk(q),
+        q,
+        side="right",
+        ref_joint=q,
+    )
+
+    assert local_kin.solver("right").last_rejection is None
+    np.testing.assert_allclose(solved, q, atol=1.0e-7)
 
 
 @pytest.mark.parametrize("side", SIDES)

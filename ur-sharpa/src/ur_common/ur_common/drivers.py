@@ -1197,6 +1197,83 @@ class SharpADevicePair:
     def connected(self) -> bool:
         return set(self.hands) == set(SIDES)
 
+    def _fault_name(self, code: Any) -> str:
+        """Return the SDK FaultCode name without assuming pybind enum details."""
+        name = getattr(code, "name", None)
+        if name:
+            return str(name)
+        try:
+            value = int(code)
+        except (TypeError, ValueError):
+            return str(code)
+        fault_code_enum = getattr(self.sdk, "FaultCode", None)
+        if fault_code_enum is None:
+            return ""
+        for attr in dir(fault_code_enum):
+            if attr.startswith("_") or attr in {"name", "value"}:
+                continue
+            try:
+                if int(getattr(fault_code_enum, attr)) == value:
+                    return attr
+            except (TypeError, ValueError):
+                continue
+        return ""
+
+    def read_faults(self) -> dict[str, Any]:
+        """Read heartbeat and active faults for both hands.
+
+        Command return code 0 only acknowledges the SDK request.  These facts
+        come from the device heartbeat/fault channels and are therefore logged
+        separately from command completion.
+        """
+        sides: dict[str, dict[str, Any]] = {}
+        for side in SIDES:
+            payload: dict[str, Any] = {
+                "connected": side in self.hands,
+                "heartbeat_fault_code": None,
+                "heartbeat_fault_name": "",
+                "heartbeat_error_joint": None,
+                "active_faults": [],
+                "device_info_error": "",
+                "active_faults_error": "",
+            }
+            hand = self.hands.get(side)
+            if hand is None:
+                sides[side] = payload
+                continue
+            try:
+                info = hand.get_device_info()
+                status = getattr(info, "status", None)
+                fault_code = getattr(status, "error_code", None)
+                if fault_code is not None:
+                    fault_value = int(fault_code)
+                    payload["heartbeat_fault_code"] = fault_value
+                    payload["heartbeat_fault_name"] = self._fault_name(fault_value)
+                error_joint = getattr(status, "error_joint", None)
+                if error_joint is not None:
+                    payload["heartbeat_error_joint"] = int(error_joint)
+            except Exception as exc:
+                payload["device_info_error"] = str(exc)
+
+            get_fault_code = getattr(hand, "get_fault_code", None)
+            if callable(get_fault_code):
+                try:
+                    for code, indices in get_fault_code().items():
+                        fault_value = int(code)
+                        payload["active_faults"].append(
+                            {
+                                "code": fault_value,
+                                "name": self._fault_name(code),
+                                "indices": [int(index) for index in list(indices)],
+                            }
+                        )
+                except Exception as exc:
+                    payload["active_faults_error"] = str(exc)
+            else:
+                payload["active_faults_error"] = "get_fault_code unavailable"
+            sides[side] = payload
+        return {"fault_timestamp_ns": time.time_ns(), "sides": sides}
+
     # ---- tactile ------------------------------------------------------
     def _tactile_callback(self, side: str) -> Any:
         """Build the per-side SDK callback. It swallows every error on purpose.
@@ -1370,11 +1447,16 @@ class SharpADevicePair:
                 )
             for side in active:
                 command_started_ns = time.monotonic_ns()
-                report("sharpa_sdk_hand_command_started", side=side)
-                error = self.hands[side].set_joint_position(targets[side].tolist(), False)
+                report(
+                    "sharpa_sdk_hand_command_started",
+                    side=side,
+                    interpolation=True,
+                )
+                error = self.hands[side].set_joint_position(targets[side].tolist(), True)
                 report(
                     "sharpa_sdk_hand_command_completed",
                     side=side,
+                    interpolation=True,
                     duration_ms=(time.monotonic_ns() - command_started_ns)
                     / 1_000_000.0,
                     sdk_code=int(getattr(error, "code", -1)),
@@ -1431,7 +1513,7 @@ class SharpADevicePair:
                     for side in SIDES:
                         target = starts[side] + alpha * (targets[side] - starts[side])
                         error = self.hands[side].set_joint_position(
-                            target.tolist(), False
+                            target.tolist(), True
                         )
                         if getattr(error, "code", -1) != 0:
                             raise HardwareCommandError(
@@ -1482,7 +1564,7 @@ class SharpADevicePair:
                 measured = (
                     snapshot.left_joint if current_side == "left" else snapshot.right_joint
                 )
-                hand.set_joint_position(measured.tolist(), False)
+                hand.set_joint_position(measured.tolist(), True)
         except Exception:
             pass
 

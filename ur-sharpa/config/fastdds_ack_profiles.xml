@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <!--
+      These are deliberately non-default, exact-topic profiles.  Hardware ACK
+      writers keep ROS RELIABLE QoS and synchronous publication; only their
+      RTPS repair heartbeat changes from Fast DDS' 3 s default to 50 ms.
+    -->
+    <publisher profile_name="/ur/command_result">
+      <times>
+        <heartbeatPeriod>
+          <sec>0</sec>
+          <nanosec>50000000</nanosec>
+        </heartbeatPeriod>
+      </times>
+    </publisher>
+
+    <publisher profile_name="/sharpa/command_result">
+      <times>
+        <heartbeatPeriod>
+          <sec>0</sec>
+          <nanosec>50000000</nanosec>
+        </heartbeatPeriod>
+      </times>
+    </publisher>
+  </profiles>
+</dds>

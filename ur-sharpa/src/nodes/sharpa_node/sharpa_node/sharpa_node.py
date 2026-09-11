@@ -173,6 +173,7 @@ def main(args=None) -> None:
             self.create_subscription(ControlStatus, "/control/status", self._status, 10)
             self.create_subscription(Bool, "/hardware/stop", self._stop, 10)
             self.timer = self.create_timer(1.0 / 30.0, self._state)
+            self.fault_timer = self.create_timer(0.5, self._fault_state)
             self.reconnect_timer = self.create_timer(2.0, self._schedule_reconnect)
 
         def _refresh_control_error(self):
@@ -293,6 +294,23 @@ def main(args=None) -> None:
             deformation.left = array.array("B", np.asarray(raw.left_deformation, dtype=np.uint8).reshape(-1).tobytes()); deformation.right = array.array("B", np.asarray(raw.right_deformation, dtype=np.uint8).reshape(-1).tobytes())
             deformation.left_valid = np.asarray(raw.left_deformation_valid, dtype=bool).tolist(); deformation.right_valid = np.asarray(raw.right_deformation_valid, dtype=bool).tolist(); self.deformation_pub.publish(deformation)
 
+        def _fault_state(self):
+            """Publish device-side faults into the active Deploy event log."""
+            try:
+                with self._sdk_lock:
+                    snapshot = self.driver.read_faults()
+                message = String()
+                message.data = execution_event_json(
+                    "sharpa_node",
+                    "sharpa_fault_snapshot",
+                    device="sharpa",
+                    driver_error=str(self._driver_error),
+                    **snapshot,
+                )
+                self._execution_event_pub.publish(message)
+            except Exception as exc:
+                self.get_logger().warning(f"failed to publish SharpA faults: {exc}")
+
         def _command(self, command):
             result = HardwareCommandResult(); result.source = command.source; result.action_id = command.action_id; result.revision = command.revision; result.step_index = command.step_index; result.device = "sharpa"; result.timestamp_ns = time.time_ns()
             result.dry_run = bool(command.dry_run)
@@ -309,6 +327,7 @@ def main(args=None) -> None:
                     command_source = Source.UNKNOWN
                 if dry_run:
                     result.success = True
+                    result.timestamp_ns = time.time_ns()
                     self.result.publish(result)
                     self._result_event(command, result)
                     return
@@ -322,6 +341,7 @@ def main(args=None) -> None:
                         result.success = False
                         result.failure_code = "arbitration_rejected"
                         result.failure_message = decision.reason
+                        result.timestamp_ns = time.time_ns()
                         self.result.publish(result)
                         self._result_event(command, result)
                         return
@@ -369,6 +389,9 @@ def main(args=None) -> None:
                     success=False,
                     error=str(exc),
                 )
+            # Timestamp the actual DDS publish, not command receipt/SDK start.  The
+            # Actor can therefore distinguish SDK duration from DDS delivery delay.
+            result.timestamp_ns = time.time_ns()
             self.result.publish(result)
             self._result_event(command, result)
 
@@ -397,6 +420,7 @@ def main(args=None) -> None:
                 success=bool(result.success),
                 failure_code=str(result.failure_code),
                 failure_message=str(result.failure_message),
+                result_publish_timestamp_ns=int(result.timestamp_ns),
             )
 
         def destroy_node(self):

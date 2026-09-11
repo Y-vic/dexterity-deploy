@@ -1,6 +1,7 @@
 import json
 import numpy as np
 import pytest
+import threading
 from types import SimpleNamespace
 
 from actor_ik_node.actor_ik_node import (
@@ -12,6 +13,7 @@ from actor_ik_node.actor_ik_node import (
     SequentialPlanBuffer,
     execution_edges,
     limit_joint_target,
+    required_execution_devices,
     next_step_due,
 )
 from actor_ik_node.trajectory import (
@@ -19,6 +21,13 @@ from actor_ik_node.trajectory import (
     PreviewTraceWriter,
     build_trajectory_payload,
 )
+
+
+def test_hands_only_scope_excludes_ur_from_publish_and_ack_devices():
+    assert required_execution_devices("hands_only") == {"sharpa"}
+    assert required_execution_devices("full") == {"ur", "sharpa"}
+    with pytest.raises(ActorIkError, match="execution scope"):
+        required_execution_devices("arms_only")
 
 
 class FakeKinematics:
@@ -64,6 +73,10 @@ def test_joint_target_is_limited_against_measured_state():
 
 def test_next_step_due_enforces_requested_period():
     assert next_step_due(10.0, 20.0) == pytest.approx(10.05)
+    deadlines = [10.0]
+    for _ in range(300):
+        deadlines.append(next_step_due(deadlines[-1], 30.0))
+    assert deadlines[-1] == pytest.approx(20.0)
     with pytest.raises(ActorIkError, match="frequency_hz"):
         next_step_due(10.0, 0.0)
 
@@ -191,6 +204,79 @@ def test_execution_trace_covers_live_mode_and_external_events(tmp_path):
     assert final_state["missing_acks"] == ["sharpa"]
 
 
+def test_execution_trace_summarizes_nonblocking_ack_warnings(tmp_path):
+    writer = ExecutionTraceWriter(tmp_path)
+    writer.start(mode="live", provider="policy")
+    writer.event(
+        "hardware_command_result_received",
+        device="sharpa",
+        ack_delivery_latency_ms=128.5,
+        success=True,
+    )
+    writer.event(
+        "hardware_command_ack_late_warning",
+        missing_acks=["sharpa"],
+        requested_period_ms=1000.0 / 30.0,
+        execution_continued=True,
+    )
+    writer.event(
+        "late_hardware_command_ack",
+        device="sharpa",
+        ack_delivery_latency_ms=1602.0,
+        success=True,
+    )
+    path = writer.stop()
+
+    summary = json.loads((tmp_path / path.split("/")[-1] / "summary.json").read_text())
+    assert summary["ack_diagnostics"] == {
+        "late_warning_count": 1,
+        "late_ack_count": 1,
+        "max_delivery_latency_ms": 1602.0,
+    }
+
+
+def test_external_trace_queue_is_bounded_and_separate_from_control_log(
+    tmp_path, monkeypatch
+):
+    writer = ExecutionTraceWriter(tmp_path, external_event_queue_capacity=2)
+    path = writer.start(mode="live", provider="policy")
+    write_started = threading.Event()
+    allow_write = threading.Event()
+    original_append = writer._append_jsonl_at
+
+    def blocked_append(path, payload):
+        if path.name == "node_events.jsonl":
+            write_started.set()
+            assert allow_write.wait(timeout=1.0)
+        original_append(path, payload)
+
+    monkeypatch.setattr(writer, "_append_jsonl_at", blocked_append)
+    assert writer.record_external({"event": "node-0"})
+    assert write_started.wait(timeout=1.0)
+    assert writer.record_external({"event": "node-1"})
+    assert writer.record_external({"event": "node-2"})
+    assert not writer.record_external({"event": "node-3"})
+    writer.event(
+        "hardware_command_ack_late_warning",
+        missing_acks=["sharpa"],
+        execution_continued=True,
+    )
+    allow_write.set()
+    finished = writer.stop()
+
+    assert finished == path
+    run_dir = tmp_path / path.split("/")[-1]
+    assert "hardware_command_ack_late_warning" in (
+        run_dir / "events.jsonl"
+    ).read_text()
+    assert "node-0" in (run_dir / "node_events.jsonl").read_text()
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["external_trace_diagnostics"]["queue_capacity"] == 2
+    assert summary["external_trace_diagnostics"]["attempted_count"] == 4
+    assert summary["external_trace_diagnostics"]["pending_at_stop"] == 2
+    assert summary["external_trace_diagnostics"]["dropped_count"] == 3
+
+
 def test_execution_trace_retention_removes_oldest_completed_run(tmp_path):
     writer = ExecutionTraceWriter(tmp_path, max_runs=2)
     paths = []
@@ -275,6 +361,33 @@ def test_chunk_latency_tracks_current_and_session_average():
     assert second["current_latency_ms"] == pytest.approx(275.0)
     assert second["average_latency_ms"] == pytest.approx(200.0)
     assert second["sample_count"] == 2
+
+
+def test_chunk_latency_excludes_the_normal_command_period():
+    tracker = ChunkLatencyTracker()
+    tracker.ensure_context(session_id="session", provider="policy")
+    final_command_deadline = 10.0
+    next_command_deadline = next_step_due(final_command_deadline, 30.0)
+    tracker.mark_chunk_complete(
+        session_id="session",
+        provider="policy",
+        request_id=0,
+        action_id="chunk-0",
+        revision=0,
+        completed_at_ns=int(next_command_deadline * 1_000_000_000),
+    )
+
+    sample = tracker.mark_next_command_published(
+        session_id="session",
+        provider="policy",
+        request_id=1,
+        action_id="chunk-1",
+        revision=0,
+        published_at_ns=int((next_command_deadline + 0.0008) * 1_000_000_000),
+    )
+
+    assert sample is not None
+    assert sample["current_latency_ms"] == pytest.approx(0.8, abs=1e-5)
 
 
 def test_chunk_latency_requires_next_identity_and_resets_context():

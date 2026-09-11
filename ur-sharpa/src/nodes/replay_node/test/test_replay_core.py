@@ -161,3 +161,5 @@ def test_config_rejects_unsafe_values():
         ReplayConfig(execution_steps=1.5)
     with pytest.raises(ValueError, match="boolean"):
         ReplayConfig(loop="false")
+    with pytest.raises(ValueError, match="execution_scope"):
+        ReplayConfig(execution_scope="arms_only")

@@ -98,14 +98,24 @@ class FakeHand:
     def __init__(self):
         self.angles = np.zeros(22, dtype=np.float32)
         self.commands = []
+        self.interpolation_modes = []
 
     def get_states(self):
         return SimpleNamespace(angles=self.angles, torques=np.zeros(22))
 
-    def set_joint_position(self, target, _interpolate):
+    def set_joint_position(self, target, interpolate):
         self.commands.append(np.asarray(target, dtype=np.float64))
+        self.interpolation_modes.append(bool(interpolate))
         self.angles = np.asarray(target, dtype=np.float32)
         return SimpleNamespace(code=0, message="")
+
+    def get_device_info(self):
+        return SimpleNamespace(
+            status=SimpleNamespace(error_code=0x0241, error_joint=7)
+        )
+
+    def get_fault_code(self):
+        return {0x0503: [7, 9]}
 
 
 class FakeControlledHand(FakeHand):
@@ -401,6 +411,36 @@ def test_sharpa_slews_large_live_target_instead_of_rejecting_it():
     np.testing.assert_allclose(driver.hands["right"].commands[-1], -0.5)
     np.testing.assert_allclose(dispatched["left"], 0.5)
     np.testing.assert_allclose(dispatched["right"], -0.5)
+    assert driver.hands["left"].interpolation_modes[-1] is True
+    assert driver.hands["right"].interpolation_modes[-1] is True
+
+
+def test_sharpa_fault_snapshot_keeps_heartbeat_and_active_faults_per_side():
+    driver = SharpADevicePair(sdk_root="/unused", enable_control=True)
+    driver.sdk = SimpleNamespace(
+        FaultCode=SimpleNamespace(
+            ERROR_POWER_HAND_OVERCURRENT=0x0241,
+            ERROR_TORQUE_LIMIT_EXCEEDED=0x0503,
+        )
+    )
+    driver.hands = {side: FakeHand() for side in ("left", "right")}
+
+    snapshot = driver.read_faults()
+
+    assert snapshot["fault_timestamp_ns"] > 0
+    for side in ("left", "right"):
+        payload = snapshot["sides"][side]
+        assert payload["connected"] is True
+        assert payload["heartbeat_fault_code"] == 0x0241
+        assert payload["heartbeat_fault_name"] == "ERROR_POWER_HAND_OVERCURRENT"
+        assert payload["heartbeat_error_joint"] == 7
+        assert payload["active_faults"] == [
+            {
+                "code": 0x0503,
+                "name": "ERROR_TORQUE_LIMIT_EXCEEDED",
+                "indices": [7, 9],
+            }
+        ]
 
 
 def test_sharpa_command_reports_each_blocking_sdk_stage():

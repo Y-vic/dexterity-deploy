@@ -62,6 +62,10 @@ def _common_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
         _argument("camera_shm_prefix", "ur_sharpa_camera_v1"),
         _argument("camera_shm_bytes", "4194304"),
         _argument("bias_file", "~/.config/ur_sharpa/teleop_bias.json"),
+        _argument(
+            "fastdds_ack_profiles_file",
+            str(workspace_root / "config" / "fastdds_ack_profiles.xml"),
+        ),
         _argument("interface_path", str(workspace_root.parent / "interface")),
         _argument("manus_python_path", str(external_root / "manus-python")),
         _argument(
@@ -97,6 +101,15 @@ def _environment() -> list[SetEnvironmentVariable]:
         SetEnvironmentVariable(
             "UR_SHARPA_PYTHON_PATHS", LaunchConfiguration("hardware_python_paths")
         ),
+        SetEnvironmentVariable(
+            "FASTDDS_DEFAULT_PROFILES_FILE",
+            LaunchConfiguration("fastdds_ack_profiles_file"),
+        ),
+        # Keep rmw_fastrtps' existing history memory, synchronous publication,
+        # and data-sharing behavior.  The XML contains only exact-topic writer
+        # timing profiles; enabling full XML QoS would change unrelated topics.
+        SetEnvironmentVariable("RMW_FASTRTPS_USE_QOS_FROM_XML", "0"),
+        SetEnvironmentVariable("UR_SHARPA_FASTDDS_HEARTBEAT_MS", "50"),
     ]
 
 
@@ -337,6 +350,12 @@ def _teleop_nodes() -> list[Node]:
 def _deploy_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
     return [
         _argument("dashboard_port", "8088"),
+        _argument("demo_port", "8089"),
+        _argument("demo_camera_serial", ""),
+        _argument("demo_camera_width", "1920"),
+        _argument("demo_camera_height", "1080"),
+        _argument("demo_camera_fps", "30"),
+        _argument("demo_recording_root", str(workspace_root / "demo_recordings")),
         _argument(
             "model_server_config",
             str(workspace_root / "config" / "model_servers.json"),
@@ -370,6 +389,23 @@ def _deploy_nodes() -> list[Node]:
             parameters=[{
                 "port": ParameterValue(LaunchConfiguration("dashboard_port"), value_type=int),
                 "model_server_config": LaunchConfiguration("model_server_config"),
+                "demo_api_url": ["http://127.0.0.1:", LaunchConfiguration("demo_port")],
+            }],
+        ),
+        Node(
+            package="recording_node",
+            executable="demo_node",
+            name="demo_node",
+            output="screen",
+            parameters=[{
+                "port": ParameterValue(LaunchConfiguration("demo_port"), value_type=int),
+                "serial": ParameterValue(LaunchConfiguration("demo_camera_serial"), value_type=str),
+                "width": ParameterValue(LaunchConfiguration("demo_camera_width"), value_type=int),
+                "height": ParameterValue(LaunchConfiguration("demo_camera_height"), value_type=int),
+                "fps": ParameterValue(LaunchConfiguration("demo_camera_fps"), value_type=int),
+                "root": LaunchConfiguration("demo_recording_root"),
+                "shared_memory_prefix": LaunchConfiguration("camera_shm_prefix"),
+                "left_wrist_serial": ParameterValue(LaunchConfiguration("left_wrist_serial"), value_type=str),
             }],
         ),
         Node(

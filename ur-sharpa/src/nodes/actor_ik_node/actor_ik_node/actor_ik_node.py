@@ -7,9 +7,12 @@ messages and publishes one terminal ExecutionDone for every received action.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
+import shutil
 import time
 from typing import Any
 
@@ -20,7 +23,19 @@ from .trajectory import ExecutionTraceWriter, build_trajectory_payload
 
 ARM_MAX_STEP_RAD = 0.25
 HAND_MAX_STEP_RAD = 0.4
-HARDWARE_ACK_TIMEOUT_S = 1.5
+ACK_OBSERVATION_RETENTION_S = 5.0
+ACK_OBSERVATION_HISTORY = 256
+CONTROL_TIMER_PERIOD_S = 0.001
+
+
+def required_execution_devices(execution_scope: str) -> frozenset[str]:
+    """Return devices commanded by Actor and observed for diagnostic ACKs."""
+    scope = str(execution_scope).strip().lower()
+    if scope == "hands_only":
+        return frozenset({"sharpa"})
+    if scope == "full":
+        return frozenset({"ur", "sharpa"})
+    raise ActorIkError(f"unsupported execution scope {execution_scope!r}")
 
 
 @dataclass(frozen=True)
@@ -47,7 +62,7 @@ class SequentialPlanBuffer:
     Admission and execution are deliberately separate: an action may be
     planned and buffered while the current chunk is still moving, but it is
     not promoted to ``current`` until ``finish_current`` is called after the
-    current chunk's final hardware acknowledgements.
+    current chunk's final command has been published.
     """
 
     def __init__(self) -> None:
@@ -109,7 +124,7 @@ class SequentialPlanBuffer:
 
 
 class ChunkLatencyTracker:
-    """Measure the command gap between consecutive executed chunks."""
+    """Measure extra idle time between consecutive executed chunks."""
 
     SCHEMA = "sharpa.actor_ik.chunk_latency.v1"
 
@@ -287,16 +302,17 @@ def limit_joint_target(current: Any, target: Any, max_delta: float) -> np.ndarra
     return current_array + delta
 
 
-def next_step_due(published_at: float, frequency_hz: float) -> float:
+def next_step_due(scheduled_deadline: float, frequency_hz: float) -> float:
+    """Advance an absolute command deadline by exactly one requested period."""
     if not np.isfinite(frequency_hz) or frequency_hz <= 0.0:
         raise ActorIkError("frequency_hz must be finite and positive")
-    return float(published_at) + 1.0 / float(frequency_hz)
+    return float(scheduled_deadline) + 1.0 / float(frequency_hz)
 
 
 def execution_edges(
     execute_length: int, rtc: int, executed_in_slice: int
 ) -> tuple[bool, bool]:
-    """Return ``(execute_fetch, execute_done)`` after one acknowledged step."""
+    """Return ``(execute_fetch, execute_done)`` after one published step."""
 
     length = int(execute_length)
     rtc_steps = int(rtc)
@@ -395,6 +411,7 @@ def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
     from ur_msgs.msg import (
         ActorTrajectory,
@@ -425,6 +442,7 @@ def main(args=None) -> None:
             self.declare_parameter(
                 "execution_log_max_total_bytes", 5 * 1024 * 1024 * 1024
             )
+            self.declare_parameter("execution_log_external_queue_capacity", 64)
             self._kin = UrCommonKinematics(config=SafetyConfig.v1_defaults())
             self._core = ActorIkCore(self._kin)
             self._left = np.zeros(6, dtype=np.float32)
@@ -443,14 +461,19 @@ def main(args=None) -> None:
             )
             self._latency = ChunkLatencyTracker()
             self._plans = SequentialPlanBuffer()
-            self._pending = {}
+            # ACKs are diagnostics only.  Entries here never gate scheduling,
+            # action completion, or the execution state machine.
+            self._ack_observations = {}
+            self._recent_ack_warnings = OrderedDict()
             self._active = None
             self._active_fetch_sent = False
             self._scheduled = None
+            self._next_chunk_due = None
             self._execution_provider = "policy"
             self._machine_running = False
             self._execution_paused = False
             self._execution_dry_run = False
+            self._execution_scope = "full"
             self._pause_started = None
             self._held_completion = None
             # STOP clears Actor-owned statistics immediately, but deliberately
@@ -465,6 +488,11 @@ def main(args=None) -> None:
                 max_runs=int(self.get_parameter("execution_log_max_runs").value),
                 max_total_bytes=int(
                     self.get_parameter("execution_log_max_total_bytes").value
+                ),
+                external_event_queue_capacity=int(
+                    self.get_parameter(
+                        "execution_log_external_queue_capacity"
+                    ).value
                 ),
             )
             self.create_subscription(
@@ -486,12 +514,6 @@ def main(args=None) -> None:
                 10,
             )
             self.create_subscription(
-                String,
-                "/deploy/execution_event",
-                self._external_event,
-                100,
-            )
-            self.create_subscription(
                 ControlStatus, "/control/status", self._control_status, 10
             )
             self.create_subscription(UrStateFrame, "/ur/state", self._ur_state, 10)
@@ -509,7 +531,24 @@ def main(args=None) -> None:
                 lambda message: self._ack(message, "sharpa"),
                 10,
             )
-            self._watchdog = self.create_timer(0.005, self._process)
+            diagnostic_qos = QoSProfile(
+                depth=8,
+                history=HistoryPolicy.KEEP_LAST,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+            )
+            # ACK subscriptions are deliberately created first so their
+            # diagnostic latency remains representative.  They never gate the
+            # command schedule.
+            self.create_subscription(
+                String,
+                "/deploy/execution_event",
+                self._external_event,
+                diagnostic_qos,
+            )
+            # Absolute deadlines prevent timer jitter from accumulating into a
+            # lower command frequency.  The 1 ms timer bounds normal wake-up
+            # quantisation without changing the requested command period.
+            self._watchdog = self.create_timer(CONTROL_TIMER_PERIOD_S, self._process)
 
         def _provider_update(self, message):
             provider = str(message.data).strip().lower()
@@ -534,14 +573,31 @@ def main(args=None) -> None:
                 payload = json.loads(message.data or "{}")
                 if not isinstance(payload, dict) or not payload.get("event"):
                     raise ValueError("execution event must be a JSON object with event")
-                self._trace.record(payload)
+                received_monotonic_ns = time.monotonic_ns()
+                published_monotonic_ns = int(payload.get("monotonic_ns") or 0)
+                payload["trace_collector_received_monotonic_ns"] = received_monotonic_ns
+                if published_monotonic_ns > 0:
+                    payload["trace_delivery_latency_ms"] = max(
+                        0.0,
+                        (received_monotonic_ns - published_monotonic_ns) / 1_000_000.0,
+                    )
+                self._trace.record_external(payload)
             except Exception as exc:
                 self.get_logger().warning(f"invalid deploy execution event: {exc}")
 
         def _control_status(self, message):
+            execution_scope = (
+                "hands_only"
+                if int(message.execution_scope)
+                == int(ControlStatus.EXECUTION_SCOPE_HANDS_ONLY)
+                else "full"
+            )
             live_running = bool(
-                message.ur_state == ControlStatus.UR_RUNNING
-                and message.sharpa_state == ControlStatus.SHARPA_RUNNING
+                message.sharpa_state == ControlStatus.SHARPA_RUNNING
+                and (
+                    execution_scope == "hands_only"
+                    or message.ur_state == ControlStatus.UR_RUNNING
+                )
             )
             dry_run = bool(message.execution_dry_run)
             running = bool(live_running or dry_run)
@@ -549,13 +605,17 @@ def main(args=None) -> None:
             mode_changed = bool(
                 self._machine_running
                 and running
-                and dry_run != self._execution_dry_run
+                and (
+                    dry_run != self._execution_dry_run
+                    or execution_scope != self._execution_scope
+                )
             )
             started = bool(not self._machine_running and running)
             if self._machine_running and (not running or mode_changed):
                 final_state = {
                     "provider": self._execution_provider,
                     "mode": "preview" if self._execution_dry_run else "live",
+                    "execution_scope": self._execution_scope,
                     "active_action": self._active,
                     "buffered_action": (
                         None
@@ -570,7 +630,7 @@ def main(args=None) -> None:
                         if self._scheduled is not None
                         else None
                     ),
-                    "pending_steps": [
+                    "ack_observations": [
                         {
                             "session_id": str(value["action"].session_id),
                             "request_id": int(value["action"].request_id),
@@ -578,13 +638,15 @@ def main(args=None) -> None:
                             "revision": key[1],
                             "step_index": key[2],
                             "received_acks": sorted(value["acks"]),
-                            "missing_acks": sorted({"ur", "sharpa"} - value["acks"]),
+                            "missing_acks": sorted(
+                                value["required_acks"] - value["acks"]
+                            ),
                             "pending_ms": (
                                 time.monotonic() - float(value["started"])
                             )
                             * 1000.0,
                         }
-                        for key, value in self._pending.items()
+                        for key, value in self._ack_observations.items()
                     ],
                 }
                 self._execution_paused = False
@@ -609,6 +671,42 @@ def main(args=None) -> None:
                         mode="preview" if dry_run else "live",
                         provider=self._execution_provider,
                     )
+                    self._trace.event(
+                        "execution_scope_selected",
+                        node="actor_ik_node",
+                        execution_scope=execution_scope,
+                    )
+                    self._trace.event(
+                        "dds_runtime_configuration",
+                        node="actor_ik_node",
+                        rmw_implementation=os.environ.get(
+                            "RMW_IMPLEMENTATION", "rmw_fastrtps_cpp(default)"
+                        ),
+                        fastdds_profiles_file=os.environ.get(
+                            "FASTDDS_DEFAULT_PROFILES_FILE", ""
+                        ),
+                        rmw_use_qos_from_xml=os.environ.get(
+                            "RMW_FASTRTPS_USE_QOS_FROM_XML", ""
+                        ),
+                        heartbeat_period_ms=os.environ.get(
+                            "UR_SHARPA_FASTDDS_HEARTBEAT_MS", "unknown"
+                        ),
+                        shm_port_queue_capacity=os.environ.get(
+                            "UR_SHARPA_FASTDDS_SHM_QUEUE_CAPACITY", "unknown"
+                        ),
+                    )
+                    disk = shutil.disk_usage(self._trace.root)
+                    self._trace.event(
+                        "trace_storage_status",
+                        node="actor_ik_node",
+                        trace_root=str(self._trace.root),
+                        filesystem_total_bytes=int(disk.total),
+                        filesystem_used_bytes=int(disk.used),
+                        filesystem_free_bytes=int(disk.free),
+                        retention_days=int(self._trace.retention_days),
+                        max_runs=int(self._trace.max_runs),
+                        max_total_bytes=int(self._trace.max_total_bytes),
+                    )
                     self.get_logger().info(f"execution trace started: {path}")
                 except Exception as exc:
                     self.get_logger().error(f"execution trace unavailable: {exc}")
@@ -621,14 +719,18 @@ def main(args=None) -> None:
             elif running and self._execution_paused and not paused:
                 now = time.monotonic()
                 pause_duration = max(0.0, now - float(self._pause_started or now))
-                for pending in self._pending.values():
-                    pending["started"] += pause_duration
+                for observation in self._ack_observations.values():
+                    observation["started"] += pause_duration
+                    observation["warning_deadline"] += pause_duration
+                    observation["expires_at"] += pause_duration
                 if self._scheduled is not None:
                     self._scheduled["due"] = (
                         now
                         if self._scheduled["due"] is None
                         else self._scheduled["due"] + pause_duration
                     )
+                elif self._next_chunk_due is not None:
+                    self._next_chunk_due += pause_duration
                 self._execution_paused = False
                 self._pause_started = None
                 self._latency.resume(time.monotonic_ns())
@@ -641,6 +743,7 @@ def main(args=None) -> None:
                 self._release_held_completion()
             self._machine_running = running
             self._execution_dry_run = dry_run
+            self._execution_scope = execution_scope
             if started and self._latency_monitor_clear_pending:
                 self._publish_latency()
                 self._latency_monitor_clear_pending = False
@@ -653,6 +756,7 @@ def main(args=None) -> None:
                 final_state={
                     "provider": self._execution_provider,
                     "mode": "preview" if self._execution_dry_run else "live",
+                    "execution_scope": self._execution_scope,
                     "active_action": self._active,
                     "buffered_action": (
                         None
@@ -662,7 +766,7 @@ def main(args=None) -> None:
                             int(self._plans.next.action.revision),
                         )
                     ),
-                    "pending_step_count": len(self._pending),
+                    "ack_observation_count": len(self._ack_observations),
                 },
             )
             if path:
@@ -687,19 +791,26 @@ def main(args=None) -> None:
                 return
             self._held_completion = None
             self._finish_action(
-                held["action"], held["success"], held["steps"], held["error"]
+                held["action"],
+                held["success"],
+                held["steps"],
+                held["error"],
+                next_due=held["next_due"],
             )
 
-        def _complete_or_hold(self, action, success, steps, error=""):
+        def _complete_or_hold(
+            self, action, success, steps, error="", *, next_due=None
+        ):
             if self._execution_paused:
                 self._held_completion = {
                     "action": action,
                     "success": bool(success),
                     "steps": int(steps),
                     "error": str(error),
+                    "next_due": next_due,
                 }
                 return
-            self._finish_action(action, success, steps, error)
+            self._finish_action(action, success, steps, error, next_due=next_due)
 
         @staticmethod
         def _same_action(left, right):
@@ -710,7 +821,9 @@ def main(args=None) -> None:
                 and int(left.revision) == int(right.revision)
             )
 
-        def _finish_action(self, action, success, steps, error=""):
+        def _finish_action(
+            self, action, success, steps, error="", *, next_due=None
+        ):
             current = self._plans.current
             if current is None or not self._same_action(current.action, action):
                 self.get_logger().error(
@@ -733,7 +846,9 @@ def main(args=None) -> None:
                     execute_fetch=fetch_at_done,
                 )
                 if promoted is not None:
-                    self._activate_current()
+                    self._activate_current(first_due=next_due)
+                else:
+                    self._next_chunk_due = next_due
                 return
 
             dropped = self._plans.clear()
@@ -760,12 +875,13 @@ def main(args=None) -> None:
                 executed_steps = int(action.execute_start) + int(
                     self._scheduled["step"]
                 )
-            elif self._pending:
-                pending = next(iter(self._pending.values()))
-                action = pending["action"]
-                executed_steps = int(action.execute_start) + int(pending["step"])
+            elif self._plans.current is not None:
+                action = self._plans.current.action
+                executed_steps = int(action.execute_start)
             self._scheduled = None
-            self._pending.clear()
+            self._next_chunk_due = None
+            self._ack_observations.clear()
+            self._recent_ack_warnings.clear()
             self._held_completion = None
             self._active = None
             self._active_fetch_sent = False
@@ -872,6 +988,9 @@ def main(args=None) -> None:
             )
 
         def _ack(self, message, expected_device):
+            received_timestamp_ns = time.time_ns()
+            received_monotonic_ns = time.monotonic_ns()
+            received_at = received_monotonic_ns / 1_000_000_000.0
             if int(message.source) != int(ArmCommand.SOURCE_ACTOR):
                 return
             if str(message.device) != expected_device:
@@ -881,7 +1000,18 @@ def main(args=None) -> None:
                 )
                 return
             key = (message.action_id, int(message.revision), int(message.step_index))
-            pending = self._pending.get(key)
+            observation = self._ack_observations.get(key)
+            published_timestamp_ns = int(message.timestamp_ns)
+            delivery_latency_ms = (
+                max(0.0, (received_timestamp_ns - published_timestamp_ns) / 1_000_000.0)
+                if published_timestamp_ns > 0
+                else None
+            )
+            command_to_ack_ms = (
+                (received_at - float(observation["started"])) * 1000.0
+                if observation is not None
+                else None
+            )
             self._trace.event(
                 "hardware_command_result_received",
                 node="actor_ik_node",
@@ -893,117 +1023,215 @@ def main(args=None) -> None:
                 success=bool(message.success),
                 failure_code=str(message.failure_code),
                 failure_message=str(message.failure_message),
-                matched_pending=pending is not None,
+                matched_observation=observation is not None,
+                ack_publish_timestamp_ns=published_timestamp_ns,
+                ack_receive_timestamp_ns=received_timestamp_ns,
+                ack_receive_monotonic_ns=received_monotonic_ns,
+                ack_delivery_latency_ms=delivery_latency_ms,
+                command_to_ack_ms=command_to_ack_ms,
+                execution_continued=True,
             )
-            if pending is None:
+            if observation is None:
+                warning = self._recent_ack_warnings.get(key)
+                if warning is not None:
+                    self._trace.event(
+                        "late_hardware_command_ack",
+                        node="actor_ik_node",
+                        action_id=str(message.action_id),
+                        revision=int(message.revision),
+                        step_index=int(message.step_index),
+                        device=str(message.device),
+                        success=bool(message.success),
+                        missing_at_period=str(message.device)
+                        in warning["missing_acks"],
+                        requested_period_ms=warning["period_s"] * 1000.0,
+                        late_after_period_ms=max(
+                            0.0,
+                            (received_at - warning["started"] - warning["period_s"])
+                            * 1000.0,
+                        ),
+                        command_to_ack_ms=(
+                            received_at - warning["started"]
+                        )
+                        * 1000.0,
+                        ack_delivery_latency_ms=delivery_latency_ms,
+                        execution_continued=True,
+                    )
                 return
-            if bool(message.dry_run) != bool(pending["dry_run"]):
+            if bool(message.dry_run) != bool(observation["dry_run"]):
                 self.get_logger().warning(
                     f"ignoring {expected_device} result with mismatched dry_run mode"
                 )
                 return
-            pending["acks"].add(str(message.device))
+            if received_at >= observation["warning_deadline"]:
+                self._warn_late_acks(key, observation, received_at)
+            device = str(message.device)
+            observation["acks"].add(device)
             if not message.success:
-                pending["failed"] = str(message.failure_message or message.failure_code)
-            self._trace.event(
-                "command_ack",
-                device=str(message.device),
-                action_id=str(message.action_id),
-                revision=int(message.revision),
-                step_index=int(message.step_index),
-                dry_run=bool(message.dry_run),
-                success=bool(message.success),
-                failure_code=str(message.failure_code),
-                failure_message=str(message.failure_message),
-            )
-            if pending["acks"] >= {"ur", "sharpa"}:
-                self._finish_pending(key, pending)
-
-        def _finish_pending(self, key, pending):
-            self._pending.pop(key, None)
-            if pending["failed"]:
-                self._scheduled = None
-                self._clear_latency_gap()
-                self._complete_or_hold(
-                    pending["action"],
-                    False,
-                    pending["action"].execute_start + pending["step"],
-                    pending["failed"],
+                failure = str(message.failure_message or message.failure_code)
+                self.get_logger().warning(
+                    f"{device} command result reported failure for "
+                    f"{message.action_id} revision={int(message.revision)} "
+                    f"step={int(message.step_index)}: {failure}; execution continues"
                 )
+                self._trace.event(
+                    "hardware_command_nack_warning",
+                    node="actor_ik_node",
+                    session_id=str(observation["action"].session_id),
+                    request_id=int(observation["action"].request_id),
+                    action_id=str(message.action_id),
+                    revision=int(message.revision),
+                    step_index=int(message.step_index),
+                    device=device,
+                    failure_code=str(message.failure_code),
+                    failure_message=str(message.failure_message),
+                    command_to_ack_ms=command_to_ack_ms,
+                    requested_period_ms=observation["period_s"] * 1000.0,
+                    execution_continued=True,
+                )
+            if device in observation["warned_acks"]:
+                self._trace.event(
+                    "late_hardware_command_ack",
+                    node="actor_ik_node",
+                    action_id=str(message.action_id),
+                    revision=int(message.revision),
+                    step_index=int(message.step_index),
+                    device=device,
+                    success=bool(message.success),
+                    missing_at_period=True,
+                    requested_period_ms=observation["period_s"] * 1000.0,
+                    late_after_period_ms=max(
+                        0.0,
+                        (received_at - observation["warning_deadline"]) * 1000.0,
+                    ),
+                    command_to_ack_ms=command_to_ack_ms,
+                    ack_delivery_latency_ms=delivery_latency_ms,
+                    execution_continued=True,
+                )
+            if observation["acks"] >= observation["required_acks"]:
+                self._ack_observations.pop(key, None)
+
+        def _warn_late_acks(self, key, observation, now):
+            missing = observation["required_acks"] - observation["acks"]
+            new_missing = missing - observation["warned_acks"]
+            if not new_missing:
                 return
-            executed_in_slice = int(pending["step"]) + 1
+            observation["warned_acks"].update(new_missing)
+            elapsed_ms = (now - observation["started"]) * 1000.0
+            period_ms = observation["period_s"] * 1000.0
+            devices = sorted(new_missing)
+            action = observation["action"]
+            self.get_logger().warning(
+                f"ACK late beyond requested period for {action.action_id} "
+                f"revision={int(action.revision)} step={int(observation['step'])}: "
+                f"missing={','.join(devices)} elapsed={elapsed_ms:.3f} ms "
+                f"period={period_ms:.3f} ms; execution continues"
+            )
+            self._trace.event(
+                "hardware_command_ack_late_warning",
+                node="actor_ik_node",
+                session_id=str(action.session_id),
+                request_id=int(action.request_id),
+                action_id=str(action.action_id),
+                revision=int(action.revision),
+                step_index=int(observation["step"]),
+                received_acks=sorted(observation["acks"]),
+                missing_acks=devices,
+                command_to_warning_ms=elapsed_ms,
+                requested_period_ms=period_ms,
+                execution_continued=True,
+            )
+            self._recent_ack_warnings[key] = {
+                "started": float(observation["started"]),
+                "period_s": float(observation["period_s"]),
+                "missing_acks": set(observation["warned_acks"]),
+            }
+            self._recent_ack_warnings.move_to_end(key)
+            while len(self._recent_ack_warnings) > ACK_OBSERVATION_HISTORY:
+                self._recent_ack_warnings.popitem(last=False)
+
+        def _advance_after_publish(self, action, plan, step, schedule_base):
+            executed_in_slice = int(step) + 1
             execute_fetch, execute_done = execution_edges(
-                pending["action"].execute_length,
-                getattr(pending["action"], "rtc", 0),
+                action.execute_length,
+                getattr(action, "rtc", 0),
                 executed_in_slice,
             )
+            next_due = next_step_due(schedule_base, action.frequency_hz)
             if execute_done:
-                action = pending["action"]
+                # The normal frame period is part of the commanded trajectory,
+                # not chunk latency.  Start the inter-chunk gap at the next
+                # expected command deadline so a continuous 30 Hz stream reads
+                # approximately 0 ms instead of 33.33 ms.
                 self._latency.mark_chunk_complete(
                     session_id=action.session_id,
                     provider=self._execution_provider,
                     request_id=action.request_id,
                     action_id=action.action_id,
                     revision=action.revision,
-                    completed_at_ns=time.monotonic_ns(),
+                    completed_at_ns=int(next_due * 1_000_000_000.0),
                 )
                 self._publish_latency()
                 self._complete_or_hold(
-                    action, True, action.execute_start + action.execute_length
+                    action,
+                    True,
+                    action.execute_start + action.execute_length,
+                    next_due=next_due,
                 )
                 return
             if execute_fetch:
                 self._fetch(
-                    pending["action"],
-                    int(pending["action"].execute_start) + executed_in_slice,
+                    action,
+                    int(action.execute_start) + executed_in_slice,
                 )
             self._scheduled = {
-                "action": pending["action"],
-                "plan": pending["plan"],
-                "step": pending["step"] + 1,
-                "due": next_step_due(
-                    pending["published_at"], pending["action"].frequency_hz
-                ),
+                "action": action,
+                "plan": plan,
+                "step": step + 1,
+                "due": next_due,
             }
 
         def _process(self):
             if self._execution_paused:
                 return
             now = time.monotonic()
-            for key, pending in list(self._pending.items()):
-                if now - pending["started"] > pending["timeout"]:
-                    received_acks = sorted(pending["acks"])
-                    missing_acks = sorted({"ur", "sharpa"} - pending["acks"])
-                    self._trace.event(
-                        "hardware_command_ack_timeout",
-                        node="actor_ik_node",
-                        session_id=str(pending["action"].session_id),
-                        request_id=int(pending["action"].request_id),
-                        action_id=str(pending["action"].action_id),
-                        revision=int(pending["action"].revision),
-                        step_index=int(pending["step"]),
-                        received_acks=received_acks,
-                        missing_acks=missing_acks,
-                        pending_ms=(now - pending["started"]) * 1000.0,
-                        success=False,
+            for key, observation in list(self._ack_observations.items()):
+                if now >= observation["warning_deadline"]:
+                    self._warn_late_acks(key, observation, now)
+                if now >= observation["expires_at"]:
+                    missing_acks = sorted(
+                        observation["required_acks"] - observation["acks"]
                     )
-                    self._pending.pop(key, None)
-                    self._scheduled = None
-                    self._clear_latency_gap()
-                    self._complete_or_hold(
-                        pending["action"],
-                        False,
-                        pending["action"].execute_start + pending["step"],
-                        "hardware command acknowledgement timeout",
-                    )
-                    return
+                    if missing_acks:
+                        action = observation["action"]
+                        self._trace.event(
+                            "hardware_command_ack_observation_expired",
+                            node="actor_ik_node",
+                            session_id=str(action.session_id),
+                            request_id=int(action.request_id),
+                            action_id=str(action.action_id),
+                            revision=int(action.revision),
+                            step_index=int(observation["step"]),
+                            received_acks=sorted(observation["acks"]),
+                            missing_acks=missing_acks,
+                            observation_retention_s=ACK_OBSERVATION_RETENTION_S,
+                            execution_continued=True,
+                        )
+                    self._ack_observations.pop(key, None)
             scheduled = self._scheduled
-            if scheduled is None or self._pending or now < scheduled["due"]:
+            if (
+                scheduled is None
+                or scheduled["due"] is None
+                or now < scheduled["due"]
+            ):
                 return
             self._scheduled = None
             try:
                 self._publish_step(
-                    scheduled["action"], scheduled["plan"], scheduled["step"]
+                    scheduled["action"],
+                    scheduled["plan"],
+                    scheduled["step"],
+                    scheduled["due"],
                 )
             except Exception as exc:
                 self._clear_latency_gap()
@@ -1015,29 +1243,38 @@ def main(args=None) -> None:
                     str(exc),
                 )
 
-        def _publish_step(self, action, plan, step):
-            if not self._ur_valid or not self._hand_valid:
+        def _publish_step(self, action, plan, step, scheduled_due):
+            if not self._hand_valid:
+                raise ActorIkError("valid SharpA state is required")
+            hands_only = self._execution_scope == "hands_only"
+            observed_devices = required_execution_devices(self._execution_scope)
+            if not hands_only and not self._ur_valid:
                 raise ActorIkError("valid UR and SharpA state are required")
-            left_target = limit_joint_target(
-                self._left, plan.left_joint[step], ARM_MAX_STEP_RAD
-            )
-            right_target = limit_joint_target(
-                self._right, plan.right_joint[step], ARM_MAX_STEP_RAD
-            )
+            left_target = None
+            right_target = None
+            if not hands_only:
+                left_target = limit_joint_target(
+                    self._left, plan.left_joint[step], ARM_MAX_STEP_RAD
+                )
+                right_target = limit_joint_target(
+                    self._right, plan.right_joint[step], ARM_MAX_STEP_RAD
+                )
             hand_target = limit_joint_target(
                 self._hand, plan.hand_joint[step], HAND_MAX_STEP_RAD
             )
-            arm = ArmCommand()
-            arm.source = ArmCommand.SOURCE_ACTOR
-            arm.action_id = action.action_id
-            arm.revision = action.revision
-            arm.step_index = step
-            arm.period_s = 1.0 / action.frequency_hz
-            arm.left_joint = left_target.tolist()
-            arm.right_joint = right_target.tolist()
-            arm.left_enable = True
-            arm.right_enable = True
-            arm.dry_run = bool(self._execution_dry_run)
+            arm = None
+            if not hands_only:
+                arm = ArmCommand()
+                arm.source = ArmCommand.SOURCE_ACTOR
+                arm.action_id = action.action_id
+                arm.revision = action.revision
+                arm.step_index = step
+                arm.period_s = 1.0 / action.frequency_hz
+                arm.left_joint = left_target.tolist()
+                arm.right_joint = right_target.tolist()
+                arm.left_enable = True
+                arm.right_enable = True
+                arm.dry_run = bool(self._execution_dry_run)
             hand = HandCommand()
             hand.source = HandCommand.SOURCE_ACTOR
             hand.action_id = action.action_id
@@ -1049,20 +1286,26 @@ def main(args=None) -> None:
             hand.dry_run = bool(self._execution_dry_run)
             key = (action.action_id, int(action.revision), step)
             published_at = time.monotonic()
-            self._pending[key] = {
+            period_s = 1.0 / float(action.frequency_hz)
+            schedule_lateness_s = max(0.0, published_at - float(scheduled_due))
+            missed_deadline = schedule_lateness_s >= period_s
+            # Never burst old commands to catch up after a long process stall.
+            # A missed period rebases the absolute schedule at this publication.
+            schedule_base = published_at if missed_deadline else float(scheduled_due)
+            self._ack_observations[key] = {
                 "action": action,
-                "plan": plan,
                 "step": step,
                 "acks": set(),
-                "failed": "",
+                "required_acks": set(observed_devices),
+                "warned_acks": set(),
                 "dry_run": bool(self._execution_dry_run),
                 "started": published_at,
-                "published_at": published_at,
-                "timeout": max(
-                    HARDWARE_ACK_TIMEOUT_S, 4.0 / float(action.frequency_hz)
-                ),
+                "period_s": period_s,
+                "warning_deadline": published_at + period_s,
+                "expires_at": published_at + ACK_OBSERVATION_RETENTION_S,
             }
-            self._arm_pub.publish(arm)
+            if arm is not None:
+                self._arm_pub.publish(arm)
             self._hand_pub.publish(hand)
             self._trace.event(
                 "command_published",
@@ -1070,8 +1313,14 @@ def main(args=None) -> None:
                 revision=int(action.revision),
                 step_index=int(step),
                 dry_run=bool(self._execution_dry_run),
-                left_arm_joint=left_target.tolist(),
-                right_arm_joint=right_target.tolist(),
+                execution_scope=self._execution_scope,
+                arm_command_published=arm is not None,
+                scheduled_deadline_monotonic_ns=int(float(scheduled_due) * 1e9),
+                command_publish_monotonic_ns=int(published_at * 1e9),
+                publish_jitter_ms=schedule_lateness_s * 1000.0,
+                requested_period_ms=period_s * 1000.0,
+                left_arm_joint=[] if left_target is None else left_target.tolist(),
+                right_arm_joint=[] if right_target is None else right_target.tolist(),
                 hand_joint=hand_target.tolist(),
             )
             if step == 0:
@@ -1085,6 +1334,27 @@ def main(args=None) -> None:
                 )
                 if sample is not None:
                     self._publish_latency()
+            if missed_deadline:
+                self.get_logger().warning(
+                    f"command deadline missed for {action.action_id} "
+                    f"revision={int(action.revision)} step={int(step)} by "
+                    f"{schedule_lateness_s * 1000.0:.3f} ms; schedule rebased, "
+                    "execution continues"
+                )
+                self._trace.event(
+                    "hardware_command_schedule_late_warning",
+                    node="actor_ik_node",
+                    session_id=str(action.session_id),
+                    request_id=int(action.request_id),
+                    action_id=str(action.action_id),
+                    revision=int(action.revision),
+                    step_index=int(step),
+                    publish_jitter_ms=schedule_lateness_s * 1000.0,
+                    requested_period_ms=period_s * 1000.0,
+                    schedule_rebased=True,
+                    execution_continued=True,
+                )
+            self._advance_after_publish(action, plan, step, schedule_base)
 
         def _publish_trajectory(self, action, plan):
             payload = build_trajectory_payload(
@@ -1134,18 +1404,27 @@ def main(args=None) -> None:
                 rtc=int(getattr(action, "rtc", 0)),
             )
 
-        def _activate_current(self):
+        def _activate_current(self, *, first_due=None):
             current = self._plans.current
             if current is None:
                 return
             action = current.action
             self._active = (action.action_id, int(action.revision))
             self._active_fetch_sent = False
+            if first_due is None:
+                due = (
+                    time.monotonic()
+                    if self._next_chunk_due is None
+                    else float(self._next_chunk_due)
+                )
+            else:
+                due = float(first_due)
+            self._next_chunk_due = None
             self._scheduled = {
                 "action": action,
                 "plan": current.plan,
                 "step": 0,
-                "due": None if self._execution_paused else time.monotonic(),
+                "due": None if self._execution_paused else due,
             }
             self._trace.event(
                 "actor_action_started",
@@ -1186,7 +1465,9 @@ def main(args=None) -> None:
                     return
                 if not self._machine_running:
                     raise ActorIkError("machine execution gate is not running")
-                if not self._ur_valid or not self._hand_valid:
+                if not self._hand_valid:
+                    raise ActorIkError("valid SharpA state is required")
+                if self._execution_scope != "hands_only" and not self._ur_valid:
                     raise ActorIkError("valid UR and SharpA state are required")
                 if self._plans.full:
                     raise ActorIkError("next actor action is already buffered")
@@ -1199,6 +1480,7 @@ def main(args=None) -> None:
                 if self._latency.ensure_context(
                     session_id=action.session_id, provider=provider
                 ):
+                    self._next_chunk_due = None
                     self._publish_latency()
                 if action.eef_frame != CANONICAL_EEF_FRAME:
                     raise ActorIkError(f"unsupported eef_frame {action.eef_frame!r}")

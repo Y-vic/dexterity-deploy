@@ -82,13 +82,26 @@ Dashboard 的执行来源可选 `Policy` 或 `Replay`。Replay 默认加载：
 ```
 
 默认 `execution steps=40`、`frequency=30 Hz`。机器控制区的“预览轨迹”与“启动”
-共用 Actor IK 执行链：预览仍逐步发布 UR/SharpA command 并等待双 ACK，但 command
-携带 `dry_run=true`，两个硬件节点只校验、不写控制器。Dashboard 的输出可视化只订阅
+共用 Actor IK 执行链：Actor 按 action 要求的绝对频率持续发布 UR/SharpA command，ACK
+仅用于诊断，不会阻塞下一帧或终止 action。若某个设备在一个命令周期内未返回 ACK
+（例如 30 Hz 时为 33.33 ms），Actor 记录 warning 后继续执行；迟到 ACK、NACK 和实际延迟
+都会写入 trace。预览 command 携带 `dry_run=true`，两个硬件节点只校验、不写控制器。
+Dashboard 的输出可视化只订阅
 `/actor_ik/trajectory`，显示 IK 后的最终规划，不再直接显示 Policy/Replay 原始 action。
+Dashboard 的 Actor latency 仍表示 chunk 边界的额外空档；正常命令周期不计入 latency，
+所以连续 30 Hz chunk 不会固定显示为 33.33 ms。
 
 每次实机执行或预览统一写入仓库下的 `ur-sharpa/log/deploy/<timestamp>/`，包含 manifest、
 逐 chunk 轨迹、Policy 推理、Actor 排程、UR/SharpA SDK、command/ACK 事件、停止时的
 未完成现场和 summary；当前目录会显示在机器控制区。Policy 与 Replay 共用这一目录。
+Actor 控制链上的 command、ACK、周期 warning 和 late-ACK 写入 `events.jsonl`；UR、SharpA 和
+Policy 的跨节点诊断写入独立的 `node_events.jsonl`。跨节点日志使用 BEST_EFFORT 小队列
+和后台写盘，存储变慢时只丢诊断样本，不会阻塞硬件 ACK；丢弃数和写入错误记录在
+`summary.json` 的 `external_trace_diagnostics` 中。
+UR 与 SharpA 的 `command_result` 保持 RELIABLE QoS，但使用按 topic 精确匹配的 Fast DDS
+writer profile，将丢包恢复 heartbeat 从默认 3 秒缩短为 50 ms。配置位于
+`config/fastdds_ack_profiles.xml`；launch 明确保持 `RMW_FASTRTPS_USE_QOS_FROM_XML=0`，
+不会改变其他 topic 的 publication mode、history memory 或 data sharing。
 日志默认保留 7 天、最多 100 次且总量最多 5 GiB，任一限制超出时按时间删除最旧的
 已完成日志，当前执行日志不会被删除；三个限制都可通过 launch 参数修改。Replay
 使用同一预览链路，整个已加载样本是一次性有限 buffer：到末尾保持 `COMPLETE` 并

@@ -22,6 +22,10 @@ uint8 SHARPA_STARTING = 4  # POSITION transition in progress; no commands
 uint8 RECORD_IDLE = 0        # not writing an episode
 uint8 RECORD_RECORDING = 1   # writing an episode to disk
 
+# --- Actor execution scope (2 scopes) ---
+uint8 EXECUTION_SCOPE_FULL = 0        # publish UR arm and SharpA hand commands
+uint8 EXECUTION_SCOPE_HANDS_ONLY = 1  # publish SharpA hand commands only
+
 std_msgs/Header header
 
 # Publish time of this status, nanoseconds.
@@ -44,6 +48,9 @@ bool execution_paused
 # remain stopped; Actor commands carry dry_run=true and drivers must not write
 # to hardware.
 bool execution_dry_run
+
+# Which hardware devices Actor is allowed to command for this execution.
+uint8 execution_scope
 
 # Human-readable explanation of why the next transition is blocked, e.g.
 # "ur not homed: run bias first" or "sharpa telemetry stale 0.8s".

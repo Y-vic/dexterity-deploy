@@ -19,8 +19,10 @@ DASHBOARD_ACTIONS = frozenset(
     {
         "reset_both",
         "start_deploy",
+        "start_hands_deploy",
         "continue_deploy",
         "preview_deploy",
+        "preview_hands_deploy",
         "pause_deploy",
         "stop_deploy",
         "select_policy",
@@ -106,10 +108,11 @@ def stop_policy_deployment(
 
 def actor_execution_active(snapshot: dict[str, Any]) -> bool:
     control = snapshot.get("control") or {}
+    hands_only = str(control.get("execution_scope", "full")) == "hands_only"
     return bool(
         (
-            int(control.get("ur_state", 0)) == 2
-            and int(control.get("sharpa_state", 0)) == 1
+            int(control.get("sharpa_state", 0)) == 1
+            and (hands_only or int(control.get("ur_state", 0)) == 2)
         )
         or control.get("execution_dry_run")
         or control.get("execution_paused")
@@ -143,6 +146,9 @@ def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
     joint_source = str(payload.get("joint_source", "measured")).strip().lower()
     if joint_source not in {"measured", "commanded"}:
         raise ValueError("replay joint_source must be measured or commanded")
+    execution_scope = str(payload.get("execution_scope", "full")).strip().lower()
+    if execution_scope not in {"full", "hands_only"}:
+        raise ValueError("replay execution_scope must be full or hands_only")
     for field in ("loop", "dry_run"):
         if not isinstance(payload.get(field), bool):
             raise ValueError(f"replay {field} must be boolean")
@@ -153,6 +159,7 @@ def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
         execution_steps=execution_steps,
         frequency_hz=frequency_hz,
         joint_source=joint_source,
+        execution_scope=execution_scope,
         loop=payload["loop"],
         dry_run=payload["dry_run"],
     )
@@ -191,6 +198,8 @@ def replay_config_matches_status(
             )
             and str(replay.get("joint_source") or "")
             == str(command.get("joint_source") or "")
+            and str(replay.get("execution_scope") or "full")
+            == str(command.get("execution_scope") or "full")
             and bool(replay.get("loop")) == bool(command.get("loop"))
         )
     except (TypeError, ValueError):
@@ -262,7 +271,12 @@ def launch_live_replay(
             ),
         )
 
-        started = forward(status_api_url, "start_deploy")
+        gate_action = (
+            "start_hands_deploy"
+            if command.get("execution_scope") == "hands_only"
+            else "start_deploy"
+        )
+        started = forward(status_api_url, gate_action)
         if not started.get("accepted"):
             raise ModelManagerError(
                 str(started.get("gate_reason") or "机器执行门无法开启")
@@ -325,7 +339,11 @@ def launch_replay_preview(
     before = state.snapshot()
     control = before.get("control") or {}
     replay_before = before.get("replay") or {}
-    if int(control.get("ur_state", 0)) == 2 or control.get("execution_dry_run"):
+    if (
+        int(control.get("ur_state", 0)) == 2
+        or int(control.get("sharpa_state", 0)) == 1
+        or control.get("execution_dry_run")
+    ):
         raise ModelManagerError("机器运行时不能启动 Replay 预览")
     if replay_before.get("waiting_action_id") or replay_before.get("preview_active"):
         raise ModelManagerError("Replay 仍在执行或预览，请先停止")
@@ -369,7 +387,12 @@ def launch_replay_preview(
                 (snapshot.get("replay") or {}).get("provider") == "replay"
             ),
         )
-        started = forward(status_api_url, "preview_deploy")
+        gate_action = (
+            "preview_hands_deploy"
+            if command.get("execution_scope") == "hands_only"
+            else "preview_deploy"
+        )
+        started = forward(status_api_url, gate_action)
         if not started.get("accepted"):
             raise ModelManagerError(
                 str(started.get("gate_reason") or "Actor 预览门无法开启")
@@ -519,9 +542,28 @@ def make_handler(
     status_api_url: str,
     model_manager: RemoteModelManager,
     publish_replay_command: Any,
+    demo_api_url: str = "http://127.0.0.1:8089",
 ):
     class Handler(BaseHTTPRequestHandler):
+        def _demo_proxy(self, path: str, payload: dict | None = None) -> None:
+            data = None if payload is None else json.dumps(payload).encode()
+            request = Request(demo_api_url.rstrip("/") + path, data=data,
+                              headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(request, timeout=3.0) as response:
+                    self._send(response.read(), response.headers.get("Content-Type", "application/json"), response.status)
+            except HTTPError as exc:
+                self._send(exc.read(), exc.headers.get("Content-Type", "application/json"), exc.code)
+            except (URLError, TimeoutError, OSError):
+                self._send_json({"error": "Demo 服务未连接", "connected": False}, 503)
+
         def do_GET(self) -> None:
+            if self.path.split("?", 1)[0] == "/api/demo/frame.jpg":
+                self._demo_proxy("/frame.jpg")
+                return
+            if self.path == "/api/demo/status":
+                self._demo_proxy("/status")
+                return
             if self.path == "/api/status":
                 payload = state.snapshot()
                 payload["model"] = model_manager.snapshot()
@@ -545,6 +587,11 @@ def make_handler(
         def do_POST(self) -> None:
             try:
                 payload = self._read_json()
+                if self.path == "/api/demo/command":
+                    if payload.get("action") not in {"start", "stop", "delete"}:
+                        raise ValueError("expected start, stop or delete")
+                    self._demo_proxy("/command", payload)
+                    return
                 if self.path == "/api/action":
                     action = str(payload.get("action", ""))
                     if action in {"start_deploy", "preview_deploy"}:
@@ -715,6 +762,7 @@ def main(args=None) -> None:
         def __init__(self) -> None:
             super().__init__("dashboard_node")
             self.declare_parameter("port", 8088)
+            self.declare_parameter("demo_api_url", "http://127.0.0.1:8089")
             self.declare_parameter(
                 "status_api_url", "http://127.0.0.1:8080/api/action"
             )
@@ -753,6 +801,7 @@ def main(args=None) -> None:
                 str(self.get_parameter("status_api_url").value),
                 self.model_manager,
                 self._publish_replay_command,
+                str(self.get_parameter("demo_api_url").value),
             )
             self.server = ThreadingHTTPServer(
                 ("127.0.0.1", int(self.get_parameter("port").value)), handler
@@ -839,6 +888,12 @@ def main(args=None) -> None:
                     "active_source": int(message.active_source),
                     "execution_paused": bool(message.execution_paused),
                     "execution_dry_run": bool(message.execution_dry_run),
+                    "execution_scope": (
+                        "hands_only"
+                        if int(message.execution_scope)
+                        == int(ControlStatus.EXECUTION_SCOPE_HANDS_ONLY)
+                        else "full"
+                    ),
                     "gate_reason": message.gate_reason,
                 },
             )

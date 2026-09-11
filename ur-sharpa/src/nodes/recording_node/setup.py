@@ -8,11 +8,14 @@ setup(
     packages=find_packages(exclude=["test"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
-        ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name, ["package.xml", "DEMO.md"]),
         ("share/" + package_name + "/launch", ["launch/recording_node.launch.py"]),
     ],
-    install_requires=["setuptools", "numpy"],
+    install_requires=["setuptools", "numpy", "Pillow"],
     tests_require=["pytest"],
     zip_safe=True,
-    entry_points={"console_scripts": ["recording_node = recording_node.recording_node:main"]},
+    entry_points={"console_scripts": [
+        "recording_node = recording_node.recording_node:main",
+        "demo_node = recording_node.demo_node:main",
+    ]},
 )

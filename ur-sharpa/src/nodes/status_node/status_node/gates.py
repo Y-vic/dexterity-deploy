@@ -66,6 +66,13 @@ class RecordState(IntEnum):
     RECORDING = 1
 
 
+class ExecutionScope(IntEnum):
+    """Mirrors ControlStatus.EXECUTION_SCOPE_* constants."""
+
+    FULL = 0
+    HANDS_ONLY = 1
+
+
 class Source(IntEnum):
     """Mirrors ArmCommand.SOURCE_* and arbitration.Source."""
 
@@ -295,6 +302,7 @@ class GateMachine:
     execution_provider: str = "policy"
     execution_paused: bool = False
     execution_dry_run: bool = False
+    execution_scope: ExecutionScope = ExecutionScope.FULL
     execution_start_pending: bool = False
     execution_start_started_at: float = 0.0
     execution_start_started_wall_ns: int = 0
@@ -323,10 +331,20 @@ class GateMachine:
             raise ValueError("execution_provider must be policy or replay")
         if self.camera_max_age_s <= 0:
             raise ValueError("camera_max_age_s must be positive")
+        self.execution_scope = ExecutionScope(self.execution_scope)
 
     @property
     def active_source(self) -> Source:
         return MODE_SOURCES[self.mode]
+
+    @property
+    def live_execution_running(self) -> bool:
+        if self.execution_scope == ExecutionScope.HANDS_ONLY:
+            return self.sharpa_state == SharpaState.RUNNING
+        return bool(
+            self.ur_state == UrState.RUNNING
+            and self.sharpa_state == SharpaState.RUNNING
+        )
 
     def _set_reason(self, reason: str) -> Outcome:
         self.gate_reason = reason
@@ -393,7 +411,8 @@ class GateMachine:
             self.execution_start_pending = False
             self.execution_start_started_at = 0.0
             self.execution_start_started_wall_ns = 0
-            self.ur_state = UrState.STOPPED
+            if self.execution_scope == ExecutionScope.FULL:
+                self.ur_state = UrState.STOPPED
             self.sharpa_state = SharpaState.STOPPED
             self.machine_ready = False
             self._set_reason(
@@ -402,12 +421,18 @@ class GateMachine:
             return _ok(hardware_stop=True)
         if not position_ready:
             return None
-        if not self.ur_hardware_ready or not self.sharpa_hardware_ready:
+        if not self.sharpa_hardware_ready:
+            return None
+        if (
+            self.execution_scope == ExecutionScope.FULL
+            and not self.ur_hardware_ready
+        ):
             return None
         self.execution_start_pending = False
         self.execution_start_started_at = 0.0
         self.execution_start_started_wall_ns = 0
-        self.ur_state = UrState.RUNNING
+        if self.execution_scope == ExecutionScope.FULL:
+            self.ur_state = UrState.RUNNING
         self.sharpa_state = SharpaState.RUNNING
         self._clear_reason()
         return _ok(hardware_stop=False)
@@ -421,7 +446,8 @@ class GateMachine:
         self.execution_start_pending = False
         self.execution_start_started_at = 0.0
         self.execution_start_started_wall_ns = 0
-        self.ur_state = UrState.STOPPED
+        if self.execution_scope == ExecutionScope.FULL:
+            self.ur_state = UrState.STOPPED
         self.sharpa_state = SharpaState.STOPPED
         self.machine_ready = False
         self._set_reason("machine start failed: SharpA POSITION readiness timeout")
@@ -503,6 +529,7 @@ class GateMachine:
         self.session_id = ""
         self.execution_paused = False
         self.execution_dry_run = False
+        self.execution_scope = ExecutionScope.FULL
         self.ur_state = UrState.HOMING
         return self._begin_bias("home_ur")
 
@@ -525,6 +552,7 @@ class GateMachine:
         self.session_id = ""
         self.execution_paused = False
         self.execution_dry_run = False
+        self.execution_scope = ExecutionScope.FULL
         self.ur_state = UrState.HOMING
         self.sharpa_state = SharpaState.HOMING
         self.jog_preview = None
@@ -537,6 +565,12 @@ class GateMachine:
         )
 
     def attempt_start_deploy(self) -> Outcome:
+        return self._attempt_start_deploy(ExecutionScope.FULL)
+
+    def attempt_start_hands_deploy(self) -> Outcome:
+        return self._attempt_start_deploy(ExecutionScope.HANDS_ONLY)
+
+    def _attempt_start_deploy(self, scope: ExecutionScope) -> Outcome:
         """Open the actor gate from either home or the current measured pose.
 
         Deployment reset is an operator choice, not a prerequisite.  STOPPED
@@ -548,7 +582,7 @@ class GateMachine:
             return self._set_reason(
                 f"start deploy blocked: launch mode is {self.mode}, expected deploy"
             )
-        if not self.ur_hardware_ready:
+        if scope == ExecutionScope.FULL and not self.ur_hardware_ready:
             return self._set_reason(
                 "machine start blocked: UR is not in Normal mode"
             )
@@ -575,17 +609,25 @@ class GateMachine:
         self.machine_ready = False
         self.execution_paused = False
         self.execution_dry_run = False
-        if self.ur_state == UrState.HOMED and self.sharpa_state == SharpaState.HOMED:
-            self.ur_state = UrState.RUNNING
+        self.execution_scope = scope
+        homed = self.sharpa_state == SharpaState.HOMED and (
+            scope == ExecutionScope.HANDS_ONLY
+            or self.ur_state == UrState.HOMED
+        )
+        if homed:
+            if scope == ExecutionScope.FULL:
+                self.ur_state = UrState.RUNNING
             self.sharpa_state = SharpaState.RUNNING
             self._clear_reason()
             return _ok(hardware_stop=False)
-        self.ur_state = UrState.STARTING
+        if scope == ExecutionScope.FULL:
+            self.ur_state = UrState.STARTING
         self.sharpa_state = SharpaState.STARTING
         self.execution_start_pending = True
         self.execution_start_started_at = time.monotonic()
         self.execution_start_started_wall_ns = time.time_ns()
-        self.gate_reason = "machine start waiting for SharpA POSITION readiness"
+        prefix = "hands-only" if scope == ExecutionScope.HANDS_ONLY else "machine"
+        self.gate_reason = f"{prefix} start waiting for SharpA POSITION readiness"
         return _ok(hardware_stop=False)
 
     def attempt_continue_deploy(self) -> Outcome:
@@ -598,7 +640,10 @@ class GateMachine:
             return self._set_reason(
                 "continue deploy blocked: actor is not paused"
             )
-        if not self.ur_hardware_ready:
+        if (
+            self.execution_scope == ExecutionScope.FULL
+            and not self.ur_hardware_ready
+        ):
             return self._set_reason(
                 "continue deploy blocked: UR is not in Normal mode"
             )
@@ -606,10 +651,7 @@ class GateMachine:
             return self._set_reason(
                 "continue deploy blocked: SharpA state is unavailable"
             )
-        live_running = bool(
-            self.ur_state == UrState.RUNNING
-            and self.sharpa_state == SharpaState.RUNNING
-        )
+        live_running = self.live_execution_running
         if not self.execution_dry_run and not live_running:
             return self._set_reason(
                 "continue deploy blocked: live actor gate is no longer running"
@@ -619,12 +661,18 @@ class GateMachine:
         return _ok()
 
     def attempt_preview_deploy(self) -> Outcome:
+        return self._attempt_preview_deploy(ExecutionScope.FULL)
+
+    def attempt_preview_hands_deploy(self) -> Outcome:
+        return self._attempt_preview_deploy(ExecutionScope.HANDS_ONLY)
+
+    def _attempt_preview_deploy(self, scope: ExecutionScope) -> Outcome:
         """Enable Actor execution while keeping all hardware writes disabled."""
         if self.mode != "deploy":
             return self._set_reason(
                 f"preview deploy blocked: launch mode is {self.mode}, expected deploy"
             )
-        if not self.ur_hardware_ready:
+        if scope == ExecutionScope.FULL and not self.ur_hardware_ready:
             return self._set_reason(
                 "trajectory preview blocked: valid UR state is unavailable"
             )
@@ -648,6 +696,7 @@ class GateMachine:
             )
         self.execution_dry_run = True
         self.execution_paused = False
+        self.execution_scope = scope
         self._clear_reason()
         return _ok()
 
@@ -677,12 +726,14 @@ class GateMachine:
                 "provider switch blocked: stop the machine before switching"
             )
         self.execution_provider = requested
+        if requested == "policy":
+            self.execution_scope = ExecutionScope.FULL
         self._clear_reason()
         return _ok()
 
     def attempt_pause(self) -> Outcome:
         """Freeze both robots while keeping every teleop process connected."""
-        if self.ur_state != UrState.RUNNING or self.sharpa_state != SharpaState.RUNNING:
+        if not self.live_execution_running:
             return self._set_reason("machine pause blocked: machine is not running")
         record_command = "stop" if self.record_state == RecordState.RECORDING else ""
         # A hard pause closes the lifecycle gate; a later start performs the
@@ -694,6 +745,7 @@ class GateMachine:
         self.session_id = ""
         self.execution_paused = False
         self.execution_dry_run = False
+        self.execution_scope = ExecutionScope.FULL
         self.jog_preview = None
         self.gate_reason = "machine paused"
         return _ok(record_command=record_command, hardware_stop=True)
@@ -727,10 +779,7 @@ class GateMachine:
             )
         if self.execution_paused:
             return self._set_reason("pause deploy blocked: actor is already paused")
-        live_running = bool(
-            self.ur_state == UrState.RUNNING
-            and self.sharpa_state == SharpaState.RUNNING
-        )
+        live_running = self.live_execution_running
         if not live_running and not self.execution_dry_run:
             return self._set_reason("pause deploy blocked: actor is not running")
         self.execution_paused = True
@@ -820,9 +869,14 @@ class GateMachine:
             "execution_provider": self.execution_provider,
             "execution_paused": self.execution_paused,
             "execution_dry_run": self.execution_dry_run,
+            "execution_scope": (
+                "hands_only"
+                if self.execution_scope == ExecutionScope.HANDS_ONLY
+                else "full"
+            ),
             "execution_start_pending": self.execution_start_pending,
             "machine_ready": self.machine_ready,
-            "machine_running": self.ur_state == UrState.RUNNING and self.sharpa_state == SharpaState.RUNNING,
+            "machine_running": self.live_execution_running,
             "ur_hardware_ready": self.ur_hardware_ready,
             "sharpa_hardware_ready": self.sharpa_hardware_ready,
             "gate_reason": self.gate_reason,

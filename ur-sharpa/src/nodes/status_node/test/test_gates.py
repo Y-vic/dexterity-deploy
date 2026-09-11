@@ -1,5 +1,11 @@
 import time
-from status_node.gates import GateMachine, RecordState, SharpaState, UrState
+from status_node.gates import (
+    ExecutionScope,
+    GateMachine,
+    RecordState,
+    SharpaState,
+    UrState,
+)
 
 def fresh(m, now):
     m.update_cameras({"ego":int(now*1e9),"left_wrist":int(now*1e9),"right_wrist":int(now*1e9)}, {"ego":True,"left_wrist":True,"right_wrist":True}, now)
@@ -100,6 +106,34 @@ def test_start_deploy_requires_deploy_mode_and_hardware_but_not_reset():
     assert deploy.ur_state == UrState.RUNNING
     assert deploy.sharpa_state == SharpaState.RUNNING
     assert deploy.machine_ready is False
+
+
+def test_hands_only_deploy_does_not_require_or_open_ur_gate():
+    machine = GateMachine(mode="deploy")
+    machine.update_hardware_readiness(ur_ready=False, sharpa_ready=True)
+
+    started = machine.attempt_start_hands_deploy()
+
+    assert started.hardware_stop is False
+    assert machine.execution_scope == ExecutionScope.HANDS_ONLY
+    assert machine.ur_state == UrState.STOPPED
+    assert machine.sharpa_state == SharpaState.STARTING
+    finish_start(machine)
+    assert machine.ur_state == UrState.STOPPED
+    assert machine.sharpa_state == SharpaState.RUNNING
+    assert machine.status_payload()["machine_running"] is True
+    assert machine.status_payload()["execution_scope"] == "hands_only"
+
+
+def test_hands_only_preview_requires_sharpa_but_not_ur():
+    machine = GateMachine(mode="deploy")
+    machine.update_hardware_readiness(ur_ready=False, sharpa_ready=True)
+
+    assert machine.attempt_preview_hands_deploy()
+    assert machine.execution_dry_run is True
+    assert machine.execution_scope == ExecutionScope.HANDS_ONLY
+    assert machine.ur_state == UrState.STOPPED
+    assert machine.sharpa_state == SharpaState.STOPPED
 
 
 def test_deploy_started_at_current_pose_can_pause_and_continue_without_reset():

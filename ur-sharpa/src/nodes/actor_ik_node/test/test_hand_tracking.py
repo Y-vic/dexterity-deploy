@@ -52,6 +52,7 @@ def test_tracking_record_contains_same_snapshot_command_and_measured_error():
     command, match_error = matcher.nearest(requested)
     measured = requested.copy()
     measured[22] += 0.03
+    tau = np.linspace(-0.4, 0.5, 44)
 
     record = tracking_record(
         hand_timestamp_ns=2_000_000_000,
@@ -69,6 +70,8 @@ def test_tracking_record_contains_same_snapshot_command_and_measured_error():
         command_match_max_abs_rad=match_error,
         recorded_at_ns=3,
         recorded_monotonic_ns=4,
+        measured_tau=tau,
+        tau_valid=True,
     )
 
     assert record["schema"] == TRACKING_SCHEMA
@@ -79,6 +82,10 @@ def test_tracking_record_contains_same_snapshot_command_and_measured_error():
     assert record["left_max_abs_error_rad"] == 0.0
     assert np.isclose(record["right_max_abs_error_rad"], 0.03)
     assert np.isclose(record["tracking_error"][22], 0.03)
+    np.testing.assert_allclose(record["tau"], tau)
+    assert record["tau_valid"] is True
+    assert np.isclose(record["left_max_abs_tau_nm"], 0.4)
+    assert np.isclose(record["right_max_abs_tau_nm"], 0.5)
 
 
 def test_invalid_command_cache_keeps_state_but_omits_tracking_error():
@@ -100,6 +107,9 @@ def test_invalid_command_cache_keeps_state_but_omits_tracking_error():
     assert record["tracking_error"] is None
     assert record["left_max_abs_error_rad"] is None
     assert record["right_max_abs_error_rad"] is None
+    assert record["tau_valid"] is False
+    assert record["left_max_abs_tau_nm"] is None
+    assert record["right_max_abs_tau_nm"] is None
 
 
 def test_writer_appends_jsonl_to_selected_actor_trace(tmp_path):

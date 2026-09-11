@@ -2,14 +2,36 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
 
 DIRECT_CANONICAL_EEF_SCHEMA = "sharpa62_direct_absolute_eef.v1"
 CANONICAL_EEF_POSE_LAYOUT = "xyz,r00,r10,r20,r01,r11,r21"
+
+
+def activate_reset_metadata(
+    server_metadata: Mapping[str, Any], reset_response: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Activate the metadata format returned by a policy session reset.
+
+    Stateful policies such as T-Rex may switch formats while a rollout is
+    running. A reset always returns the format for request 0, which is the
+    only authoritative value for the new session.
+    """
+
+    metadata_format = reset_response.get("metadata_format")
+    if not isinstance(metadata_format, Mapping):
+        raise ValueError("policy reset response is missing metadata_format")
+    format_id = metadata_format.get("format_id")
+    if not isinstance(format_id, str) or not format_id:
+        raise ValueError("policy reset metadata_format.format_id must be nonempty")
+    activated = dict(server_metadata)
+    activated["metadata_format"] = deepcopy(dict(metadata_format))
+    return activated
 
 
 @dataclass(frozen=True)
@@ -744,7 +766,8 @@ def main(args=None) -> None:
                 f"{self._base_session_id}-m{self._model_generation}"
                 f"-r{self._rollout_generation}"
             )
-            self._client.reset(session_id, request_id=0)
+            reset = self._client.reset(session_id, request_id=0)
+            self._metadata = activate_reset_metadata(self._metadata, reset)
             self._core = PolicyClientCore(session_id)
             self._pending = None
             self._busy = False
@@ -799,7 +822,9 @@ def main(args=None) -> None:
                         or str(self._metadata.get("prompt") or "")
                         or self._fallback_prompt
                     )
-                    self._client.reset(self._core.session_id, request_id=0); self._core.reset(); self._started = True
+                    reset = self._client.reset(self._core.session_id, request_id=0)
+                    self._metadata = activate_reset_metadata(self._metadata, reset)
+                    self._core.reset(); self._started = True
                     self._reason = ""
                     self._last_error = ""
                     self._publish({"phase": "connected", "metadata_format_id": self._metadata["metadata_format"]["format_id"]}); return
