@@ -157,7 +157,6 @@ def main(args=None) -> None:
             self.declare_parameter("ego_frame_stall_timeout_s", 3.0)
             self.declare_parameter("diagnostic_interval_s", 10.0)
             self.declare_parameter("left_wrist_serial", "230322270627")
-            self.declare_parameter("right_wrist_serial", "218622279586")
             self.declare_parameter("wrist_camera_fps", 30)
             self.declare_parameter("wrist_camera_width", 480)
             self.declare_parameter("wrist_camera_height", 270)
@@ -215,7 +214,7 @@ def main(args=None) -> None:
                     ),
                     "right_wrist": RealSenseWristCamera(
                         label="right_wrist",
-                        serial_number=str(self.get_parameter("right_wrist_serial").value),
+                        serial_number="218622279586",
                         width=wrist_camera_width,
                         height=wrist_camera_height,
                         frequency_hz=wrist_camera_fps,

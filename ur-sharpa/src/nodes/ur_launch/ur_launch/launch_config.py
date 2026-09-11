@@ -54,7 +54,6 @@ def _common_arguments(workspace_root: Path) -> list[DeclareLaunchArgument]:
         _argument("ego_frame_stall_timeout_s", "3.0"),
         _argument("camera_diagnostic_interval_s", "10.0"),
         _argument("left_wrist_serial", "230322270627"),
-        _argument("right_wrist_serial", "218622279586"),
         _argument("wrist_camera_fps", "30"),
         _argument("wrist_camera_width", "480"),
         _argument("wrist_camera_height", "270"),
@@ -152,7 +151,6 @@ def _shared_nodes(mode: str) -> list:
                 LaunchConfiguration("camera_diagnostic_interval_s"), value_type=float
             ),
             "left_wrist_serial": ParameterValue(LaunchConfiguration("left_wrist_serial"), value_type=str),
-            "right_wrist_serial": ParameterValue(LaunchConfiguration("right_wrist_serial"), value_type=str),
             "wrist_camera_fps": ParameterValue(LaunchConfiguration("wrist_camera_fps"), value_type=int),
             "wrist_camera_width": ParameterValue(LaunchConfiguration("wrist_camera_width"), value_type=int),
             "wrist_camera_height": ParameterValue(LaunchConfiguration("wrist_camera_height"), value_type=int),

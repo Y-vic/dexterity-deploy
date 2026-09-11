@@ -29,12 +29,12 @@ python .\vive_process.py
 cd /home/yns/deploy/Deploy-v2/ur-sharpa
 source scripts/setup_env.sh
 ros2 launch ur_launch teleop.launch.py \
-  recording_root:=/media/yns/T9/0825_0826_wyq_ppp
+  recording_root:=/media/fqx/'My Passport'/0910_wyq_chahua_change
 ```
 
 Monitor 地址：<http://127.0.0.1:8080/>。
 录制根目录由 ROS launch 参数 `recording_root` 指定，默认为
-`/media/yns/T9/0826_wyq_ppp`。未定义记录直接保存在该根目录，
+`/media/fqx/'My Passport'/0910_wyq_chahua_change`。未定义记录直接保存在该根目录，
 已分类记录分别保存在其 `success/` 和 `fail/` 子目录。
 
 Manus 左右手独立控制：一只手无数据时，另一只手仍可使用。Client 和
@@ -69,7 +69,7 @@ Monitor 的 Drop 会永久删除当前展示的整条 sample，并清空校验�
 
 ```bash
 cd /home/yns/deploy/Deploy-v2/ur-sharpa
-source scripts/setup_env.sh
+source scripts/setup_env.sh     
 ros2 launch ur_launch deploy.launch.py
 ```
 

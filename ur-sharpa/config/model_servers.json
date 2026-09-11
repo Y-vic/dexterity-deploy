@@ -12,15 +12,25 @@
       "port": 5500,
       "env_file": ""
     },
+    "orca": {
+      "label": "ORCA MoT v5",
+      "ssh_host": "orca",
+      "repo_root": "/share/project/zjk/orca",
+      "asset_root": "/share/project/zjk/orca",
+      "task_config_root": "/share/project/zjk/orca/scripts/deploy/task_config",
+      "remote_host": "127.0.0.1",
+      "port": 5500,
+      "env_file": ""
+    },
     "ps": {
       "label": "PS 4090",
       "ssh_host": "ps",
-      "repo_root": "/home/ps/dexterity/repos/dexhand",
-      "asset_root": "/home/ps/dexterity/assets",
-      "task_config_root": "/home/ps/dexterity/repos/dexhand/scripts/deploy/task_config",
+      "repo_root": "/home/ps/dexterity",
+      "asset_root": "/home/ps/dexterity",
+      "task_config_root": "/home/ps/dexterity/scripts/deploy/task_config",
       "remote_host": "127.0.0.1",
       "port": 5500,
-      "env_file": "/home/ps/dexterity/profile.env"
+      "env_file": "/home/ps/dexterity/.env.local"
     }
   }
 }

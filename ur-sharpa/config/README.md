@@ -23,6 +23,7 @@ profiles only while the current model is stopped or faulted. Its `/model/status`
 message then changes both lifecycle SSH commands and the policy client's SSH
 tunnel target.
 
-On PS the maintained root is `/home/ps/dexterity`: Dexhand code is under
-`repos/dexhand`, checkpoints/datasets under `assets`, and machine-specific
-runtime variables are in `profile.env`.
+On PS `/home/ps/dexterity` is the Dexhand checkout and asset root, matching the
+single-root layout used on BAAI. Checkpoints, datasets, logs, and third-party
+repositories live under that checkout; machine-specific variables are in
+`.env.local`.
