@@ -23,10 +23,47 @@ def jpeg_bytes(color=(32, 64, 96)):
     return output.getvalue()
 
 
-def test_validation_rate_threshold_is_25_hz():
-    assert MIN_VALID_RATE_HZ == 25.0
-    assert _validation_rate(25, 1.0) >= MIN_VALID_RATE_HZ
-    assert _validation_rate(24, 1.0) < MIN_VALID_RATE_HZ
+def test_validation_rate_requires_30_hz_with_two_percent_tolerance():
+    assert MIN_VALID_RATE_HZ == pytest.approx(29.4)
+    assert _validation_rate(30, 1.0) >= MIN_VALID_RATE_HZ
+    assert _validation_rate(29, 1.0) < MIN_VALID_RATE_HZ
+    assert _validation_rate(25, 1.0) < MIN_VALID_RATE_HZ
+
+
+def test_tactile_disabled_saves_without_tactile_messages_or_files(tmp_path, monkeypatch):
+    import recording_node.recording_node as module
+    monkeypatch.setattr(module, "_fk", lambda q: ([0.0]*15, [0.0]*15))
+    core = RecorderCore(tmp_path, record_tactile=False)
+    try:
+        core.observe_diagnostic(json.dumps({"recording": {"recording": False}, "cameras": {}}))
+        for name, msg in msgset().items():
+            if name not in ("wrench", "deform"):
+                core.update(name, msg, received=1_000_000_000)
+        assert core.start()
+        assert not core.update_deformation(object())
+        assert core.sample(now=1_000_000_000), core.last_error
+        saved = core.stop(True)
+        assert saved is not None
+        assert not (saved / "sharpa/tactile").exists()
+        data = json.loads((saved / "data.json").read_text())
+        assert "tactile" not in data["data"][0]["states"]
+        assert data["info"]["tactile_enabled"] is False
+        validation = json.loads((saved / "validation.json").read_text())
+        assert validation["ok"]
+        assert validation["disabled_modalities"] == ["wrench", "deform"]
+        assert not any(x["key"] in ("wrench", "deform") for x in validation["items"])
+        with np.load(saved / "timeline/source_quality.npz") as quality:
+            assert quality["enabled"].tolist() == [True]*4+[False]*2
+            np.testing.assert_array_equal(quality['age_ms'], quality['receive_age_ms'])
+            assert quality['receive_age_ms'][0, 1] == 0.
+            with np.load(saved / 'timeline/clock.npz') as clock:
+                expected = np.float32((int(clock['time_unix_ns'][0])
+                                      -int(quality['source_timestamp_ns'][0, 1]))/1e6)
+            assert quality['source_age_ms'][0, 1] == expected
+            assert quality['source_age_ms'][0, 1] != quality['receive_age_ms'][0, 1]
+        assert json.loads((saved / "raw/diagnostic_preroll.json").read_text())[0]["recording"]["recording"] is False
+    finally:
+        core.writer.close()
 
 def test_fingertip_fk_shape_when_kinematics_available():
     sys.path.insert(0, str(Path(__file__).parents[2] / "ur_common"))
@@ -96,7 +133,7 @@ def test_output_schema_and_three_color_mapping(tmp_path):
     start_with_deformation(c); assert c.sample(now=1_000_000_000); out=c.stop(save=True); assert out
     d=json.loads((out/"data.json").read_text()); assert set(d)=={"info","data"}; f=d["data"][0]
     assert set(f)=={"idx","colors","depths","states","actions","tactiles","audios","tactile_images","tactile_images_raw","tactile_images_deform","metadata"}
-    assert set(f["colors"])=={"color_0","color_1","color_2"}; assert set(f["metadata"]["stamps"])=={"frame_start","wall_clock","wrist","head_image","left_image","right_image","arm","hand_state","hand_action","tactile","frame_end"}
+    assert set(f["colors"])=={"color_0","color_1","color_2"}; assert set(f["metadata"]["stamps"])=={"frame_start","wall_clock","wrist","head_image","left_image","right_image","arm","hand_state","hand_action","tactile","joint_torque","frame_end"}
     assert f["colors"] == {
         "color_0":"cameras/ego/rgb.mp4",
         "color_1":"cameras/left_wrist/rgb.mp4",
@@ -124,7 +161,7 @@ def test_output_schema_and_three_color_mapping(tmp_path):
     validation=json.loads((out/"validation.json").read_text())
     assert [item["key"] for item in validation["items"]] == [
         "ego_camera", "left_wrist_camera", "right_wrist_camera",
-        "arm_state", "hand_state", "hand_action", "wrench", "deform",
+        "arm_state", "hand_state", "hand_action", "wrench", "deform", "joint_torque",
     ]
     assert [item["label"] for item in validation["items"][:4]] == [
         "Ego Camera", "Left Wrist Camera", "Right Wrist Camera", "Arm State",
@@ -243,6 +280,9 @@ def test_partial_tactile_frame_is_saved_and_reports_finger_percentages(tmp_path)
     assert deform["valid"].shape == (1,10) and not deform["valid"][0,4]
     validation=c.status()["validation"]
     assert validation and validation["ok"] is False
+    quality = json.loads((out/'manifest.json').read_text())['quality']
+    assert quality['files_ok'] and not quality['ok'] and not quality['capture_ok']
+    assert (out/'CAPTURE_QUALITY_FAILED').is_file()
     by_key={item["key"]:item for item in validation["items"]}
     assert "左无名指 100.00%" in by_key["wrench"]["details"]
     assert "右拇指 100.00%" in by_key["deform"]["details"]
@@ -303,7 +343,8 @@ def test_classification_preserves_timestamp_name(tmp_path):
     c.stop(save=False)
 
 
-def test_drop_permanently_deletes_only_last_saved_sample(tmp_path):
+@pytest.mark.parametrize('category', [None, 'success', 'fail'])
+def test_drop_permanently_deletes_only_last_saved_sample(tmp_path, category):
     c=RecorderCore(tmp_path,frequency=30)
     import recording_node.recording_node as mod
     mod._fk=lambda q: ([0.0]*15,[0.0]*15)
@@ -311,11 +352,14 @@ def test_drop_permanently_deletes_only_last_saved_sample(tmp_path):
     for key,value in msgset().items(): c.update(key,value,received=1_000_000_000)
     start_with_deformation(c); assert c.sample(now=1_000_000_000)
     sample=c.stop(save=True); assert sample and sample.is_dir()
+    if category:
+        sample=c.classify(category)
     removed=c.drop_last_saved()
     assert removed == sample.resolve()
     assert not sample.exists()
     assert unrelated.read_text() == "keep"
     assert c.status()["validation"] is None
+    assert c.status()["saved_path"] == ''
 
 def test_deformation_uses_pnd_raw_stream_and_plane_order(tmp_path):
     c=RecorderCore(tmp_path,frequency=30)
@@ -339,3 +383,57 @@ def test_deformation_uses_pnd_raw_stream_and_plane_order(tmp_path):
     assert index["valid"].shape == (1,10)
     assert not list(out.glob("tactiles_deform/*.jpg"))
     assert not list((out/"sharpa"/"tactile").glob("*.npy"))
+
+
+def test_background_save_excludes_later_reset_feedback_and_camera_frames(tmp_path, monkeypatch):
+    """Hold finalization open while new robot/camera/tactile messages arrive."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import recording_node.recording_node as module
+
+    monkeypatch.setattr(module, '_fk', lambda q: ([0.0] * 15, [0.0] * 15))
+    core = RecorderCore(tmp_path)
+    finalizing, release = threading.Event(), threading.Event()
+    original_stop = core.writer.stop
+
+    def slow_stop(**kwargs):
+        finalizing.set()
+        assert release.wait(10), 'test did not release background saving'
+        return original_stop(**kwargs)
+
+    monkeypatch.setattr(core.writer, 'stop', slow_stop)
+    try:
+        for key, message in msgset().items():
+            core.update(key, message, received=1_000_000_000)
+        start_with_deformation(core)
+        assert core.sample(now=1_000_000_000)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(core.stop, True)
+            try:
+                assert finalizing.wait(5)
+                assert core.recording is False and core.writer.active
+                assert not core.start(), 'new episode must still wait for saving'
+                messages = msgset()
+                messages['ur'].left_joint = [1.0] * 6
+                messages['hand'].q = [1.0] * 44
+                for name in ('ego', 'left_wrist', 'right_wrist'):
+                    setattr(messages['camera'], name + '_timestamp_ns', 2_000_000_000)
+                for key, message in messages.items():
+                    core.update(key, message, received=1_000_000_001)
+                assert not core.sample(now=1_000_000_001)
+                assert not core.record_message('/test/reset', 'test/Feedback', b'new feedback')
+                assert core.frames == core.attempts == 1
+            finally:
+                release.set()
+            saved = future.result(timeout=30)
+        assert saved is not None
+        data = json.loads((saved / 'data.json').read_text())['data']
+        assert len(data) == 1
+        assert data[0]['states']['left_arm']['qpos'] == [0] * 6
+        assert data[0]['states']['left_hand']['qpos'] == [0] * 22
+        for name in ('ego', 'left_wrist', 'right_wrist'):
+            with np.load(saved / 'cameras' / name / 'index.npz') as index:
+                assert index['source_timestamp_ns'].tolist() == [1_000_000_000]
+    finally:
+        release.set()
+        core.writer.close()

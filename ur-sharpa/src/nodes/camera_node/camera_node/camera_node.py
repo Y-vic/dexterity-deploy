@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import array
+import json
 import pathlib
 import threading
 import time
@@ -142,8 +144,12 @@ def main(args=None) -> None:
     from rclpy.node import Node
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from ur_msgs.msg import CameraSet
+    from std_msgs.msg import String
     from ur_common.camera_transport import SharedCameraWriter
-    from ur_common.drivers import HardwareConnectionError, HardwareDependencyError, RealSenseWristCamera, ZedEgoCamera
+    from ur_common.acquisition_diagnostics import AcquisitionMonitor
+    from ur_common.raw_camera import pack_bgr
+    from ur_common.drivers import HardwareConnectionError, HardwareDependencyError, RealSenseWristCamera
+    from ur_common.isolated_camera import IsolatedZedEgoCamera
 
     class CameraNode(Node):
         def __init__(self):
@@ -153,8 +159,8 @@ def main(args=None) -> None:
             self.declare_parameter("ego_zed_resolution", "HD720")
             self.declare_parameter("ego_zed_fps", 30)
             self.declare_parameter("ego_zed_serial_number", 0)
-            self.declare_parameter("ego_first_frame_timeout_s", 5.0)
-            self.declare_parameter("ego_frame_stall_timeout_s", 3.0)
+            self.declare_parameter("ego_first_frame_timeout_s", setting("camera", "ego_first_frame_timeout_s"))
+            self.declare_parameter("ego_frame_stall_timeout_s", setting("camera", "ego_frame_stall_timeout_s"))
             self.declare_parameter("diagnostic_interval_s", 10.0)
             self.declare_parameter("left_wrist_serial", "230322270627")
             self.declare_parameter("wrist_camera_fps", 30)
@@ -163,6 +169,22 @@ def main(args=None) -> None:
             self.declare_parameter("preview_fps", 10.0)
             self.declare_parameter("shared_memory_prefix", "ur_sharpa_camera_v1")
             self.declare_parameter("shared_memory_bytes", 4194304)
+            self.declare_parameter("raw_queue_size", 64)
+            self.declare_parameter("encoded_queue_size", 256)
+            self.declare_parameter("shared_memory_slots", 64)
+            self.declare_parameter("acquisition_log_dir", "")
+            self.declare_parameter("video_backend", "hevc_nvenc")
+            self._video_backend = str(self.get_parameter("video_backend").value)
+            if self._video_backend not in ("hevc_nvenc", "mjpeg"):
+                raise ValueError("video_backend must be hevc_nvenc or mjpeg")
+            self._raw_recording = self._video_backend == "hevc_nvenc"
+
+            queue_options = {
+                "raw_queue_size": int(self.get_parameter("raw_queue_size").value),
+                "encoded_queue_size": int(self.get_parameter("encoded_queue_size").value),
+            }
+            if min(queue_options.values()) <= 0:
+                raise ValueError("camera queues must have positive bounded capacities")
             self.declare_parameter("reconnect_interval_s", 2.0)
             wrist_camera_fps = int(self.get_parameter("wrist_camera_fps").value)
             wrist_camera_width = int(self.get_parameter("wrist_camera_width").value)
@@ -195,17 +217,29 @@ def main(args=None) -> None:
             self._shared_camera = SharedCameraWriter(
                 prefix=str(self.get_parameter("shared_memory_prefix").value),
                 max_payload_bytes=int(self.get_parameter("shared_memory_bytes").value),
+                slot_count=2 if self._raw_recording else int(self.get_parameter("shared_memory_slots").value),
+                reserve_space=self._raw_recording,
             )
+            # Raw frames also feed deployment, regardless of recording backend.
+            self._raw_shared_camera = SharedCameraWriter(
+                prefix=str(self.get_parameter("shared_memory_prefix").value) + "_raw",
+                max_payload_bytes=int(self.get_parameter("shared_memory_bytes").value),
+                slot_count=int(self.get_parameter("shared_memory_slots").value) if self._raw_recording else 2,
+                reserve_space=True)
+            self._last_raw_stamps = {}
+
             self._last_shared_signatures = {}
             self._reconnect_interval_s = float(self.get_parameter("reconnect_interval_s").value)
             if use_hardware:
                 candidates = {
-                    "ego": ZedEgoCamera(
+                    "ego": IsolatedZedEgoCamera(
+                        **queue_options,
                         resolution=str(self.get_parameter("ego_zed_resolution").value),
                         frequency_hz=int(self.get_parameter("ego_zed_fps").value),
                         serial_number=zed_serial if zed_serial > 0 else None,
                     ),
                     "left_wrist": RealSenseWristCamera(
+                        **queue_options,
                         label="left_wrist",
                         serial_number=str(self.get_parameter("left_wrist_serial").value),
                         width=wrist_camera_width,
@@ -213,6 +247,7 @@ def main(args=None) -> None:
                         frequency_hz=wrist_camera_fps,
                     ),
                     "right_wrist": RealSenseWristCamera(
+                        **queue_options,
                         label="right_wrist",
                         serial_number="218622279586",
                         width=wrist_camera_width,
@@ -226,6 +261,8 @@ def main(args=None) -> None:
                 # successfully; that made a single RealSense failure look
                 # like a complete camera outage in the unified launch.
                 for name, camera in candidates.items():
+                    if self._raw_recording:
+                        camera.configure_raw_recording(float(self.get_parameter("preview_fps").value))
                     self._connect_camera(name, camera, initial=True)
             camera_qos = QoSProfile(
                 depth=1,
@@ -238,6 +275,40 @@ def main(args=None) -> None:
             self._last_preview_publish = 0.0
             poll_hz = max(30, wrist_camera_fps * 4) if use_hardware else 30
             self.timer = self.create_timer(1.0 / poll_hz, self._tick)
+            self._acquisition_status = self.create_publisher(
+                String, "/camera/acquisition_status", camera_qos)
+            self._host_monitor = AcquisitionMonitor(
+                lambda: {name: camera.diagnostics(include_frame_timings=True) for name, camera in dict(self._cameras).items()
+                         if camera is not None},
+                str(self.get_parameter("acquisition_log_dir").value))
+            self.create_subscription(String, "/control/record_status", self._record_status, camera_qos)
+            self.get_logger().info(
+                f"recording={self._video_backend}; JPEG preview only={self._raw_recording}; raw queue={queue_options['raw_queue_size']}, "
+                f"encoded queue={queue_options['encoded_queue_size']}; continuous USB/host log: {self._host_monitor.path}")
+            self.create_timer(1.0, self._publish_acquisition_status)
+            self._raw_publish_stop = threading.Event()
+            self._raw_publish_thread = threading.Thread(
+                target=self._raw_publish_loop, name="camera-raw-publish", daemon=True)
+            self._raw_publish_thread.start()
+
+        def _record_status(self, msg):
+            try:
+                self._host_monitor.recording_status(json.loads(msg.data))
+            except (ValueError, TypeError):
+                pass
+
+        def _publish_acquisition_status(self):
+            payload = self._host_monitor.latest()
+            if not payload:
+                return
+            # Full per-frame timing is persisted by the monitor. Keep DDS status compact.
+            if 'cameras' in payload:
+                payload['cameras'] = {
+                    name: {key: value for key, value in row.items() if key != 'frame_timing_events'}
+                    for name, row in payload['cameras'].items()}
+            message = String()
+            message.data = json.dumps(payload, separators=(",", ":"))
+            self._acquisition_status.publish(message)
 
         def _connect_camera(self, name, camera, initial=False):
             try:
@@ -346,6 +417,39 @@ def main(args=None) -> None:
                 self._connect_threads[name] = thread
                 thread.start()
 
+        def _raw_publish_loop(self):
+            while not self._raw_publish_stop.is_set():
+                try:
+                    self._publish_raw_frames()
+                except Exception as exc:
+                    self.get_logger().error(f"raw camera publication failed: {exc}")
+                self._raw_publish_stop.wait(.001)
+
+        def _publish_raw_frames(self):
+            # Inference and recording see frames independently of preview/ROS
+            # scheduling. Preserve all pending recording frames and their stamps.
+            for name in CameraSetCore.NAMES:
+                camera = self._cameras.get(name)
+                if camera is None:
+                    if self._last_raw_stamps.get(name) != 0:
+                        self._raw_shared_camera.write(name, 0, b"", False)
+                        self._last_raw_stamps[name] = 0
+                else:
+                    if self._raw_recording:
+                        raw_frames = camera.read_raw_pending()
+                    else:
+                        latest = camera.read_raw_latest()
+                        raw_frames = [latest] if latest is not None else []
+                    for timestamp, bgr in raw_frames:
+                        if timestamp != self._last_raw_stamps.get(name):
+                            write_started_ns = time.monotonic_ns()
+                            self._raw_shared_camera.write(name, timestamp, pack_bgr(bgr))
+                            published_at_ns = time.time_ns()
+                            published_monotonic_ns = time.monotonic_ns()
+                            camera.record_raw_publish(timestamp, published_at_ns, published_monotonic_ns,
+                                (published_monotonic_ns-write_started_ns)/1e6)
+                            self._last_raw_stamps[name] = timestamp
+
         def _tick(self):
             self._reconnect_missing()
             data = {}
@@ -359,11 +463,12 @@ def main(args=None) -> None:
                     if pending
                     else camera.read() if camera is not None else None
                 )
+                raw_latest = camera.read_raw_latest() if camera is not None else None
                 if (
                     name == "ego"
                     and camera is not None
                     and self._ego_watchdog.stalled(
-                        int(snapshot.timestamp_ns) if snapshot is not None else 0,
+                        int(raw_latest[0]) if raw_latest is not None else 0,
                         time.monotonic(),
                     )
                 ):
@@ -390,7 +495,7 @@ def main(args=None) -> None:
                 self._last_camera_errors[name] = error
                 if camera is not None:
                     dropped = (
-                        int(getattr(camera, "dropped_raw_count", 0)),
+                        int(getattr(camera, "recording_raw_drop_count" if self._raw_recording else "dropped_raw_count", 0)),
                         int(getattr(camera, "dropped_encoded_count", 0)),
                     )
                     previous_dropped = self._last_camera_drop_counts.get(name, (0, 0))
@@ -420,11 +525,16 @@ def main(args=None) -> None:
             msg = CameraSet(); msg.header.stamp = self.get_clock().now().to_msg(); msg.encoding = payload["encoding"]; msg.ego = array.array("B", payload["ego"]); msg.left_wrist = array.array("B", payload["left_wrist"]); msg.right_wrist = array.array("B", payload["right_wrist"]); msg.ego_timestamp_ns = payload["ego_timestamp_ns"]; msg.left_wrist_timestamp_ns = payload["left_wrist_timestamp_ns"]; msg.right_wrist_timestamp_ns = payload["right_wrist_timestamp_ns"]; msg.ego_valid = payload["ego_valid"]; msg.left_wrist_valid = payload["left_wrist_valid"]; msg.right_wrist_valid = payload["right_wrist_valid"]; self.pub.publish(msg)
 
         def destroy_node(self):
+            self._raw_publish_stop.set()
+            self._raw_publish_thread.join()
+            self._host_monitor.close()
             self._closing = True
             for thread in self._connect_threads.values():
                 thread.join(timeout=2.0)
             for camera in self._camera_candidates.values(): camera.close()
             self._shared_camera.close()
+            if self._raw_shared_camera is not None:
+                self._raw_shared_camera.close()
             return super().destroy_node()
 
     rclpy.init(args=args); node = CameraNode()

@@ -2,6 +2,7 @@ import json
 import numpy as np
 import pytest
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 from actor_ik_node.actor_ik_node import (
@@ -202,6 +203,58 @@ def test_execution_trace_covers_live_mode_and_external_events(tmp_path):
     assert manifest["state"] == "complete"
     assert summary["event_count"] == 3
     assert final_state["missing_acks"] == ["sharpa"]
+
+
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_execution_trace_serializes_real_ros_float32_commands(tmp_path, dry_run):
+    from ur_msgs.msg import ArmCommand, HandCommand
+
+    target = np.linspace(-0.1, 0.1, 56, dtype=np.float32)
+    arm, hand = ArmCommand(), HandCommand()
+    arm.left_joint = target[:6].tolist()
+    arm.right_joint = target[6:12].tolist()
+    hand.q_cmd = target[12:].tolist()
+    writer = ExecutionTraceWriter(tmp_path)
+    path = Path(writer.start(mode='preview' if dry_run else 'live', provider='policy'))
+    writer.event('command_published', action_id='policy-0', dry_run=dry_run,
+                 left_arm_joint=list(arm.left_joint), right_arm_joint=list(arm.right_joint),
+                 hand_joint=list(hand.q_cmd), source=hand.source)
+    writer.stop()
+
+    records = [json.loads(line) for line in (path / 'events.jsonl').read_text().splitlines()]
+    command = next(row for row in records if row['event'] == 'command_published')
+    assert command['left_arm_joint'] + command['right_arm_joint'] + command['hand_joint'] == target.tolist()
+    assert command['action_id'] == 'policy-0' and command['dry_run'] is dry_run
+
+
+def test_execution_trace_preserves_numpy_numbers_in_nested_records(tmp_path):
+    writer = ExecutionTraceWriter(tmp_path)
+    path = Path(writer.start())
+    timestamp = 1792252799280343695
+    writer.event('diagnostic', nested={'delta': np.float32(0.125), 'success': np.bool_(True)},
+                 timestamp_ns=np.int64(timestamp), joints=np.array([[0.25, 0.5]], dtype=np.float32))
+    writer.stop(final_state={'count': np.int64(2), 'joints': np.array([0.25], dtype=np.float32)})
+
+    records = [json.loads(line) for line in (path / 'events.jsonl').read_text().splitlines()]
+    record = next(row for row in records if row['event'] == 'diagnostic')
+    assert record['nested'] == {'delta': 0.125, 'success': True}
+    assert record['timestamp_ns'] == timestamp
+    assert record['joints'] == [[0.25, 0.5]]
+    assert json.loads((path / 'final_state.json').read_text()) == {'count': 2, 'joints': [0.25]}
+
+
+def test_failed_event_serialization_leaves_journal_intact(tmp_path):
+    writer = ExecutionTraceWriter(tmp_path)
+    path = Path(writer.start())
+    before = (path / 'events.jsonl').read_bytes()
+    with pytest.raises(TypeError, match='not JSON serializable'):
+        writer.event('invalid', nested={'unsupported': object()})
+    assert (path / 'events.jsonl').read_bytes() == before
+    writer.event('local_policy_rejected', reason='test failure')
+    writer.stop()
+    records = [json.loads(line) for line in (path / 'events.jsonl').read_text().splitlines()]
+    assert [row['event'] for row in records] == ['execution_started', 'local_policy_rejected', 'execution_stopped']
+    assert json.loads((path / 'summary.json').read_text())['event_count'] == 3
 
 
 def test_execution_trace_summarizes_nonblocking_ack_warnings(tmp_path):

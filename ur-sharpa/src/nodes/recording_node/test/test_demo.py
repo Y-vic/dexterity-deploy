@@ -227,3 +227,68 @@ def test_acquisition_timing_slows_playback_instead_of_accelerating_drops():
     assert duration == pytest.approx(35.646666666)
     assert scale == pytest.approx(duration / (803 / 30))
     assert 803 / duration == pytest.approx(22.526, rel=1e-3)
+
+
+def test_demo_disabled_ignores_sensors_and_disabling_saves_recording(tmp_path, monkeypatch):
+    service = DemoService(str(tmp_path))
+    assert service.status()['enabled'] is False
+    monkeypatch.setattr(service.history, 'update', lambda *a: pytest.fail('disabled sensor work'))
+    service.sensor('/sharpa/state', object(), 123, lambda _: pytest.fail('disabled serialization'))
+    service.command('enable')
+    assert service.status()['enabled'] is True
+    finished = threading.Event()
+    class Session:
+        started_ns = time.time_ns()
+        frames = 0
+        dropped = {}
+        errors = []
+        def stop(self):
+            finished.set()
+            return {'path': str(tmp_path / 'saved'), 'complete': True}
+    service.session = Session()
+    result = service.command('disable')
+    assert result['enabled'] is False and result['connected'] is False
+    assert finished.wait(1)
+    service.save_thread.join(1)
+    assert service.result['complete']
+    assert service.session is None
+
+
+def test_demo_does_not_open_camera_until_enabled_and_closes_on_disable(tmp_path, monkeypatch):
+    import sys
+    from ur_common import drivers
+    monkeypatch.setattr(drivers, 'ensure_optional_runtime_paths', lambda: None)
+    opened, stopped = threading.Event(), threading.Event()
+    attempts = []
+    intrinsics = SimpleNamespace(width=64, height=36, fx=1, fy=1, ppx=0, ppy=0, coeffs=[], model='none')
+    profile = SimpleNamespace(get_stream=lambda _: SimpleNamespace(as_video_stream_profile=lambda:
+        SimpleNamespace(get_intrinsics=lambda: intrinsics)))
+    class Pipeline:
+        def start(self, config): opened.set(); return profile
+        def wait_for_frames(self, timeout):
+            time.sleep(.01)
+            return SimpleNamespace(get_color_frame=lambda: None)
+        def stop(self): stopped.set()
+    def context():
+        attempts.append('context')
+        return SimpleNamespace(query_devices=lambda: [SimpleNamespace(get_info=lambda key: 'D435' if key == 'name' else 'demo')])
+    rs = SimpleNamespace(context=context, pipeline=Pipeline,
+        config=lambda: SimpleNamespace(enable_device=lambda *a: None, enable_stream=lambda *a: None),
+        camera_info=SimpleNamespace(name='name', serial_number='serial'),
+        stream=SimpleNamespace(color='color'), format=SimpleNamespace(rgb8='rgb8'))
+    monkeypatch.setitem(sys.modules, 'pyrealsense2', rs)
+    service = DemoService(str(tmp_path), width=64, height=36)
+    service.thread.start()
+    try:
+        assert not opened.wait(.05)
+        assert attempts == []
+        service.command('enable')
+        assert opened.wait(1)
+        service.command('disable')
+        assert stopped.wait(1)
+        assert not service.capture_enabled.is_set()
+        time.sleep(.05)
+        assert attempts == ['context']
+    finally:
+        service.close()
+    assert not service.thread.is_alive()

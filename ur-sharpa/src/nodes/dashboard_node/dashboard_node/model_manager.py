@@ -11,10 +11,10 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 
-REMOTE_ROOT = "/share/project/yenaisheng/sharpa-deploy"
 TMUX_SESSION = "ur_sharpa_policy_server"
 ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 CONTROL_CHARACTER = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
@@ -45,7 +45,7 @@ class ServerProfile:
             raise ModelManagerError(f"无效的模型 server profile: {server_id!r}")
         repo_root = str(value.get("repo_root") or "").strip()
         ssh_host = str(value.get("ssh_host") or "").strip()
-        if not repo_root.startswith("/") or not ssh_host:
+        if (repo_root and not repo_root.startswith("/")) or not ssh_host or ssh_host.startswith("-"):
             raise ModelManagerError(f"server profile {server_id!r} 缺少 ssh_host/repo_root")
         port = int(value.get("port", 5500))
         if not 1 <= port <= 65535:
@@ -113,13 +113,12 @@ class RemoteModelManager:
         self,
         *,
         ssh_host: str = "BAAI",
-        remote_root: str = REMOTE_ROOT,
+        remote_root: str = "",
         session_name: str = TMUX_SESSION,
         runner: Callable[[list[str], float], subprocess.CompletedProcess[str]] = run_command,
         event_callback: Callable[[dict[str, Any]], None] | None = None,
         startup_timeout_s: float = 180.0,
         base_port: int = 5500,
-        port_candidates: int = 16,
         profile_path: str | Path | None = None,
         profiles: dict[str, ServerProfile] | None = None,
         default_server: str | None = None,
@@ -144,13 +143,17 @@ class RemoteModelManager:
             raise ModelManagerError(f"模型 server {default_server!r} 不存在")
         self._profiles = dict(profiles)
         self._server_id = str(default_server)
-        self.session_name = session_name
+        self.session_name = session_name + "-" + uuid.uuid4().hex[:12]
+        self._worker = None
+        self._stop_thread = None
+        self._closed = False
+        self._owns_session = False
         self.runner = runner
         self.event_callback = event_callback
         self.startup_timeout_s = startup_timeout_s
         self.base_port = int(self._profiles[self._server_id].port)
-        self.port_candidates = int(port_candidates)
         self._lock = threading.Lock()
+        self._notification_lock = threading.RLock()
         self._generation = 0
         self._cancel = threading.Event()
         self._state: dict[str, Any] = {
@@ -175,6 +178,7 @@ class RemoteModelManager:
     @staticmethod
     def _connection_state(profile: ServerProfile) -> dict[str, Any]:
         return {
+            "configured": bool(profile.repo_root),
             "server_id": profile.server_id,
             "server_label": profile.label,
             "ssh_host": profile.ssh_host,
@@ -194,9 +198,11 @@ class RemoteModelManager:
 
     def select_server(self, server_id: str) -> dict[str, Any]:
         with self._lock:
+            if self._closed:
+                raise ModelManagerError("模型管理器已关闭")
             if server_id not in self._profiles:
                 raise ModelManagerError(f"未知模型 server: {server_id}")
-            if self._state["phase"] not in {"stopped", "fault"}:
+            if (self._worker and self._worker.is_alive()) or self._owns_session or self._state["phase"] not in {"stopped", "fault"}:
                 raise ModelManagerError("请先停止当前模型再切换 server")
             self._server_id = server_id
             profile = self._profiles[server_id]
@@ -225,6 +231,9 @@ class RemoteModelManager:
             return self._profiles[self._server_id]
 
     def catalog(self) -> dict[str, Any]:
+        profile = self._active_profile()
+        if not profile.repo_root:
+            return {"models": [], "tasks": [], "server": profile.public(), "configured": False, "reason": "尚未配置模型目录"}
         script = """
 import json
 from pathlib import Path
@@ -291,14 +300,13 @@ for path in sorted(config_root.glob("*/task.json")):
     })
 print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separators=(",", ":")))
 """
-        profile = self._active_profile()
         remote_command = "python3 -c {} {} {} {}".format(
             shlex.quote(script),
             shlex.quote(profile.repo_root),
             shlex.quote(profile.asset_root),
             shlex.quote(profile.task_config_root),
         )
-        result = self._ssh(remote_command, timeout_s=20.0)
+        result = self._ssh(remote_command, timeout_s=20.0, profile=profile)
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -306,14 +314,23 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
             raise ModelManagerError("远端 task catalog 格式错误")
         payload["server"] = profile.public()
+        payload["configured"] = True
         return payload
 
     def start(self, task: str, run_id: str) -> dict[str, Any]:
+        with self._lock:
+            if self._closed:
+                raise ModelManagerError("模型管理器已关闭")
+        profile = self._active_profile()
         selected = self._find_run(task, run_id)
         if not selected["run"]["launchable"]:
             raise ModelManagerError(selected["run"]["disabled_reason"] or "该模型不可部署")
         with self._lock:
-            if self._state["phase"] in {
+            if self._closed:
+                raise ModelManagerError("模型管理器已关闭")
+            if profile.server_id != self._server_id:
+                raise ModelManagerError("模型 server 已切换，请重新选择模型")
+            if self._owns_session or (self._worker and self._worker.is_alive()) or self._state["phase"] in {
                 "starting",
                 "loading",
                 "running",
@@ -323,6 +340,7 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
             self._generation += 1
             generation = self._generation
             self._cancel = threading.Event()
+            self._stop_thread = None
             self._state.update(
                 phase="starting",
                 generation=generation,
@@ -337,25 +355,26 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 updated_at=time.time(),
             )
             state = deepcopy(self._state)
+            launch_run = deepcopy(selected["run"])
+            launch_run.update(
+                task=task,
+                task_id=selected["task"]["task_id"],
+                prompt=selected["task"]["prompt"],
+                dataset_path=selected["task"]["dataset_path"],
+            )
+            self._worker = threading.Thread(
+                target=self._start_worker,
+                args=(generation, launch_run, self._cancel),
+                daemon=True,
+                name="remote-model-start",
+            )
+            self._worker.start()
         self._notify(state)
-        launch_run = deepcopy(selected["run"])
-        launch_run.update(
-            task=task,
-            task_id=selected["task"]["task_id"],
-            prompt=selected["task"]["prompt"],
-            dataset_path=selected["task"]["dataset_path"],
-        )
-        threading.Thread(
-            target=self._start_worker,
-            args=(generation, launch_run, self._cancel),
-            daemon=True,
-            name="remote-model-start",
-        ).start()
         return state
 
     def stop(self) -> dict[str, Any]:
         with self._lock:
-            if self._state["phase"] == "stopping":
+            if self._state["phase"] == "stopping" or (self._state["phase"] == "stopped" and not self._owns_session):
                 return deepcopy(self._state)
             self._generation += 1
             generation = self._generation
@@ -367,13 +386,14 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 updated_at=time.time(),
             )
             state = deepcopy(self._state)
+            self._stop_thread = threading.Thread(
+                target=self._stop_worker,
+                args=(generation,),
+                daemon=True,
+                name="remote-model-stop",
+            )
+            self._stop_thread.start()
         self._notify(state)
-        threading.Thread(
-            target=self._stop_worker,
-            args=(generation,),
-            daemon=True,
-            name="remote-model-stop",
-        ).start()
         return state
 
     def _find_run(self, task: str, run_id: str) -> dict[str, Any]:
@@ -392,64 +412,43 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         run: dict[str, Any],
         cancel: threading.Event,
     ) -> None:
+        port = self.base_port
         try:
-            failures = []
-            for attempt in range(2):
-                port = self.base_port
-                try:
-                    self._cleanup_remote_model(port)
-                    self._launch_remote(run, port)
-                    if cancel.is_set():
-                        self._stop_remote_session()
-                        return
-                    self._transition(
-                        generation,
-                        "loading",
-                        f"正在端口 {port} 加载 {run['run_id']} checkpoint",
-                        port=port,
-                    )
-                    deadline = time.monotonic() + self.startup_timeout_s
-                    while time.monotonic() < deadline:
-                        if cancel.wait(1.0):
-                            self._stop_remote_session()
-                            return
-                        log_tail = self._captured_log()
-                        self._update_log(generation, log_tail)
-                        if self._pane_dead():
-                            raise ModelManagerError(
-                                self._error_log(log_tail) or "远端模型进程已退出"
-                            )
-                        if self._healthy(port):
-                            self._transition(
-                                generation,
-                                "running",
-                                f"模型服务已在端口 {port} 就绪",
-                                port=port,
-                            )
-                            return
-                    raise ModelManagerError("等待远端模型健康检查超时")
-                except Exception as exc:
-                    failures.append(str(exc))
-                    try:
-                        self._cleanup_remote_model(port)
-                    except Exception as cleanup_exc:
-                        failures.append(f"清理失败：{cleanup_exc}")
-                    if cancel.is_set():
-                        return
-                    if attempt == 0:
-                        self._transition(
-                            generation,
-                            "starting",
-                            f"首次启动失败，正在自动换端口重试：{exc}",
-                            port=0,
-                        )
-                        continue
-                    raise ModelManagerError(
-                        "模型自动重试失败：" + "；".join(failures)
-                    ) from exc
+            if cancel.is_set():
+                return
+            if self._port_in_use(port):
+                raise ModelManagerError("服务端口已被占用，请配置空闲端口；不会终止已有服务")
+            if cancel.is_set():
+                return
+            self._launch_remote(run, port)
+            if cancel.is_set():
+                self._stop_remote_session()
+                return
+            self._transition(
+                generation, "loading",
+                f"正在端口 {port} 加载 {run['run_id']} checkpoint", port=port,
+            )
+            deadline = time.monotonic() + self.startup_timeout_s
+            while time.monotonic() < deadline:
+                if cancel.wait(1.0):
+                    self._stop_remote_session()
+                    return
+                log_tail = self._captured_log()
+                self._update_log(generation, log_tail)
+                if self._pane_dead():
+                    raise ModelManagerError(self._error_log(log_tail) or "远端模型进程已退出")
+                if self._healthy(port):
+                    self._transition(generation, "running", f"模型服务已在端口 {port} 就绪", port=port)
+                    return
+            raise ModelManagerError("等待远端模型健康检查超时")
         except Exception as exc:
+            detail = f"模型启动失败：{exc}"
+            try:
+                self._stop_remote_session()
+            except Exception as cleanup_exc:
+                detail += f"；清理失败：{cleanup_exc}"
             if not cancel.is_set():
-                self._transition(generation, "fault", str(exc))
+                self._transition(generation, "fault", detail)
 
     def _launch_remote(self, run: dict[str, Any], port: int) -> None:
         profile = self._active_profile()
@@ -492,10 +491,8 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 ),
             ]
         )
+        self._owns_session = True
         self._ssh(remote_command, timeout_s=15.0)
-
-    def _select_available_port(self, excluded: set[int]) -> int:
-        return self.base_port
 
     def _port_in_use(self, port: int) -> bool:
         result = self._ssh_raw(
@@ -506,59 +503,21 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
 
     def _stop_worker(self, generation: int) -> None:
         try:
+            if self._worker is not None:
+                self._worker.join(timeout=self.startup_timeout_s + 30)
+                if self._worker.is_alive():
+                    raise ModelManagerError("模型启动线程尚未退出")
             self._cleanup_remote_model(self.base_port)
             self._transition(generation, "stopped", "模型已停止", port=0)
         except Exception as exc:
             self._transition(generation, "fault", str(exc))
 
     def _cleanup_remote_model(self, port: int) -> None:
-        remote_command = """
-set +e
-if tmux has-session -t {session} 2>/dev/null; then
-  tmux send-keys -t {session}:0.0 C-c
-  i=0
-  while [ "$i" -lt 20 ]; do
-    [ "$(tmux display-message -p -t {session}:0.0 '#{{pane_dead}}' 2>/dev/null)" = "1" ] && break
-    sleep 0.25
-    i=$((i + 1))
-  done
-  tmux kill-session -t {session} 2>/dev/null || true
-fi
-pattern='[d]exterity\\.deploy\\..*\\.server.*--port {port}([[:space:]]|$)'
-pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
-for pid in $pids; do
-  kill -TERM "$pid" 2>/dev/null || true
-done
-i=0
-while [ "$i" -lt 40 ]; do
-  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
-  [ -z "$pids" ] && break
-  sleep 0.25
-  i=$((i + 1))
-done
-pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
-for pid in $pids; do
-  kill -KILL "$pid" 2>/dev/null || true
-done
-i=0
-while [ "$i" -lt 40 ]; do
-  pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
-  port_open=0
-  if (exec 3<>/dev/tcp/127.0.0.1/{port}) >/dev/null 2>&1; then
-    port_open=1
-  fi
-  [ -z "$pids" ] && [ "$port_open" -eq 0 ] && exit 0
-  sleep 0.25
-  i=$((i + 1))
-done
-pids="$(pgrep -f "$pattern" 2>/dev/null || true)"
-[ -z "$pids" ] || exit 42
-if (exec 3<>/dev/tcp/127.0.0.1/{port}) >/dev/null 2>&1; then
-  exit 43
-fi
-exit 0
-        """.format(session=shlex.quote(self.session_name), port=int(port)).lstrip()
+        if not self._owns_session:
+            return
+        remote_command = "tmux kill-session -t {} 2>/dev/null || true".format(shlex.quote(self.session_name))
         self._ssh(remote_command, timeout_s=12.0)
+        self._owns_session = False
 
     def _stop_remote_session(self) -> None:
         self._cleanup_remote_model(self.base_port)
@@ -641,23 +600,29 @@ exit 0
         self._notify(state)
 
     def _notify(self, state: dict[str, Any]) -> None:
-        if self.event_callback is not None:
-            try:
-                self.event_callback(deepcopy(state))
-            except Exception:
-                pass
+        # Workers can advance between snapshot creation and notification. Never
+        # publish an older phase after a newer one (notably stopped -> stopping).
+        with self._notification_lock:
+            with self._lock:
+                if self._closed or state != self._state:
+                    return
+            if self.event_callback is not None:
+                try:
+                    self.event_callback(deepcopy(state))
+                except Exception:
+                    pass
 
-    def _ssh(self, remote_command: str, *, timeout_s: float) -> subprocess.CompletedProcess[str]:
-        result = self._ssh_raw(remote_command, timeout_s=timeout_s)
+    def _ssh(self, remote_command: str, *, timeout_s: float, profile: ServerProfile | None = None) -> subprocess.CompletedProcess[str]:
+        result = self._ssh_raw(remote_command, timeout_s=timeout_s, profile=profile)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()
             raise ModelManagerError(detail or f"SSH 命令退出码 {result.returncode}")
         return result
 
     def _ssh_raw(
-        self, remote_command: str, *, timeout_s: float
+        self, remote_command: str, *, timeout_s: float, profile: ServerProfile | None = None
     ) -> subprocess.CompletedProcess[str]:
-        profile = self._active_profile()
+        profile = profile or self._active_profile()
         command = [
             "/usr/bin/ssh",
             "-T",
@@ -674,3 +639,14 @@ exit 0
             return self.runner(command, timeout_s)
         except subprocess.TimeoutExpired as exc:
             raise ModelManagerError("SSH 操作超时") from exc
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._generation += 1
+            self._cancel.set()
+            worker = self._stop_thread or self._worker
+        if worker is not None:
+            worker.join(timeout=25)
+        if worker is None or not worker.is_alive():
+            self._stop_remote_session()

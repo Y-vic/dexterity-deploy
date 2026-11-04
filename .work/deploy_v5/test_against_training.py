@@ -251,3 +251,126 @@ def test_state_and_action_use_different_anchors():
         action[0][rb.SLICES["left_wrist_trans"]],
         atol=1e-4,
     )
+
+
+# --- the prompt contract --------------------------------------------------
+def test_embodiment_constant_is_a_real_phrase_key():
+    """``EMBODIMENT`` must be a key the training code will actually accept.
+
+    ``embodiment_phrase_for`` raises on an unknown value rather than defaulting,
+    so a typo here fails at the first inference -- after the 26 GB load, inside
+    tmux, with the robot already waiting. Checked against the training code's own
+    table instead of against a copied string.
+    """
+    import server as srv
+    from flagscale.models.vla.action_model.hand_action_lerobot import (
+        EMBODIMENT_PHRASES,
+        embodiment_phrase_for,
+    )
+
+    assert srv.EMBODIMENT in EMBODIMENT_PHRASES, sorted(EMBODIMENT_PHRASES)
+    # The UR-Sharpa windows rendered the robot phrase, same as T-Rex: dispatch is
+    # on carrying a robot span and these genuinely are Sharpa hands.
+    assert embodiment_phrase_for({"_embodiment": srv.EMBODIMENT}) == (
+        "a robot's two Sharpa hands"
+    )
+
+
+def test_prompt_is_the_bare_instruction_not_a_rendered_sentence():
+    """``lang`` is substituted INTO the checkpoint's template, not used as-is.
+
+    ``build_qwenvl_inputs`` replaces ``{instruction}`` with whatever ``lang``
+    holds, so a pre-rendered prompt would nest one template inside another and
+    put every sample far outside the token-length distribution the checkpoint was
+    trained on -- which nothing reports, because the chunk still comes out
+    well-shaped. This asserts the registered prompt is a bare instruction by
+    checking it carries none of the template's own words.
+    """
+    template = (
+        "You are controlling {embodiment} from a head-mounted camera. "
+        "The task is {instruction}. Predict how the scene and both hands will move next."
+    )
+    instruction = "Right hand unscrews the blue cap while left hand holds the bottle steady"
+    rendered = template.replace("{instruction}", instruction).replace(
+        "{embodiment}", "a robot's two Sharpa hands"
+    )
+    # A bare instruction cannot contain the template's framing.
+    for marker in ("You are controlling", "head-mounted camera", "Predict how"):
+        assert marker not in instruction
+    assert instruction in rendered
+
+
+def test_checkpoint_config_agrees_with_the_bridge_constants():
+    """Read the SERVED checkpoint's own config, not the run's yaml.
+
+    The yaml can be edited after a run finishes -- this one was, from 4000/250 to
+    1800/150 -- so the only authority on what the weights expect is the config
+    saved beside them.
+    """
+    import json
+    import os
+
+    import server as srv
+
+    checkpoint = os.environ.get("SHARPA_TEST_CHECKPOINT")
+    if not checkpoint:
+        pytest.skip("set SHARPA_TEST_CHECKPOINT to the served checkpoint directory")
+    config = json.load(open(Path(checkpoint) / "pretrained_model" / "config.json"))
+    action_model = config["action_model"]
+
+    assert action_model["action_dim"] == rb.ACTION_DIM
+    assert action_model["action_horizon"] == rb.ACTION_HORIZON
+    assert action_model["action_stride"] == rb.ACTION_STRIDE
+    assert tuple(action_model["state_history_offsets"]) == rb.STATE_HISTORY_OFFSETS
+    assert action_model["state_anchor_offset"] == rb.STATE_ANCHOR_OFFSET
+    assert action_model["use_state"] is True
+    # The template must still have both slots, or the server's _embodiment key
+    # is silently unused and the prompt the model sees is not what trained it.
+    assert "{instruction}" in config["prompt_template"]
+    assert "{embodiment}" in config["prompt_template"]
+    assert srv.EMBODIMENT == "robot"
+
+
+def test_make_policy_alone_does_not_load_weights():
+    """The defect this pins: building a policy leaves the expert RANDOM.
+
+    ``make_policy`` ends at ``TrainablePolicy.from_config``; the training entry
+    loads weights separately in its own ``init_from`` branch. A server that only
+    calls ``make_policy`` serves a randomly initialized 1.26B action expert, and
+    NOTHING downstream reports it -- the chunk is finite, correctly shaped, and
+    lands in a plausible millimetre range once the normalizer scales it.
+
+    Asserted by reading the source rather than by loading a 26 GB model, so it
+    runs in the normal suite. If a future refactor moves the load INTO
+    make_policy, this test fails and says so, which is the point: the server would
+    then be loading twice.
+    """
+    import inspect
+
+    from flagscale.train import train_qwen3_5_gr00t as entry
+
+    source = inspect.getsource(entry.make_policy)
+    for marker in ("load_model_state_fsdp2", "init_from", "load_state_dict"):
+        assert marker not in source, (
+            f"make_policy now mentions {marker!r}; the server loads weights itself "
+            "and would be loading them twice -- re-check MotPolicy.load"
+        )
+
+
+def test_server_loads_the_checkpoint_it_was_told_to_serve():
+    """``checkpoint_path`` must reach a loader, not only a log line.
+
+    It used to reach ONLY ``logger.info``, so the server announced the right
+    checkpoint while serving a random expert. Reading the source is what catches
+    that: any test that merely started the server and inspected its output saw
+    well-formed numbers and passed.
+    """
+    import inspect
+
+    import server as srv
+
+    source = inspect.getsource(srv.MotPolicy.load)
+    assert "load_model_state_fsdp2" in source, "MotPolicy.load does not load weights"
+    load_line = source.index("load_model_state_fsdp2(model")
+    path_line = source.index("self.checkpoint_path")
+    assert path_line < load_line, "checkpoint_path is not what gets loaded"

@@ -36,3 +36,8 @@ cdef class PyKinematics:
         return self.thisptr.forward(joint_config)
     def inverse(self,vector[double] ee_pose):
         return self.thisptr.inverse(ee_pose)
+    def inverse_quiet(self,vector[double] ee_pose):
+        # This wrapper version returns an empty vector on no solution without
+        # printing the legacy generic stderr message. Expose that capability so
+        # the Python solver need not redirect process stderr for every IK call.
+        return self.thisptr.inverse(ee_pose)

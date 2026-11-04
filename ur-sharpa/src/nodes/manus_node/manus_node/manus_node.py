@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import json
 import os
 import shlex
@@ -254,7 +255,7 @@ def main(args=None) -> None:
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
     from std_msgs.msg import String
-    from ur_msgs.msg import HandCommand
+    from ur_msgs.msg import HandCommand, ControlStatus
 
     class ManusNode(Node):
         def __init__(self):
@@ -271,10 +272,12 @@ def main(args=None) -> None:
             self.declare_parameter("start_hardware", True)
             self.declare_parameter("client_use_sudo", False)
             self.declare_parameter("retarget_command", "")
-            self.declare_parameter("startup_grace_s", 8.0)
-            self.declare_parameter("raw_timeout_s", 2.0)
-            self.declare_parameter("incomplete_hand_timeout_s", 1.0)
-            self.declare_parameter("action_timeout_s", 2.0)
+            self.declare_parameter("startup_grace_s", setting("manus", "startup_grace_s"))
+            self.declare_parameter("raw_timeout_s", setting("manus", "raw_timeout_s"))
+            self.declare_parameter("incomplete_hand_timeout_s", setting("manus", "incomplete_hand_timeout_s"))
+            self.declare_parameter("action_timeout_s", setting("manus", "action_timeout_s"))
+            self.declare_parameter("hil_mode", False)
+            self.declare_parameter("workbench_mode", False)
             self._process = None; self._reader = None; self._retarget = None
             self._zmq = None; self._mocap_zmq = None; self._proto = None; self._hardware_error = ""
             self._hardware_started = False; self._last_action_monotonic = 0.0
@@ -290,7 +293,13 @@ def main(args=None) -> None:
                 self.get_parameter("incomplete_hand_timeout_s").value,
                 self.get_parameter("action_timeout_s").value,
             )
-            self.pub = self.create_publisher(HandCommand, "/sharpa/command", 10)
+            topic = '/hil/hand_candidate' if self.get_parameter('hil_mode').value else '/sharpa/command'
+            self.pub = self.create_publisher(HandCommand, topic, 10)
+            if self.get_parameter("workbench_mode").value:
+                self._direct_pub = self.create_publisher(HandCommand, '/sharpa/command', 10)
+                self._candidate_pub = self.create_publisher(HandCommand, '/hil/hand_candidate', 10)
+                self.pub = self._candidate_pub
+                self.create_subscription(ControlStatus, '/control/status', self._control, 10)
             self.status = self.create_publisher(String, "/teleop/manus_status", 10)
             self.create_subscription(String, "/manus/retargeted_json", self._input, 10)
             if command:
@@ -299,6 +308,9 @@ def main(args=None) -> None:
                 self._start_hardware()
             self._poll_timer = self.create_timer(0.01, self._poll_hardware)
             self._status_timer = self.create_timer(0.5, self._publish_status)
+
+        def _control(self, message):
+            self.pub = self._direct_pub if int(message.active_source) == 2 else self._candidate_pub
 
         def _start_process(self, command):
             self._process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
@@ -449,6 +461,11 @@ def main(args=None) -> None:
             elif self._hardware_started and not retarget_alive:
                 code = None if self._retarget is None else self._retarget.poll()
                 error = error or f"Manus retarget exited with code {code}"
+            elif self._hardware_started:
+                # A live vendor process can stop producing frames without
+                # exiting. Surface the stream fault without stopping the
+                # pipeline or disabling a healthy single glove.
+                error = error or self._health.fault(client_alive, retarget_alive, now)
             out = String()
             out.data = json.dumps({
                 "connected": bool(valid),

@@ -9,6 +9,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/config", ["../../config/protection.yaml"]),
     ],
     # The compiled ikfast bindings and the hand URDFs must land next to the
     # Python sources, otherwise kinematics.py cannot find them at runtime.
@@ -17,10 +18,14 @@ setup(
             "ikfastpy/*.so",
             "ikfastpy/*.xml",
             "assets/hand_urdf/*/*.urdf",
+            "assets/command_calibration.json",
+            "assets/sharpa_firmware_limits.json",
+            "assets/ego_reference.js",
+            "assets/workbench/*",
         ],
     },
     include_package_data=True,
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "PyYAML"],
     tests_require=["pytest"],
     zip_safe=False,
     maintainer="ur-sharpa",

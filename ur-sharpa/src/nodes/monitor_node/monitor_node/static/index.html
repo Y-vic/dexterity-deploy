@@ -21,6 +21,7 @@
       --shadow: 0 24px 70px rgba(0, 0, 0, .28);
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       margin: 0;
       min-width: 320px;
@@ -41,27 +42,28 @@
       gap: 24px;
       border-bottom: 1px solid var(--line);
     }
-    .brand { display: flex; align-items: center; gap: 14px; }
+    .brand { display: flex; align-items: center; min-width: 0; gap: 14px; }
     .brand-mark {
       width: 44px; height: 44px; border-radius: 13px;
       display: grid; place-items: center;
       background: linear-gradient(145deg, var(--blue), var(--cyan));
       box-shadow: 0 10px 30px rgba(79, 140, 255, .32);
       color: white; font-weight: 900; letter-spacing: -.08em;
+      flex: 0 0 44px;
     }
     h1 { margin: 0; font-size: 21px; letter-spacing: -.02em; }
     .subtitle { margin-top: 3px; color: var(--muted); font-size: 13px; }
-    .header-state { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+    .header-state { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); }
     .section { margin-top: 22px; }
     .section-head {
-      display: flex; align-items: end; justify-content: space-between;
+      display: flex; flex-wrap: wrap; align-items: end; justify-content: space-between;
       gap: 16px; margin: 0 2px 10px;
     }
     h2 { margin: 0; font-size: 15px; font-weight: 720; letter-spacing: .01em; }
     .hint { color: var(--muted); font-size: 12px; }
     .panel {
       background: linear-gradient(145deg, rgba(20, 35, 59, .95), rgba(12, 23, 42, .94));
-      border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
+      min-width: 0; border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow);
     }
     .health-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
     .health-card { padding: 15px; min-height: 112px; position: relative; overflow: hidden; }
@@ -70,14 +72,14 @@
       right: -42px; top: -42px; background: var(--muted); opacity: .09;
     }
     .health-title { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 12px; }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: #64748b; box-shadow: 0 0 0 4px rgba(100, 116, 139, .1); }
+    .dot { flex: 0 0 8px; width: 8px; height: 8px; border-radius: 50%; background: #64748b; box-shadow: 0 0 0 4px rgba(100, 116, 139, .1); }
     [data-state="ok"] .dot { background: var(--green); box-shadow: 0 0 0 4px rgba(54, 211, 153, .11), 0 0 18px rgba(54, 211, 153, .45); }
     [data-state="warn"] .dot { background: var(--amber); box-shadow: 0 0 0 4px rgba(251, 191, 91, .11); }
     [data-state="bad"] .dot { background: var(--red); box-shadow: 0 0 0 4px rgba(251, 113, 133, .11); }
     .health-value { margin-top: 13px; font-size: 18px; font-weight: 760; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .health-detail { margin-top: 4px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .two-column {
-      display: grid; grid-template-columns: 1.45fr 1fr; gap: 14px; align-items: stretch;
+      display: grid; grid-template-columns: minmax(0,1.45fr) minmax(0,1fr); gap: 14px; align-items: stretch;
     }
     .two-column > div { min-width: 0; display: flex; flex-direction: column; }
     .two-column > div > .panel { flex: 1; }
@@ -90,6 +92,9 @@
     }
     .pill strong { color: var(--text); margin-left: 5px; font-weight: 650; }
     .button-row { display: flex; flex-wrap: wrap; gap: 9px; }
+    .reset-choice { display: grid; grid-template-columns: 160px minmax(0,1fr) auto minmax(0,1fr); gap: 8px; margin-top: 12px; }
+    .reset-choice input, .reset-choice select, .reset-choice button { min-width: 0; min-height: 38px; padding: 0 9px; border: 1px solid var(--line); border-radius: 8px; background: #0d1a30; color: var(--text); font: inherit; font-size: 12px; }
+    .reset-choice [hidden] { display: none; }
     button {
       min-height: 38px; padding: 0 15px; border: 1px solid transparent; border-radius: 9px;
       background: var(--blue); color: white; cursor: pointer; font-weight: 650;
@@ -97,6 +102,8 @@
     }
     button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.08); }
     button:disabled { opacity: .42; cursor: not-allowed; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+    button, .pill, .bias-result, .hint, .subtitle { max-width: 100%; overflow-wrap: anywhere; }
     button.secondary { background: rgba(255,255,255,.06); border-color: var(--line); color: var(--text); }
     button.success { background: #168a67; }
     button.danger { background: #b93650; }
@@ -105,7 +112,7 @@
     .bias-result { margin-top: 13px; padding: 10px 12px; border-radius: 9px; background: rgba(255,255,255,.035); color: var(--muted); font-size: 12px; }
     .camera-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
     .camera-card { overflow: hidden; }
-    .camera-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; }
+    .camera-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 14px; }
     .camera-name { font-weight: 700; }
     .camera-meta { color: var(--muted); font-size: 11px; }
     .camera-stage { position: relative; aspect-ratio: 4 / 3; background: #02050a; border-top: 1px solid var(--line); }
@@ -117,7 +124,7 @@
     }
     .camera-stage.has-frame .camera-empty { display: none; }
     .camera-empty span::before { content: "◉"; display: block; font-size: 24px; margin-bottom: 5px; }
-    .data-layout { display: grid; grid-template-columns: .95fr 1.55fr; gap: 20px; }
+    .data-layout { display: grid; grid-template-columns: minmax(0,.95fr) minmax(0,1.55fr); gap: 20px; }
     .record-actions { border-right: 1px solid var(--line); padding-right: 20px; }
     .metric-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 15px 0; }
     .metric { padding: 10px; border-radius: 9px; background: rgba(255,255,255,.035); }
@@ -129,8 +136,8 @@
     .validation-head span { color: var(--muted); font-size: 11px; }
     .validation-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
     .validation-item { min-width: 0; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(255,255,255,.025); }
-    .validation-name { display: flex; justify-content: space-between; gap: 6px; font-size: 11px; font-weight: 700; }
-    .validation-value { margin-top: 5px; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .validation-name { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px; font-size: 11px; font-weight: 700; }
+    .validation-value { margin-top: 5px; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .validation-detail { margin-top: 3px; color: var(--muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .classification-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
     .classification-row span { color: var(--muted); font-size: 11px; margin-right: 2px; }
@@ -148,7 +155,7 @@
     }
     .remote-path-display strong { flex: 0 0 auto; color: var(--cyan); font-weight: 650; }
     .remote-path-display code {
-      min-width: 0; overflow: hidden; color: var(--text); white-space: nowrap;
+      min-width: 0; color: var(--text); overflow-wrap: anywhere;
       font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
     }
     .event-panel { display: flex; align-items: flex-start; gap: 12px; min-height: 64px; }
@@ -161,16 +168,18 @@
       .health-grid { grid-template-columns: repeat(3, 1fr); }
       .data-layout { grid-template-columns: 1fr; }
       .record-actions { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 18px; }
+      .reset-choice { grid-template-columns: repeat(2,minmax(0,1fr)); }
     }
     @media (max-width: 760px) {
-      .shell { width: min(100% - 22px, 1480px); }
-      header { min-height: 92px; }
+      .shell { width: min(1480px, calc(100% - 22px)); }
+      header { min-height: 92px; padding: 18px 0; flex-wrap: wrap; gap: 14px; }
       .header-state .hint { display: none; }
       .two-column, .camera-grid { grid-template-columns: 1fr; }
       .two-column > div > .panel { flex: none; }
       .health-grid { grid-template-columns: repeat(2, 1fr); }
       .metric-grid { grid-template-columns: repeat(2, 1fr); }
       .validation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .reset-choice { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -190,7 +199,7 @@
         <article class="panel health-card" id="device-ur"><div class="health-title">UR 双臂<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
         <article class="panel health-card" id="device-sharpa"><div class="health-title">SharpA 双手<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
         <article class="panel health-card" id="device-vive"><div class="health-title">Vive Tracker<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
-        <article class="panel health-card" id="device-manus"><div class="health-title">Manus Gloves<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
+        <article class="panel health-card" id="device-glove"><div class="health-title">AE01 Gloves<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
         <article class="panel health-card" id="device-camera"><div class="health-title">Camera × 3<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待画面</div></article>
         <article class="panel health-card" id="device-recorder"><div class="health-title">Recorder<span class="dot"></span></div><div class="health-value">—</div><div class="health-detail">等待状态</div></article>
       </div>
@@ -202,12 +211,18 @@
         <div class="panel control-panel">
           <div class="state-line"><span class="pill">UR<strong id="ur-machine-state">—</strong></span><span class="pill">SharpA<strong id="sharpa-machine-state">—</strong></span><span class="pill">控制源<strong id="active-source">—</strong></span></div>
           <div class="button-row"><button class="amber" id="reset-machine" data-action="reset_both">机器复位</button><button class="success" id="start-machine" data-action="run_ur">机器启动</button><button class="danger" id="pause-machine" data-action="pause">机器暂停</button></div>
+          <div class="reset-choice" aria-label="复位目标">
+            <select id="reset-mode" aria-label="复位目标类型"><option value="bias">当前 Bias 固定位置</option><option value="episode">参考 episode 初始位置</option></select>
+            <input id="reset-root" aria-label="复位参考数据集路径" value="/media/yns/My Passport/0908_wyq_chahua_static" placeholder="参考数据集绝对路径" hidden>
+            <button id="reset-scan" type="button" hidden>加载 episode</button>
+            <select id="reset-episode" aria-label="复位参考 episode" hidden><option value="">请选择 episode</option></select>
+          </div>
         </div>
       </div>
       <div>
         <div class="section-head"><h2>Bias 校准</h2><span class="hint" id="bias-phase">idle</span></div>
         <div class="panel bias-panel">
-          <p class="bias-copy">先把双臂和 SharpA 双手调整到合适位置，再保存为新的复位基准。之后每次“机器复位”都会使用该 Bias。</p>
+          <p class="bias-copy">先把双臂和 SharpA 双手调整到合适位置，再保存为 Bias。选择“当前 Bias 固定位置”复位时会使用它。</p>
           <button class="secondary" id="save-bias" data-action="save_bias">保存当前位置为 Bias</button>
           <div class="bias-result" id="bias-detail">尚未执行 Bias 操作</div>
         </div>
@@ -244,13 +259,14 @@
           </div>
         </div>
         <div class="validation-wrap" id="record-validation" hidden>
-          <div class="validation-head"><strong>保存后校验（8 项）</strong><span id="validation-summary">—</span></div>
+          <div class="validation-head"><strong>保存后校验</strong><span id="validation-summary">—</span></div>
           <div class="validation-grid" id="validation-grid"></div>
         </div>
       </div>
     </section>
 
     <section class="section"><div class="section-head"><h2>系统信息</h2><span class="hint" id="last-refresh">尚未刷新</span></div><div class="panel event-panel"><div class="event-icon">◆</div><pre id="event-log">等待 Teleop 状态…</pre></div></section>
+    <ego-reference-view></ego-reference-view>
   </div>
   <script>
     const cameraNames = ['ego', 'left_wrist', 'right_wrist'];
@@ -285,7 +301,7 @@
       const wrap = byId('record-validation');
       const grid = byId('validation-grid');
       const items = validation && Array.isArray(validation.items) ? validation.items : [];
-      if (isRecording || items.length !== 8) {
+      if (isRecording || items.length === 0) {
         wrap.hidden = true;
         grid.replaceChildren();
         return;
@@ -302,7 +318,7 @@
         name.textContent = item.label || item.key || 'Data';
         const state = document.createElement('span');
         state.className = item.ok ? 'online-label' : 'bad-label';
-        state.textContent = item.ok ? '≥25 Hz' : (item.rate_ok ? '有缺失' : '<25 Hz');
+        state.textContent = item.ok ? '达标' : (item.rate_ok ? (item.timing && !item.timing.stable ? '时序异常' : '有缺失') : `<${finite(item.minimum_hz || validation.minimum_hz || 30).toFixed(1)} Hz`);
         head.append(name, state);
         const value = document.createElement('div');
         value.className = 'validation-value';
@@ -326,7 +342,7 @@
       const ur = upstream.ur_status || {};
       const sharpa = upstream.sharpa_status || {};
       const vive = upstream.vive_status || {};
-      const manus = upstream.manus_status || {};
+      const glove = upstream.glove_status || {};
       const recorder = upstream.record_status || {};
       const bias = upstream.bias_status || {};
       const cameraStatus = payload.camera_status || {};
@@ -341,12 +357,12 @@
       const viveSides = `${viveArms.left ? 'L✓' : 'L×'} ${viveArms.right ? 'R✓' : 'R×'}`;
       const viveDetail = `${viveSides} · ${vive.error || vive.operator_hint || `${vive.address || '5555'} · 等待 tracker publisher`}`;
       setDevice('vive', viveOk ? ((viveArms.left && viveArms.right) ? 'ok' : 'warn') : (vive.receiver_running ? 'warn' : 'bad'), viveOk ? 'Tracker Online' : (vive.receiver_running ? 'Windows 数据桥未启动' : 'ROS 节点离线'), viveDetail);
-      const manusOk = Boolean(manus.online && manus.valid);
-      const manusSides = `${manus.left_valid ? 'L✓' : 'L×'} ${manus.right_valid ? 'R✓' : 'R×'}`;
-      const manusState = manusOk ? ((manus.left_valid && manus.right_valid) ? 'ok' : 'warn') : (manus.client_alive || manus.retarget_alive ? 'warn' : 'bad');
-      const manusValue = manusOk ? 'Online' : 'Offline';
-      const manusDetail = `${manusSides} · ${manus.error || (manus.hardware_started ? '等待手套数据；不会自动重启' : '硬件未启动；请重启 Teleop')}`;
-      setDevice('manus', manusState, manusValue, manusDetail);
+      const gloveOk = Boolean(glove.online && glove.valid);
+      const gloveSides = `${glove.left_valid ? 'L✓' : 'L×'} ${glove.right_valid ? 'R✓' : 'R×'}`;
+      const gloveState = gloveOk ? ((glove.left_valid && glove.right_valid) ? 'ok' : 'warn') : (glove.sdk_alive ? 'warn' : 'bad');
+      const gloveValue = gloveOk ? 'Online' : 'Offline';
+      const gloveDetail = `${gloveSides} · ${glove.error || (glove.hardware_started ? '等待 AE01 数据或重定向预热；SDK 退出后不会自动重启' : 'AE01 SDK 未启动；请重启 Teleop')}`;
+      setDevice('glove', gloveState, gloveValue, gloveDetail);
 
       const cameraOnline = cameraNames.filter(name => cameraStatus[name] && cameraStatus[name].online).length;
       setDevice('camera', cameraOnline === 3 ? 'ok' : (cameraOnline ? 'warn' : 'bad'), `${cameraOnline} / 3 Online`, cameraOnline === 3 ? '三路画面正常' : '查看下方各路画面状态');
@@ -369,7 +385,8 @@
       const biasActive = Boolean(bias.active || ['requested', 'preparing', 'homing_ur', 'homing_sharpa', 'verifying'].includes(bias.phase));
       byId('save-bias').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
       byId('reset-machine').disabled = !controlOnline || !urOk || !sharpaOk || machineRunning || biasActive;
-      byId('start-machine').disabled = !controlOnline || !urOk || !sharpaOk || !viveOk || !manusOk || machineRunning || !machineReady || biasActive;
+      for (const id of ['reset-mode', 'reset-root', 'reset-scan', 'reset-episode']) byId(id).disabled = machineRunning || biasActive;
+      byId('start-machine').disabled = !controlOnline || !urOk || !sharpaOk || !viveOk || !gloveOk || machineRunning || !machineReady || biasActive;
       byId('pause-machine').disabled = !controlOnline || !machineRunning;
 
       byId('record-state').textContent = isSaving ? '正在保存' : (controlOnline ? (recordStates[status.record_state] || '未知') : '离线');
@@ -415,10 +432,10 @@
         meta.className = `camera-meta ${info.online ? 'online-label' : 'bad-label'}`;
       });
 
-      const messages = [payload.message, status.gate_reason, vive.error, manus.error, recorder.last_error].filter(Boolean);
+      const messages = [payload.message, status.gate_reason, vive.error, glove.error, recorder.last_error].filter(Boolean);
       byId('event-log').textContent = [...new Set(messages)].join('\n') || '系统运行正常';
       byId('last-refresh').textContent = `刷新于 ${new Date().toLocaleTimeString()}`;
-      const ready = urOk && sharpaOk && viveOk && manusOk && cameraOnline === 3;
+      const ready = urOk && sharpaOk && viveOk && gloveOk && cameraOnline === 3;
       byId('overall').textContent = ready ? 'Teleop Ready' : '存在离线设备';
       byId('overall').className = ready ? 'online-label' : 'warn-label';
       byId('overall-dot').style.background = ready ? 'var(--green)' : 'var(--amber)';
@@ -434,10 +451,38 @@
     async function action(name, button = null) {
       const label = button ? button.textContent : '';
       if (button) { button.disabled = true; button.textContent = '请求中…'; }
-      try { await post({action: name}); }
+      try {
+        const body = {action: name};
+        if (name === 'reset_both') body.reset_target = selectedResetTarget();
+        const result = await post(body);
+        if (result.accepted === false) throw new Error(result.gate_reason || result.message || '复位被拒绝');
+      }
       catch (error) { byId('event-log').textContent = String(error); }
       finally { if (button) button.textContent = label; }
     }
+
+    function selectedResetTarget() {
+      if (byId('reset-mode').value === 'bias') return {mode: 'bias'};
+      const root = byId('reset-root').value.trim(), episode = byId('reset-episode').value;
+      if (!root || !episode) throw new Error('请先加载参考数据集并选择 episode');
+      return {mode: 'episode', root, episode};
+    }
+    byId('reset-mode').addEventListener('change', () => {
+      const visible = byId('reset-mode').value === 'episode';
+      for (const id of ['reset-root', 'reset-scan', 'reset-episode']) byId(id).hidden = !visible;
+    });
+    byId('reset-root').addEventListener('input', () => byId('reset-episode').replaceChildren(new Option('请选择 episode', '')));
+    byId('reset-scan').addEventListener('click', async () => {
+      const select = byId('reset-episode');
+      select.replaceChildren(new Option('请选择 episode', ''));
+      try {
+        const response = await fetch('/api/reference/episodes?' + new URLSearchParams({root: byId('reset-root').value.trim()}), {cache: 'no-store'});
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        for (const item of data.episodes) select.add(new Option(`${item.category} / ${item.name}`, item.id));
+        byId('event-log').textContent = `已找到 ${data.episodes.length} 个 episode；请选择复位目标。`;
+      } catch (error) { byId('event-log').textContent = String(error); }
+    });
 
     document.querySelectorAll('[data-action]').forEach(button => button.addEventListener('click', () => action(button.dataset.action, button)));
     byId('local-path').addEventListener('input', () => { pathDirty.local = true; });
@@ -474,5 +519,6 @@
     connectCameras();
     poll();
   </script>
+  <script src="/api/reference/view.js" defer></script>
 </body>
 </html>

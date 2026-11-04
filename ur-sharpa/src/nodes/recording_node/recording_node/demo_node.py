@@ -50,6 +50,8 @@ class DemoService:
         self.preview_torque_history = TorqueHistory()
         self.lock = threading.RLock()
         self.quit = threading.Event()
+        self.capture_enabled = threading.Event()
+        self.resources_changed = lambda: None
         self.session = None
         self.saving = False
         self.result = None
@@ -64,9 +66,9 @@ class DemoService:
 
     def status(self):
         with self.lock:
-            connected = time.time_ns() - self.last_frame_ns < 1_000_000_000
+            connected = self.capture_enabled.is_set() and time.time_ns() - self.last_frame_ns < 1_000_000_000
             session = self.session
-            return {"connected": connected, "camera": dict(self.camera_info),
+            return {"enabled": self.capture_enabled.is_set(), "connected": connected, "camera": dict(self.camera_info),
                     "camera_error": self.camera_error, "error": self.command_error,
                     "recording": session is not None and not self.saving, "saving": self.saving,
                     "duration_s": round((time.time_ns() - session.started_ns) / 1e9, 1) if session else 0,
@@ -78,7 +80,20 @@ class DemoService:
 
     def command(self, action, root=None):
         with self.lock:
-            if action == "start":
+            if action == "enable":
+                self.capture_enabled.set()
+                self.resources_changed()
+            elif action == "disable":
+                self.capture_enabled.clear()
+                self.preview = None
+                self.last_frame_ns = 0
+                # Closing the feature finalizes an active recording instead of
+                # discarding it. Disk draining may finish after camera shutdown.
+                self.command("stop")
+                self.resources_changed()
+            elif action == "start":
+                if not self.capture_enabled.is_set():
+                    raise ValueError("请先开启 Demo 功能")
                 if self.saving:
                     raise ValueError("Demo is still saving")
                 if self.session:
@@ -117,7 +132,7 @@ class DemoService:
                 self.deleted_path = str(resolved)
                 self.command_error = ""
             else:
-                raise ValueError("expected start, stop or delete")
+                raise ValueError("expected enable, disable, start, stop or delete")
             return self.status()
 
     def _save(self):
@@ -135,11 +150,13 @@ class DemoService:
                 self.saving = False
 
     def sensor(self, topic, msg, stamp, serialize):
-        key = {"/sharpa/state": "hand", "/sharpa/tau": "tau", "/sharpa/wrench": "wrench",
-               "/sharpa/deformation": "deform"}.get(topic)
-        if key:
-            self.history.update(key, msg, stamp)
         with self.lock:
+            if not self.capture_enabled.is_set():
+                return
+            key = {"/sharpa/state": "hand", "/sharpa/tau": "tau", "/sharpa/wrench": "wrench",
+                   "/sharpa/deformation": "deform"}.get(topic)
+            if key:
+                self.history.update(key, msg, stamp)
             if self.session and not self.saving:
                 self.session.observe(topic, msg, stamp)
                 self.session.enqueue(topic, (stamp, serialize(msg)))
@@ -151,6 +168,9 @@ class DemoService:
 
     def _capture(self):
         while not self.quit.is_set():
+            self.capture_enabled.wait()
+            if self.quit.is_set():
+                break
             pipeline = None
             try:
                 from ur_common.drivers import ensure_optional_runtime_paths
@@ -183,8 +203,10 @@ class DemoService:
                 preview_at = 0
                 previous_frame = None
                 rate_started, rate_count = time.monotonic(), 0
-                while not self.quit.is_set():
+                while not self.quit.is_set() and self.capture_enabled.is_set():
                     frames = pipeline.wait_for_frames(2000)
+                    if not self.capture_enabled.is_set() or self.quit.is_set():
+                        break
                     stamp = time.time_ns()
                     color = frames.get_color_frame()
                     if not color:
@@ -200,6 +222,8 @@ class DemoService:
                               "color_frame_number": number,
                               "color_timestamp_domain": str(color.get_frame_timestamp_domain())}
                     with self.lock:
+                        if not self.capture_enabled.is_set():
+                            break
                         self.last_frame_ns = stamp
                         self.camera_error = ""
                         rate_count += 1
@@ -216,7 +240,8 @@ class DemoService:
                         preview = jpeg_bytes(render_overlay(
                             rgb, metrics, planes, self.preview_torque_history))
                         with self.lock:
-                            self.preview = preview
+                            if self.capture_enabled.is_set():
+                                self.preview = preview
                         preview_at = time.monotonic()
             except Exception as exc:
                 with self.lock:
@@ -232,11 +257,15 @@ class DemoService:
                         pipeline.stop()
                     except Exception:
                         pass
-            self.quit.wait(2)
+            if self.capture_enabled.is_set():
+                self.quit.wait(2)
 
     def close(self):
         self.quit.set()
-        self.thread.join(timeout=5)
+        self.capture_enabled.set()  # Wake an idle capture thread for shutdown.
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
+        self.capture_enabled.clear()
         self.command("stop")
         if self.save_thread:
             self.save_thread.join()
@@ -311,23 +340,50 @@ def main(args=None):
             self.shared_seen = False
             self.dropped = {}
             self.camera_type = get_message(SENSOR_TOPICS["/camera/set"])
-            qos = QoSProfile(depth=30, reliability=ReliabilityPolicy.BEST_EFFORT)
-            for topic, type_name in SENSOR_TOPICS.items():
-                self.create_subscription(get_message(type_name), topic,
-                                         lambda msg, topic=topic: self.receive(topic, msg), qos)
-            self.create_timer(1 / 120, self.poll_cameras)
+            self.sensor_qos = QoSProfile(depth=30, reliability=ReliabilityPolicy.BEST_EFFORT)
+            self.sensor_subscriptions = []
+            self.camera_timer = self.create_timer(1 / 120, self.poll_cameras)
+            self.camera_timer.cancel()
+            self.resource_guard = self.create_guard_condition(self.sync_resources)
+            self.service.resources_changed = self.resource_guard.trigger
             self.server = ThreadingHTTPServer(("127.0.0.1", int(self.get_parameter("port").value)),
                                               make_demo_handler(self.service))
             self.http_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.http_thread.start()
             self.service.thread.start()
 
+        def sync_resources(self):
+            # ROS entities are created/destroyed in the executor, never by the
+            # HTTP command thread. Disabled Demo has no sensor subscriptions.
+            if self.service.capture_enabled.is_set():
+                if not self.sensor_subscriptions:
+                    for topic, type_name in SENSOR_TOPICS.items():
+                        self.sensor_subscriptions.append(self.create_subscription(
+                            get_message(type_name), topic,
+                            lambda msg, topic=topic: self.receive(topic, msg), self.sensor_qos))
+                    self.shared_seen = False
+                    self.dropped = {}
+                    self.camera_timer.reset()
+            else:
+                self.camera_timer.cancel()
+                for subscription in self.sensor_subscriptions:
+                    self.destroy_subscription(subscription)
+                self.sensor_subscriptions.clear()
+                self.reader.close()
+                with self.service.lock:
+                    self.service.history = SensorHistory()
+                    self.service.preview_torque_history = TorqueHistory()
+
         def receive(self, topic, msg):
+            if not self.service.capture_enabled.is_set():
+                return
             if topic == "/camera/set" and self.shared_seen:
                 return
             self.service.sensor(topic, msg, time.time_ns(), serialize_message)
 
         def poll_cameras(self):
+            if not self.service.capture_enabled.is_set():
+                return
             pending = self.reader.read_pending()
             for name, count in self.reader.dropped_frames.items():
                 difference = count - self.dropped.get(name, 0)

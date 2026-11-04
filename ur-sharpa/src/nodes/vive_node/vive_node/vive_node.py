@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import json
 import time
 
@@ -165,6 +166,12 @@ def vive_side_validity(frame, stale_topics):
     }
 
 
+def joint_step_gate(first_command, hil_mode, hil_initial_step_guard,
+                    initial_limit, running_limit):
+    initial = first_command and (not hil_mode or hil_initial_step_guard)
+    return (initial_limit, 'INITIAL_STEP_LIMIT') if initial else (running_limit, 'JOINT_STEP_LIMIT')
+
+
 def main(args=None):
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
@@ -177,8 +184,17 @@ def main(args=None):
         def __init__(self):
             super().__init__("vive_node")
             self.declare_parameter("zmq_address", DEFAULT_ZMQ_ADDRESS)
-            self.declare_parameter("stale_timeout_s", 0.25)
+            self.declare_parameter("stale_timeout_s", setting("vive", "stale_timeout_s"))
             self.declare_parameter("frequency", 30.0)
+            self.declare_parameter("hil_mode", False)
+            self.declare_parameter("workbench_mode", False)
+            self.workbench_mode = bool(self.get_parameter("workbench_mode").value)
+            self.hil_mode = bool(self.get_parameter("hil_mode").value)
+            self.declare_parameter('hil_initial_step_guard', True)
+            self.hil_initial_step_guard = bool(self.get_parameter('hil_initial_step_guard').value)
+            self._hil_active = False
+            self._hil_token = ''
+            self._hil_seen = 0.0
             self.declare_parameter("base_offset", [0.05, 0.0, 0.40])
             self.declare_parameter("translation_scale", 1.0)
             self.declare_parameter("pose_filter_enabled", True)
@@ -189,10 +205,10 @@ def main(args=None):
             self.declare_parameter("rotation_min_cutoff_hz", 2.0)
             self.declare_parameter("rotation_beta", 1.5)
             self.declare_parameter("derivative_cutoff_hz", 1.0)
-            self.declare_parameter("max_translation_delta_m", 0.03)
-            self.declare_parameter("max_rotation_delta_rad", 0.12)
-            self.declare_parameter("max_joint_step_rad", 0.35)
-            self.declare_parameter("initial_joint_tolerance_rad", 0.05)
+            self.declare_parameter("max_translation_delta_m", setting("vive", "max_translation_delta_m"))
+            self.declare_parameter("max_rotation_delta_rad", setting("vive", "max_rotation_delta_rad"))
+            self.declare_parameter("max_joint_step_rad", setting("ur", "max_joint_step_rad"))
+            self.declare_parameter("initial_joint_tolerance_rad", setting("vive", "initial_joint_tolerance_rad"))
             self.address = str(self.get_parameter("zmq_address").value)
             self.stale_timeout_s = float(
                 self.get_parameter("stale_timeout_s").value
@@ -285,6 +301,8 @@ def main(args=None):
             self.ur_state_valid = False
             self._ur_state_error = ""
             self.control_state = ControlStatus.UR_STOPPED
+            self._preview = False
+            self._paused = False
             self._head_origin = None
             self._tracker_origin = {}
             self._robot_origin = {}
@@ -299,7 +317,12 @@ def main(args=None):
             self._ik_rejection_stage = {"left": "", "right": ""}
             self._last_ik_rejection_log_at = {"left": 0.0, "right": 0.0}
             self._last_ik_backtrack_log_at = {"left": 0.0, "right": 0.0}
-            self.command_pub = self.create_publisher(ArmCommand, "/ur/command", 10)
+            self.command_pub = self.create_publisher(ArmCommand, "/hil/arm_candidate" if self.hil_mode else "/ur/command", 10)
+            if self.workbench_mode:
+                self._direct_pub = self.create_publisher(ArmCommand, "/ur/command", 10)
+                self._candidate_pub = self.create_publisher(ArmCommand, "/hil/arm_candidate", 10)
+            if self.hil_mode or self.workbench_mode:
+                self.create_subscription(String, '/hil/state', self._on_hil, 10)
             self.status_pub = self.create_publisher(
                 String, "/teleop/vive_status", 10
             )
@@ -341,7 +364,7 @@ def main(args=None):
                 self._ur_state_error = f"UR FK failed: {exc}"
                 return
             self.measured_joint = measured_joint
-            if self.control_state != ControlStatus.UR_RUNNING:
+            if not self._control_running():
                 self.seeds = {
                     side: measured_joint[side].copy() for side in ("left", "right")
                 }
@@ -365,12 +388,36 @@ def main(args=None):
                 self._head_origin = None
 
         def _on_control(self, message):
-            previous = self.control_state
+            previous = self._control_running()
+            if self.workbench_mode:
+                hil_mode = int(message.active_source) != ArmCommand.SOURCE_VIVE
+                if hil_mode != self.hil_mode:
+                    self._reset_alignment()
+                    self._hil_active = False
+                    self._hil_seen = 0.0
+                self.hil_mode = hil_mode
+                self.command_pub = self._candidate_pub if hil_mode else self._direct_pub
             self.control_state = int(message.ur_state)
-            if self.control_state != ControlStatus.UR_RUNNING:
+            self._preview = bool(message.execution_dry_run)
+            self._paused = bool(message.execution_paused)
+            if not self._control_running() or not previous:
                 self._reset_alignment()
-            elif previous != ControlStatus.UR_RUNNING:
-                self._reset_alignment()
+
+        def _control_running(self):
+            return (self.control_state == ControlStatus.UR_RUNNING
+                    or (self.hil_mode and self._preview and not self._paused))
+
+        def _on_hil(self, message):
+            try:
+                status = json.loads(message.data)
+                active = bool(status['active'])
+                token = str(status['token'])
+                if active != self._hil_active or token != self._hil_token:
+                    self._reset_alignment()
+                self._hil_active, self._hil_token = active, token
+                self._hil_seen = time.monotonic()
+            except (ValueError, KeyError):
+                self._hil_active = False
 
         def _align_side(self, target, side):
             if not self._calibrated[side]:
@@ -448,7 +495,10 @@ def main(args=None):
                 for side in ("left", "right"):
                     if f"{side}_elbow" in stale_topics or getattr(frame, side) is None:
                         self._reset_alignment(side)
-            if tracking_valid and self.control_state == ControlStatus.UR_RUNNING and self.ur_state_valid:
+            hil_allowed = not self.hil_mode or (self._hil_active and time.monotonic()-self._hil_seen < 0.6)
+            if not hil_allowed:
+                self._reset_alignment()
+            if tracking_valid and self._control_running() and self.ur_state_valid and hil_allowed:
                 for side in ("left", "right"):
                     if not side_tracking_valid[side]:
                         continue
@@ -480,16 +530,10 @@ def main(args=None):
                             self.max_translation_delta_m,
                             self.max_rotation_delta_rad,
                         )
-                        joint_limit = (
-                            self.initial_joint_tolerance_rad
-                            if self._first_command_pending[side]
-                            else self.max_joint_step_rad
-                        )
-                        joint_stage = (
-                            "INITIAL_STEP_LIMIT"
-                            if self._first_command_pending[side]
-                            else "JOINT_STEP_LIMIT"
-                        )
+                        joint_limit, joint_stage = joint_step_gate(
+                            self._first_command_pending[side], self.hil_mode,
+                            self.hil_initial_step_guard, self.initial_joint_tolerance_rad,
+                            self.max_joint_step_rad)
                         (
                             solution,
                             solver_rejection,
@@ -535,6 +579,8 @@ def main(args=None):
                         self._motion_ready[side] = True
                         command = ArmCommand()
                         command.source = ArmCommand.SOURCE_VIVE
+                        if self.hil_mode:
+                            command.action_id = self._hil_token
                         command.period_s = 1.0 / self.frequency
                         command.left_joint = solution.tolist() if side == "left" else [0.0] * 6
                         command.right_joint = solution.tolist() if side == "right" else [0.0] * 6
@@ -580,7 +626,7 @@ def main(args=None):
                 side: bool(
                     side_tracking_valid[side]
                     and self.ur_state_valid
-                    and self.control_state == ControlStatus.UR_RUNNING
+                    and self._control_running()
                     and self._motion_ready[side]
                     and not self._last_ik_error[side]
                 )
@@ -596,7 +642,7 @@ def main(args=None):
                 "socket_ready": self.receiver.socket_ready,
                 "address": self.address,
                 "operator_hint": VIVE_PUBLISHER_HINT,
-                "control_running": self.control_state == ControlStatus.UR_RUNNING,
+                "control_running": self._control_running(),
                 "calibrated": all(self._calibrated.values()),
                 "calibrated_arms": dict(self._calibrated),
                 "last_command_age_s_by_arm": {

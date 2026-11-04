@@ -93,14 +93,22 @@ def _finite(value: Any, shape: tuple[int, ...], label: str) -> np.ndarray:
     return array
 
 
+# Fixed finite references: use the same atol + rtol*abs(reference) bounds as
+# numpy.allclose, without its broadcasting/NaN machinery on every tiny matrix.
+_HOMOGENEOUS_ROW = np.array([0.0, 0.0, 0.0, 1.0])
+_HOMOGENEOUS_TOL = 1.0e-7 + 1.0e-5 * _HOMOGENEOUS_ROW
+_ROTATION_IDENTITY = np.eye(3)
+_ROTATION_TOL = 1.0e-6 + 1.0e-5 * _ROTATION_IDENTITY
+
+
 def validate_transform(value: Any, label: str = "transform") -> np.ndarray:
     t = _finite(value, (4, 4), label)
-    if not np.allclose(t[3], (0.0, 0.0, 0.0, 1.0), atol=1.0e-7):
+    if not (np.abs(t[3] - _HOMOGENEOUS_ROW) <= _HOMOGENEOUS_TOL).all():
         raise ValueError(f"{label} has an invalid homogeneous row")
     r = t[:3, :3]
-    if not np.allclose(r.T @ r, np.eye(3), atol=1.0e-6):
+    if not (np.abs(r.T @ r - _ROTATION_IDENTITY) <= _ROTATION_TOL).all():
         raise ValueError(f"{label} rotation must be orthonormal")
-    if not np.isclose(np.linalg.det(r), 1.0, atol=1.0e-6):
+    if not abs(np.linalg.det(r) - 1.0) <= 1.0e-6 + 1.0e-5:
         raise ValueError(f"{label} rotation must have determinant +1")
     return t
 
@@ -359,6 +367,33 @@ class UrSharpAWireGeometry:
         wr = xyz_euler_to_transform((0.0, 0.0, 0.0, -np.pi / 4.0, 0.0, 0.0))
         wr = wr @ xyz_euler_to_transform((0.0, 0.0, 0.0, 0.0, np.pi / 2.0, 0.0))
         self.capture_tcp_to_ur_tcp = {side: wr.copy() for side in SIDES}
+        self._canonical_chains = {}
+
+    def _canonical_chain(self, side: str):
+        """Compose fixed calibration once; invalidate on calibration edits."""
+        side = _side(side)
+        root = self.capture_root_from_ur_base[side]
+        mount = self.capture_tcp_to_ur_tcp[side]
+        hand = UR_TCP_FROM_SHARPA_HAND[side]
+        key = tuple(value.tobytes() for value in (root, mount, hand, UR_ROOT_TO_PRETRAIN))
+        cached = self._canonical_chains.get(side)
+        if cached is None or cached[0] != key:
+            canonical = np.eye(4)
+            canonical[:3, :3] = UR_ROOT_TO_PRETRAIN
+            left = validate_transform(canonical) @ np.linalg.inv(validate_transform(root))
+            right = np.linalg.inv(validate_transform(mount)) @ validate_transform(hand)
+            cached = (key, left, right, np.linalg.inv(left), np.linalg.inv(right))
+            self._canonical_chains[side] = cached
+        return cached[1:]
+
+    def ur_base_tcp_to_canonical_pose(self, value: Any, side: str) -> np.ndarray:
+        """Same capture/mount chain as the two public conversion steps."""
+        left, right, _, _ = self._canonical_chain(side)
+        return transform_to_column_pose9(left @ validate_transform(value) @ right)
+
+    def canonical_pose_to_ur_base_tcp(self, value: Any, side: str) -> np.ndarray:
+        _, _, left_inverse, right_inverse = self._canonical_chain(side)
+        return validate_transform(left_inverse @ column_pose9_to_transform(value) @ right_inverse)
 
     def ur_base_tcp_to_capture_tcp(self, value: Any, side: str) -> np.ndarray:
         ur_base_from_tcp = validate_transform(value)

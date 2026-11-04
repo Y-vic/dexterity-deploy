@@ -7,12 +7,12 @@
 
 1. `/home/fqx/ur_sharpa` **只读**，只拷贝不修改。
 2. `/home/yns/deploy/sharpa_policy_v3_ws` 只读参考。它是已部署跑过的 v3 代码，是行为基准的
-   权威来源；与 `Deploy-v2/ur-sharpa/src/nodes/sharpa_policy_v3_client` 是同一份代码的两个分叉副本。
+   权威来源；与 `Deploy/ur-sharpa/src/nodes/sharpa_policy_v3_client` 是同一份代码的两个分叉副本。
 3. `interface/` 是冻结 ABI（`sharpa.py` 明确要求改动需 schema bump + 迁移说明 + 各本体签字）。
    UR 侧 import，不再抄。
 4. v1 **关闭全部安全保护**，但做成 launch 参数（默认 `false`），单开关可完整恢复。
 5. 硬件是 **UR5**（非 UR5e）。DH 不同，IK 和 URDF 都要对上。
-6. 落地在 `Deploy-v2/ur-sharpa/src`，运行节点统一放在 `src/nodes/`。
+6. 落地在 `Deploy/ur-sharpa/src`，运行节点统一放在 `src/nodes/`。
 
 ## 目标包布局
 

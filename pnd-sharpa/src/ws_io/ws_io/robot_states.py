@@ -54,7 +54,7 @@ class RobotStatesNode(Node):
         )
         self.declare_parameter(
             "pnd_bias_local_path",
-            "/home/ps/Deploy-v2/pnd-sharpa/deploy/runtime/pnd_bias/"
+            "/home/ps/Deploy/pnd-sharpa/deploy/runtime/pnd_bias/"
             "bias_joints_set_with_init.json",
         )
 

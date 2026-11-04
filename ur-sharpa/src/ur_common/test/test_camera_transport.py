@@ -1,6 +1,8 @@
 import os
+import pytest
 
 from ur_common.camera_transport import SharedCameraReader, SharedCameraWriter
+from ur_common import camera_transport as transport
 
 
 def jpeg(payload: bytes) -> bytes:
@@ -174,6 +176,110 @@ def test_reader_rejects_truncated_jpeg_payload(tmp_path):
         assert frame is not None
         assert frame.ego_valid is False
         assert frame.ego == b""
+    finally:
+        reader.close()
+        writer.close()
+
+
+@pytest.mark.parametrize("partial_header", [
+    bytes(24),
+    transport._FILE_HEADER.pack(transport._MAGIC, 0, 0, 0),
+    transport._FILE_HEADER.pack(transport._MAGIC, 64, 64, 0),
+])
+def test_latest_reader_retries_transient_header_without_losing_frame(tmp_path, monkeypatch, partial_header):
+    writer = SharedCameraWriter("test_camera", 64, tmp_path)
+    reader = SharedCameraReader("test_camera", tmp_path)
+    try:
+        writer.write("ego", 11, jpeg(b"previous"))
+        assert reader.read().ego_valid
+        writer.write("ego", 12, jpeg(b"current"))
+        descriptor = reader._maps["ego"]
+        original = os.pread
+        injected = []
+
+        def interrupted_header(fd, size, offset):
+            if fd == descriptor and offset == 0 and not injected:
+                injected.append(True)
+                return partial_header
+            return original(fd, size, offset)
+
+        monkeypatch.setattr(os, "pread", interrupted_header)
+        frame = reader.read()
+        assert injected
+        assert frame.ego_valid
+        assert frame.ego_timestamp_ns == 12
+        assert frame.ego == jpeg(b"current")
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_writer_does_not_clear_live_metadata_when_publishing(tmp_path, monkeypatch):
+    writer = SharedCameraWriter("test_camera", 64, tmp_path)
+    reader = SharedCameraReader("test_camera", tmp_path)
+    try:
+        writer.write("ego", 11, jpeg(b"previous"))
+        header = transport._FILE_HEADER
+        observed = []
+
+        class InterruptedPack:
+            size = header.size
+            unpack = header.unpack
+
+            @staticmethod
+            def pack_into(buffer, offset, *fields):
+                # Expose struct.pack_into's zeroed destination to another reader.
+                buffer[offset:offset + header.size] = bytes(header.size)
+                observed.append(reader.read().ego_valid)
+                header.pack_into(buffer, offset, *fields)
+
+        monkeypatch.setattr(transport, "_FILE_HEADER", InterruptedPack)
+        writer.write("ego", 12, jpeg(b"current"))
+        observed.append(reader.read().ego_valid)
+        assert all(observed)
+        assert reader.read().ego_timestamp_ns == 12
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_latest_reader_refreshes_tail_after_ring_overwrite(tmp_path, monkeypatch):
+    writer = SharedCameraWriter("test_camera", 64, tmp_path, slot_count=2)
+    reader = SharedCameraReader("test_camera", tmp_path)
+    try:
+        writer.write("ego", 11, jpeg(b"old"))
+        original = reader._read_frame
+        overwritten = []
+
+        def overwrite_slot(*args):
+            if not overwritten:
+                overwritten.append(True)
+                writer.write("ego", 12, jpeg(b"middle"))
+                writer.write("ego", 13, jpeg(b"new"))
+            return original(*args)
+
+        monkeypatch.setattr(reader, "_read_frame", overwrite_slot)
+        frame = reader.read()
+        assert frame.ego_valid and frame.ego_timestamp_ns == 13
+    finally:
+        reader.close()
+        writer.close()
+
+
+def test_cached_valid_frame_never_hides_persistent_invalid_data(tmp_path):
+    writer = SharedCameraWriter("test_camera", 64, tmp_path)
+    reader = SharedCameraReader("test_camera", tmp_path)
+    try:
+        writer.write("ego", 11, jpeg(b"good"))
+        assert reader.read().ego_valid
+        writer.write("ego", 12, b"broken")
+        assert not reader.read().ego_valid
+        writer.write("ego", 13, jpeg(b"good-again"))
+        assert reader.read().ego_valid
+        writer.write("ego", 0, b"", valid=False)
+        assert not reader.read().ego_valid
+        writer.close()
+        assert reader.read() is None
     finally:
         reader.close()
         writer.close()

@@ -3,7 +3,7 @@
 <package format="3">
   <name>dashboard_node</name>
   <version>0.1.0</version>
-  <description>Machine, remote model and policy dashboard for dual UR5 + SharpA.</description>
+  <description>Machine, remote policy and recording dashboard for dual UR5 + SharpA.</description>
   <maintainer email="ur.sharpa@example.com">ur-sharpa</maintainer>
   <license>Apache-2.0</license>
 
@@ -13,6 +13,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>ur_msgs</exec_depend>
   <exec_depend>ur_common</exec_depend>
+  <exec_depend>monitor_node</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <!-- pybullet: offscreen sim rendering for panels 2 and 5. OPTIONAL - the node
        serves the non-sim panels and says so on the page when it is missing. -->

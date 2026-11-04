@@ -11,6 +11,7 @@ def generate_launch_description():
             "recording_root",
             default_value="/media/yns/T9/0824_yns_unscrew_cap",
         ),
+        DeclareLaunchArgument("reference_dataset_root", default_value="/home/yns/data/0916_ppp"),
         DeclareLaunchArgument("upload_host", default_value="BAAI"),
         DeclareLaunchArgument(
             "upload_path",
@@ -21,6 +22,7 @@ def generate_launch_description():
              output="screen", parameters=[{
                  "port": LaunchConfiguration("port"),
                  "recording_root": LaunchConfiguration("recording_root"),
+                 "reference_dataset_root": LaunchConfiguration("reference_dataset_root"),
                  "upload_host": LaunchConfiguration("upload_host"),
                  "upload_path": LaunchConfiguration("upload_path"),
                  "status_timeout_s": LaunchConfiguration("status_timeout_s"),

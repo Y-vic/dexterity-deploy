@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import socket
 import struct
 import sys
@@ -77,6 +78,19 @@ from repr_bridge import (  # noqa: E402
     STATE_HISTORY_OFFSETS,
     build_state_rows,
     decode_action_chunk,
+)
+from speed_guard import (  # noqa: E402
+    MAX_HAND_STEP_RAD,
+    MAX_WRIST_STEP_MM,
+    SCALE_ENV as SCALE_ENV_NAME,
+    govern,
+    read_scale,
+)
+from time_stretch import (  # noqa: E402
+    TIME_SCALE_ENV as TIME_SCALE_ENV_NAME,
+    read_time_scale,
+    stretch_chunk,
+    stretched_length,
 )
 
 logging.basicConfig(
@@ -122,25 +136,40 @@ EEF_CONTRACT = {
 # per period. Setting it to TRAIN_FPS would run every chunk 3x too fast, which
 # reads as an aggressive policy rather than a units bug.
 FREQUENCY_HZ = TRAIN_FPS / ACTION_STRIDE  # 10.0
+TIME_SCALE = read_time_scale()
+EXECUTION_HORIZON = stretched_length(ACTION_HORIZON, TIME_SCALE)
 
-# How many steps of the current chunk remain when the client should fetch the
-# next one. 0 means "fetch after the last step completes", which stalls the arm
-# for a whole inference at every chunk boundary.
+# --- deliberately sequential execution ------------------------------------
+# RTC_STEPS = 0 is the diagnostic mode requested for model validation. The
+# client waits for inference, executes the complete chunk, publishes done, and
+# only then starts the next inference. The arm therefore holds its last command
+# during inference instead of hiding latency by prefetching another chunk.
 #
-# SET FROM MEASUREMENT, not from taste. On this checkpoint and this GPU, steady
-# state inference is ~370 ms (measured 2026-09-11 over the ssh tunnel: 0.37,
-# 0.36 s; the first call is ~13.5 s of CUDA warmup and must not be used for
-# this). At 10 Hz each step is 100 ms, so:
-#
-#   RTC=3 -> 300 ms of cover, LESS than 370 ms: the arm stalls every chunk.
-#   RTC=5 -> 500 ms of cover, ~130 ms of slack. Chosen.
-#
-# The cost of raising it is that the chunk is abandoned earlier: at RTC=5 only
-# half of a 1.0 s chunk is executed before replanning. That is the right trade
-# for a policy that re-anchors on the measured pose every request -- a stale
-# half-chunk is worth less than continuous motion. Re-measure if the GPU, the
-# checkpoint, or num_inference_timesteps changes.
-RTC_STEPS = 5
+# This is intentionally slow and visibly stepped. It removes observation-to-
+# takeover lag from the experiment, so a remaining boundary jump belongs to the
+# model/observation path rather than RTC timing. Restore a measured non-zero RTC
+# only after the policy can complete the task in this mode.
+RTC_STEPS = 0
+EXECUTE_START = RTC_STEPS
+EXECUTE_LENGTH = EXECUTION_HORIZON - EXECUTE_START
+
+# The pair above is only correct while these hold. Asserted at import: a future
+# edit that raises RTC_STEPS without re-deriving EXECUTE_START would restore the
+# silent retraction, and nothing downstream can see it.
+if EXECUTE_START != RTC_STEPS:
+    raise ValueError(
+        f"EXECUTE_START {EXECUTE_START} must equal RTC_STEPS {RTC_STEPS}: the "
+        "anchor lag at take-over is exactly RTC_STEPS steps"
+    )
+if not 0 < EXECUTE_LENGTH <= EXECUTION_HORIZON:
+    raise ValueError(
+        f"EXECUTE_LENGTH {EXECUTE_LENGTH} outside (0, {EXECUTION_HORIZON}]"
+    )
+if not 0 <= RTC_STEPS < EXECUTE_LENGTH:
+    raise ValueError(
+        f"RTC_STEPS {RTC_STEPS} must be < EXECUTE_LENGTH {EXECUTE_LENGTH}; the "
+        "client rejects rtc >= execute_length"
+    )
 
 
 # --- msgpack, matching sharpa_interface.server.serialization exactly ------
@@ -218,13 +247,43 @@ def unpackb(payload):
 #           `observation.images.head_left` (hand_action_corpus.TREX_CAMERA_KEY),
 #           i.e. the head/ego camera. The two wrist cameras exist on this robot
 #           but this checkpoint never saw them, so they are declared off.
-#   state   STATE_HISTORY_OFFSETS is (0,), so one row: the current frame,
-#           measured against an anchor 12 frames back. The anchor is NOT
-#           requested from the workstation -- the interface only ever sends the
-#           current frame, so this server keeps the history itself.
+#   state   STATE_HISTORY_OFFSETS is (9, 6, 3, 0), so FOUR rows, all measured
+#           against the single anchor STATE_ANCHOR_OFFSET frames back. Every one
+#           of those five frames is read out of the observation's OWN history,
+#           which is why history_len is 12 rather than 0: buffering them here
+#           instead would space the rows one inference apart (~500 ms) instead of
+#           three frames apart (100 ms) and inflate every displacement ~5x.
 #   sensor  tau/wrench/deformation are not in the 56D representation at all.
 #           All off.
 IMAGE_SIZE = (256, 256)
+
+# Which body the prompt claims to be driving, as a key into the training code's
+# EMBODIMENT_PHRASES ("robot" -> "a robot's two Sharpa hands"). Both the T-Rex
+# pretrain windows and the UR-Sharpa post-train windows rendered this phrase,
+# because dispatch is on whether a window carries a robot span and these are
+# genuinely Sharpa hands on both. It is NOT cosmetic: the checkpoint's
+# prompt_template has an {embodiment} slot and the backbone raises rather than
+# defaulting when nothing fills it.
+EMBODIMENT = "robot"
+
+# Per-inference diagnostics, opt-in via SHARPA_DEPLOY_DIAGNOSE=1. Kept behind a
+# flag rather than deleted after use: the numbers it prints (the chunk in
+# NORMALIZED units, beside the metric path length) are what distinguish a model
+# sampling out of distribution from a normalizer or layout error, and that
+# question recurs on every new checkpoint.
+DIAGNOSE = os.environ.get("SHARPA_DEPLOY_DIAGNOSE", "") not in ("", "0", "false")
+
+# The operator's speed scale, read once at import so a bad value fails before the
+# port is bound rather than on the first inference. 1.0 is full speed.
+#
+# This is a comfort/safety control, NOT a fix for anything: measured, the policy's
+# commanded per-step motion sits at or below the corpus at every percentile
+# (`dist_compare.py`), while the corpus itself reaches ~190 mm/s at the wrist and
+# varies 5.3x by task phase (`gt_envelope.py`). The fast unscrew phase is the task,
+# faithfully reproduced. Scaling it down trades progress per chunk for a speed a
+# person can stand beside; it does not disturb the anchor-lag relation, which is
+# about WHICH steps are sent, not how far each goes. See speed_guard.py.
+SPEED_SCALE = read_scale()
 
 
 def build_metadata_format(format_id: str) -> dict[str, Any]:
@@ -521,6 +580,39 @@ class MotPolicy:
         logger.info("loading the 4B policy from %s ...", self.checkpoint_path)
         started = time.time()
         model = make_policy(policy_config, dataset.meta)
+
+        # LOAD THE WEIGHTS. make_policy only BUILDS the model -- it ends at
+        # TrainablePolicy.from_config, so the VLM comes from `base_vlm` but the
+        # 1.26B action expert is left RANDOMLY INITIALIZED. The training entry
+        # point loads them separately, further down its own function
+        # (train_qwen3_5_gr00t.py, the `init_from` branch), which is why building
+        # a policy the same way training does is not enough here.
+        #
+        # This was a real defect and it is worth naming precisely, because
+        # everything that normally catches a bad deploy passed: the model loaded,
+        # /metadata validated, identity matched, the chunk had the right shape and
+        # dtype, every value was finite, latency was normal, and 43 contract tests
+        # were green. The only symptom was that the actions were nonsense -- a
+        # random expert maps noise to a well-shaped chunk, and multiplying it by
+        # the normalizer's 19.1 mm/sigma even lands it in a plausible-looking
+        # millimetre range. Nothing anywhere compared the output against the
+        # distribution it was supposed to come from.
+        #
+        # Uses the training code's own loader so serving cannot drift from it, and
+        # the config's `init_from` is deliberately NOT consulted: that names the
+        # PRETRAIN checkpoint this run was post-trained from, so honouring it would
+        # serve the wrong weights while every log line named the right ones.
+        from flagscale.train.utils.train_utils import load_model_state_fsdp2
+
+        weights_dir = Path(self.checkpoint_path) / "pretrained_model"
+        if not weights_dir.is_dir():
+            raise RuntimeError(
+                f"{weights_dir} does not exist; --checkpoint wants the directory "
+                "holding pretrained_model/, e.g. .../checkpoints/001500"
+            )
+        logger.info("loading expert + VLM weights from %s", weights_dir)
+        load_model_state_fsdp2(model, weights_dir)
+
         # eval, not train: dropout off, and the backbone re-enables use_cache,
         # which is what makes the one-VLM-pass sampling path work.
         model.eval()
@@ -586,16 +678,63 @@ class MotPolicy:
         rows = np.asarray(state56, dtype=np.float32)
         if rows.ndim != 2 or rows.shape[1] != ACTION_DIM:
             raise ValueError(f"state must be [rows, {ACTION_DIM}], got {rows.shape}")
-        state = self.normalizer.normalize_state(torch.from_numpy(rows))
+        state = self.normalizer.normalize_state(
+            torch.from_numpy(rows), embodiment=EMBODIMENT
+        )
 
-        batch = [{"image": [image], "lang": prompt, "state": state}]
+        # `lang` is the BARE INSTRUCTION, not a rendered prompt. The checkpoint
+        # carries prompt_template in its own config and build_qwenvl_inputs
+        # substitutes {instruction} itself, so passing a pre-rendered sentence
+        # here would nest it inside the template and shift every sample off the
+        # length distribution the model trained on.
+        #
+        # `_embodiment` is MANDATORY for this checkpoint, not optional. Its
+        # template contains an {embodiment} slot, and build_qwenvl_inputs RAISES
+        # when the slot is present and no phrase was derived -- deliberately, so
+        # one corpus cannot borrow another's prompt. The phrase is looked up in
+        # EMBODIMENT_PHRASES; "robot" renders "a robot's two Sharpa hands",
+        # which is exactly what these UR-Sharpa windows rendered in training
+        # (dispatch is on carrying a robot span, and these genuinely are Sharpa
+        # hands, so the UR corpus got the same phrase T-Rex did).
+        batch = [
+            {
+                "image": [image],
+                "lang": prompt,
+                "state": state,
+                "_embodiment": EMBODIMENT,
+            }
+        ]
         with torch.no_grad():
             output = self.model._predict_action_mot(batch)
 
         chunk = output[next(iter(output))]
-        chunk = self.normalizer.denormalize(chunk.float().cpu())
+        raw = chunk.float().cpu()
+        chunk = self.normalizer.denormalize(raw, embodiment=EMBODIMENT)
         chunk = chunk[0].numpy() if chunk.ndim == 3 else chunk.numpy()
-        return np.asarray(chunk, dtype=np.float32)
+        chunk = np.asarray(chunk, dtype=np.float32)
+
+        # Diagnostic, off by default. Logs the chunk in NORMALIZED units next to
+        # the denormalized one, which is the only way to tell a model that is
+        # sampling badly from a normalizer applied wrongly: the expert's output
+        # should sit within a couple of sigma, so |raw| >> 2 says the weights are
+        # producing out-of-distribution values and no scaling choice downstream
+        # can rescue it, while a sane raw next to an insane metric output puts the
+        # fault in the statistics or the layout.
+        if DIAGNOSE:
+            flat = raw[0] if raw.ndim == 3 else raw
+            flat = np.asarray(flat, dtype=np.float32)
+            per_step = np.linalg.norm(np.diff(chunk[:, 0:3], axis=0), axis=1)
+            logger.info(
+                "DIAG raw |mean|=%.3f max|.|=%.3f p99=%.3f | left_trans path=%.1fmm "
+                "net=%.1fmm | hand max|d|/step=%.3f rad",
+                float(np.abs(flat).mean()),
+                float(np.abs(flat).max()),
+                float(np.percentile(np.abs(flat), 99)),
+                float(per_step.sum() * 1000),
+                float(np.linalg.norm(chunk[-1, 0:3] - chunk[0, 0:3]) * 1000),
+                float(np.abs(np.diff(chunk[:, 12:34], axis=0)).max()),
+            )
+        return chunk
 
 
 # --- websocket framing ----------------------------------------------------
@@ -807,6 +946,23 @@ class PolicyServer:
             if not np.all(np.isfinite(chunk)):
                 raise RuntimeError("model returned a non-finite chunk")
 
+            # Corpus ceiling, then the operator's scale. Inert at SPEED_SCALE=1
+            # unless the sampled chunk exceeds anything the corpus contains, which
+            # measured 0 of 54 in-distribution windows -- so a `capped` line in the
+            # log is a real excursion and worth reading.
+            chunk, speed = govern(chunk, SPEED_SCALE)
+            if speed["capped"]:
+                logger.warning(
+                    "speed ceiling engaged: %s (max step %.1fmm / %.3frad)",
+                    speed["capped"],
+                    speed["max_wrist_step_mm"],
+                    speed["max_hand_step_rad"],
+                )
+
+            # Slow the complete path in time rather than shrinking it in space.
+            # At 0.3, ten model points become 34 commands at the same safe 10 Hz;
+            # wrist and hand endpoints remain exactly what the policy predicted.
+            chunk = stretch_chunk(chunk, hands, TIME_SCALE)
             decoded = decode_action_chunk(chunk, poses)
             session.request_count += 1
         # Log the newest row's displacement from the state anchor: it is the one
@@ -844,14 +1000,15 @@ def build_action_response(
     execution-slice truncation, so sending a pre-sliced array would be
     rejected for a length mismatch.
 
-    ``execute_start`` is 0 and ``execute_length`` is the whole chunk: this
-    policy re-plans from the current pose on every request, so there is no
-    reason to withhold part of a chunk. ``rtc`` then asks the client to fetch
-    the next chunk with RTC_STEPS still to run, which is what keeps the arm
-    moving across the inference gap.
+    ``execute_start`` is EXECUTE_START, not 0. Re-planning from the measured
+    pose does NOT by itself make the chunk current: the pose is measured when
+    the observation is taken and the chunk takes over RTC_STEPS later, so its
+    first EXECUTE_START steps describe motion the arm has already performed.
+    Sending them commands a retraction. See the RTC_STEPS derivation above.
+
+    The arrays stay ``action_length`` long: the client slices them itself and
+    rejects a pre-sliced array for a length mismatch.
     """
-    if not 0 <= RTC_STEPS < ACTION_HORIZON:
-        raise ValueError(f"RTC_STEPS {RTC_STEPS} must be in [0, {ACTION_HORIZON})")
     return {
         "schema": ACTION_SCHEMA,
         "session_id": session_id,
@@ -863,9 +1020,9 @@ def build_action_response(
         "timestamp_ns": time.time_ns(),
         "execution": {
             "frequency_hz": float(FREQUENCY_HZ),
-            "action_length": int(ACTION_HORIZON),
-            "execute_start": 0,
-            "execute_length": int(ACTION_HORIZON),
+            "action_length": int(EXECUTION_HORIZON),
+            "execute_start": int(EXECUTE_START),
+            "execute_length": int(EXECUTE_LENGTH),
             "rtc": int(RTC_STEPS),
         },
         "action": {
@@ -1133,6 +1290,29 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("checkpoint=%s", checkpoint_path)
     logger.info("config=%s", config_path)
     logger.info("normalizer=%s", normalizer_path)
+    if SPEED_SCALE != 1.0:
+        # Loud, because a scaled server looks like an underperforming policy to
+        # anyone reading only the robot: progress per chunk drops by this factor.
+        logger.warning(
+            "SPEED SCALE %.2f -- every commanded step is %.0f%% of the policy's "
+            "own motion (%s)", SPEED_SCALE, SPEED_SCALE * 100.0, SCALE_ENV_NAME
+        )
+    else:
+        logger.info("speed scale 1.00 (full); ceiling at %.1fmm/%.3frad per step",
+                    MAX_WRIST_STEP_MM, MAX_HAND_STEP_RAD)
+    if TIME_SCALE != 1.0:
+        logger.warning(
+            "TIME SCALE %.2f -- full %d-step policy path resampled to %d steps "
+            "at %.1f Hz; endpoints are unchanged (%s)",
+            TIME_SCALE,
+            ACTION_HORIZON,
+            EXECUTION_HORIZON,
+            FREQUENCY_HZ,
+            TIME_SCALE_ENV_NAME,
+        )
+    else:
+        logger.info("time scale 1.00 (native %d steps at %.1f Hz)",
+                    ACTION_HORIZON, FREQUENCY_HZ)
     if not prompt:
         # Allowed: the client skips the prompt comparison when either side is
         # empty. Logged because an empty prompt reaches the VLM as an empty

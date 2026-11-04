@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, "/home/yns/deploy/Deploy-v2/interface")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "interface"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import server as srv

@@ -1,6 +1,19 @@
 # D435 Demo recording
 
-Deploy Dashboard includes a **Demo** control and a live D435 view. Start records
+Deploy Dashboard includes a **Demo** control and a live D435 view at the bottom,
+above the Ego comparison panel. The service starts **disabled**. Turn on the
+**开启** switch before recording; only then does it open the D435, subscribe to
+sensors, and poll camera shared memory. With the switch off, the capture thread
+waits, ROS sensor subscriptions are destroyed, the polling timer is cancelled,
+and browser preview/status polling stops. Loading a dashboard checks Demo status
+once so an already enabled service is represented correctly after a page reload.
+
+Turning the switch off during recording stops and saves that recording; pending
+disk writes finish in the background. The D435 pipeline closes after its current
+frame wait returns (up to two seconds). Re-enable the switch to inspect the saved
+result or start another recording.
+
+Start records
 sensor data and camera streams; Stop drains the writer and finalizes the files.
 Recording does not start, stop, or otherwise command the robot. Policy, Replay,
 and idle hardware feedback can all be recorded. Existing teleop episodes retain
@@ -38,7 +51,7 @@ Launch arguments:
 
 Set `demo_camera_serial:=<serial>` if multiple D435 cameras are connected.
 The two existing D405 wrist cameras are excluded. Missing/busy D435 devices
-retry every two seconds and do not prevent the rest of Deploy from running.
+retry every two seconds while enabled and do not prevent the rest of Deploy from running.
 D435/D435i uses only 1920x1080 RGB at 30 Hz; depth and IMU are not enabled. USB bandwidth must support the
 additional camera; device frame gaps and shared-memory camera overruns are
 reported in the recording manifest. Runtime dependencies are `pyrealsense2`,

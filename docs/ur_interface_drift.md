@@ -46,11 +46,11 @@ interface）／**B** 陈旧遗留（可删）／**C** 违反 contract（潜在 b
 
 ### 第三份副本
 
-`/home/yns/deploy/sharpa_policy_v3_ws/.../` 严格更旧，**没有任何 Deploy-v2 副本丢失的修复**：
+`/home/yns/deploy/sharpa_policy_v3_ws/.../` 严格更旧，**没有任何 Deploy 副本丢失的修复**：
 `action.py:15` 为 `sharpa_policy_action.v3`、带 `wrist_action_type`／44 维
 `hand_joint`／`relative_eef`；`metadata.py:13` 为 v3；`observation.py:457` 等仍写
 `"eef_frame": "robot_base"` 而非 `eef_def`；`mock_server.py:228` 同为 v3。
-Deploy-v2 副本已把这些前推到 v4 与 `eef_def`。**结论：该副本可整体忽略。**
+Deploy 副本已把这些前推到 v4 与 `eef_def`。**结论：该副本可整体忽略。**
 
 ## observation.py（I 235 / U 852）
 
@@ -143,7 +143,7 @@ I 侧独有：push 时 deepcopy 隔离（`buffers.py:49`）；U 用 `copy()+setf
 | A11 | eef 数组逐行 rot6d 退化／共线校验 | **D** | U `action.py:143-156,171`；I 无 |
 | A12 | `expected_action_id`／`expected_revision` 可选比对 | **D** | U `action.py:193-194,260-267`；I `action.py:140-146` 只比对 session/request |
 | A13 | server error 在 transport 层处理而非 parser 层 | — | U `transport.py:547-558` vs I `action.py:148-149`。位置不同，覆盖等价，非差异 |
-| A14 | `_object` 默认 `allow_unknown=True` | — | U `action.py:81`，与契约可扩展一致。第三副本为 `False`（旧行为），Deploy-v2 已修 |
+| A14 | `_object` 默认 `allow_unknown=True` | — | U `action.py:81`，与契约可扩展一致。第三副本为 `False`（旧行为），Deploy 已修 |
 
 I 侧独有：`EEF_DEFINITIONS` 含 `"relative"`（`action.py:19`）并由
 `expected_eef_def="absolute"` 在公共边界上拒绝（`action.py:145,213-219`）——即

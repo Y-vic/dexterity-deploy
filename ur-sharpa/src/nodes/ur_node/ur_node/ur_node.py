@@ -22,6 +22,7 @@ Two deliberate departures from the deployed v3 `ur_node.py`:
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import threading
 import time
 from typing import Any
@@ -69,8 +70,8 @@ class UrNode(Node):
         # arm commands; these guards constrain every command that passes it.
         self.declare_parameter("enable_motion_limits", True)
         self.declare_parameter("enable_joint_step_limit", True)
-        self.declare_parameter("max_joint_step_rad", 0.35)
-        self.declare_parameter("max_abs_joint_rad", 6.28)
+        self.declare_parameter("max_joint_step_rad", setting("ur", "max_joint_step_rad"))
+        self.declare_parameter("max_abs_joint_rad", setting("ur", "max_abs_joint_rad"))
         self.declare_parameter("enable_payload_configuration", True)
         self.declare_parameter("left_payload_mass_kg", 1.3)
         self.declare_parameter("left_payload_cog_m", [0.0, 0.0, 0.08])
@@ -79,7 +80,7 @@ class UrNode(Node):
 
         # --- final joint command limits ---
         self.declare_parameter("enable_joint_clip", True)
-        self.declare_parameter("joint_vel_limit", 0.35)
+        self.declare_parameter("joint_vel_limit", setting("ur", "joint_vel_limit"))
 
         # --- topics: defaults MUST match docs/ur_topics.md ---
         self.declare_parameter("state_topic", "/ur/state")
@@ -472,6 +473,9 @@ class UrNode(Node):
                     left, right, float(message.period_s),
                     left_enable=bool(message.left_enable),
                     right_enable=bool(message.right_enable),
+                    **(dict(strict_targets=True) if getattr(message,"strict_targets",False) else {}),
+                    event_callback=lambda event, **fields: self.execution_event(
+                        event, message, device=DEVICE, **fields),
                 )
             self.execution_event(
                 "hardware_sdk_command_completed",
@@ -526,6 +530,7 @@ class UrNode(Node):
             self.enable_motion_limits
             or self.enable_joint_clip
             or self.enable_joint_step_limit
+            or getattr(message,"strict_targets",False)
         ):
             return left, right
         snapshot = self.driver.read()
@@ -536,10 +541,11 @@ class UrNode(Node):
         for side in ("left", "right"):
             if not enables[side]:
                 continue
-            targets[side] = targets[side] + np.round(
-                (current[side] - targets[side]) / (2.0 * np.pi)
-            ) * (2.0 * np.pi)
-            if self.enable_motion_limits and np.any(
+            if not getattr(message,'strict_targets',False):
+                targets[side] = targets[side] + np.round(
+                    (current[side] - targets[side]) / (2.0 * np.pi)
+                ) * (2.0 * np.pi)
+            if (self.enable_motion_limits or getattr(message,"strict_targets",False)) and np.any(
                 np.abs(targets[side]) > self.max_abs_joint_rad + 1.0e-9
             ):
                 raise ValueError(
@@ -547,7 +553,7 @@ class UrNode(Node):
                     f"{self.max_abs_joint_rad:.3f} rad"
                 )
             if (
-                self.enable_joint_step_limit
+                (self.enable_joint_step_limit or getattr(message,"strict_targets",False))
                 and np.any(
                     np.abs(targets[side] - current[side])
                     > self.max_joint_step_rad + 1.0e-9
@@ -559,10 +565,18 @@ class UrNode(Node):
                 )
         if not self.enable_joint_clip:
             return targets["left"], targets["right"]
-        return (
+        limited = (
             self.kinematics.limit_joints(targets["left"], current_left),
             self.kinematics.limit_joints(targets["right"], current_right),
         )
+        if getattr(message,'strict_targets',False):
+            for side,value in zip(('left','right'),limited):
+                # Limiter arithmetic may round an unchanged float64 target.
+                # Accept only that roundoff, and still return the original target.
+                if enables[side] and not np.allclose(value,targets[side],rtol=0,atol=1e-12):
+                    raise ValueError(f'{side} policy target would be changed by UR joint limiter')
+            return targets['left'],targets['right']
+        return limited
 
     def publish_result(
         self,

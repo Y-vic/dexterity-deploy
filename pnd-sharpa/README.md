@@ -5,7 +5,7 @@ Adam Pro + SharpA Wave 的 ROS 2 Humble 遥操与模型部署。系统分为三�
 | 本体 | 默认路径 | 职责 |
 | --- | --- | --- |
 | PND | `/home/pnd-humanoid/Deploy` | 机器人、手、相机、遥操及 action/obs 网关 |
-| Workstation | `/home/ps/Deploy-v2/pnd-sharpa` | obs 同步、策略客户端、IK、动作调度和 dashboard |
+| Workstation | `/home/ps/Deploy/pnd-sharpa` | obs 同步、策略客户端、IK、动作调度和 dashboard |
 | Server | `/share/project/yenaisheng/dreamzero` | 模型运行环境、checkpoint registry 与各模型 deploy 入口 |
 
 ## 1. Setup
@@ -412,7 +412,7 @@ Workstation 只保留一个通用入口。模型差异来自 server metadata/act
 provider、action horizon 或 execute steps。当前只支持 synchronous：
 
 ```bash
-cd /home/ps/Deploy-v2/pnd-sharpa
+cd /home/ps/Deploy/pnd-sharpa
 conda activate pnd-ws-ros
 export ROS_DOMAIN_ID=77
 set +u; source install/setup.bash; set -u
@@ -443,26 +443,26 @@ Replay 在 workstation 上读取一个 recording sample，替代 `policy_client`
 
 ```bash
 # Workstation
-cd /home/ps/Deploy-v2/pnd-sharpa
+cd /home/ps/Deploy/pnd-sharpa
 conda activate pnd-ws-ros
 export ROS_DOMAIN_ID=77
 set +u; source install/setup.bash; set -u
 
 # Direct joint replay：执行一次后停止发送
 ros2 launch ws_launch replay.launch.py \
-  sample_dir:=/home/ps/Deploy-v2/pnd-sharpa/recordings/pick_place/sample_0004 \
+  sample_dir:=/home/ps/Deploy/pnd-sharpa/recordings/pick_place/sample_0004 \
   action_horizon:=40 actor_send_hz:=30.0 obs_rate_hz:=30.0 \
   loop:=false fk:=false dry_run:=false
 
 # Direct joint replay：循环执行；每轮之间发送 40 帧 sample 初始姿态
 ros2 launch ws_launch replay.launch.py \
-  sample_dir:=/home/ps/Deploy-v2/pnd-sharpa/recordings/pick_place/sample_0002 \
+  sample_dir:=/home/ps/Deploy/pnd-sharpa/recordings/pick_place/sample_0002 \
   action_horizon:=40 actor_send_hz:=30.0 obs_rate_hz:=30.0 \
   loop:=true fk:=false dry_run:=false
 
 # FK→IK 诊断：先转成 posttrain 训练 action space，再由 action_ik 还原并做 IK
 ros2 launch ws_launch replay.launch.py \
-  sample_dir:=/home/ps/Deploy-v2/pnd-sharpa/recordings/pick_place/sample_0002 \
+  sample_dir:=/home/ps/Deploy/pnd-sharpa/recordings/pick_place/sample_0002 \
   action_horizon:=40 actor_send_hz:=30.0 obs_rate_hz:=30.0 \
   loop:=true fk:=true dry_run:=false
 ```

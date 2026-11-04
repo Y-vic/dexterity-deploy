@@ -34,3 +34,10 @@ bool right_enable
 # Validate and acknowledge this command without calling the SharpA SDK.
 # Only Actor commands may use dry-run.
 bool dry_run
+
+# Local policy: reject unsafe targets; never silently clip or unwrap.
+bool strict_targets
+string policy_session_id
+
+# True only for a human intervention command routed through the local Actor.
+bool is_hil

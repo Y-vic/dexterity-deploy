@@ -56,8 +56,33 @@ export LD_LIBRARY_PATH=/share/project/lyx/miniconda3/envs/starVLA/lib:/usr/local
 
 # One GPU is enough for a 4B at batch 1; training's 16-GPU topology is
 # irrelevant here. Pinned so a shared node cannot hand the process a busy card.
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    # Card 0 is NOT a safe default: this is a shared training node, and a full
+    # card fails at the WEIGHT LOAD -- after the server has bound its port and
+    # started answering /healthz, which the workstation reads as a healthy model
+    # that then never becomes ready. Picking the emptiest card turns that into a
+    # non-event; naming one explicitly still wins.
+    CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index,memory.used \
+        --format=csv,noheader,nounits | sort -t, -k2 -n | head -1 | cut -d, -f1)
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+fi
+export CUDA_VISIBLE_DEVICES
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# The operator's speed scale, forwarded verbatim so the server can reject a bad
+# value at import rather than silently running at a speed nobody chose. Unset
+# means full speed. This is a comfort control, not a fix: measured, the policy's
+# per-step motion is already at or below the corpus at every percentile, and the
+# corpus itself reaches ~190 mm/s at the wrist during the unscrew. See
+# speed_guard.py for the numbers.
+#
+#   SHARPA_DEPLOY_SPEED_SCALE=0.5 -> half speed, half the progress per chunk
+export SHARPA_DEPLOY_SPEED_SCALE=${SHARPA_DEPLOY_SPEED_SCALE:-}
+
+# Path-preserving slowdown. Unlike SPEED_SCALE this keeps the policy's complete
+# wrist targets and hand closure, and resamples the path onto more 10 Hz points.
+# A value of 0.3 turns a 10-point chunk into 34 points with the same endpoint.
+export SHARPA_DEPLOY_TIME_SCALE=${SHARPA_DEPLOY_TIME_SCALE:-}
 
 # PyAV is chatty about long-GOP files; only errors are useful in a served log.
 export LIBAV_LOG_LEVEL=0
@@ -76,6 +101,8 @@ echo "  asset_root  : $ASSET_ROOT"
 echo "  task_config : $TASK_CONFIG_ROOT"
 echo "  python      : $(command -v python)"
 echo "  gpu         : ${CUDA_VISIBLE_DEVICES}"
+echo "  speed_scale : ${SHARPA_DEPLOY_SPEED_SCALE:-1.0 (full)}"
+echo "  time_scale  : ${SHARPA_DEPLOY_TIME_SCALE:-1.0 (native)}"
 echo
 
 # exec, so tmux's pane tracks the server process itself. Without it the shell

@@ -201,8 +201,7 @@ class UrCommonKinematics:
         root-from-wrist R, exactly as frozen by `sharpa_interface.sharpa`.
         """
         ur_base_tcp = self.arm_fk(joints)
-        capture_tcp = self.geometry.ur_base_tcp_to_capture_tcp(ur_base_tcp, side)
-        return self.geometry.capture_tcp_to_canonical_pose(capture_tcp, side)
+        return self.geometry.ur_base_tcp_to_canonical_pose(ur_base_tcp, side)
 
     def arm_fk_wire_eef9(self, joints: Any, side: str) -> np.ndarray:
         """UR5 joint angles -> column-major policy wire EEF (9,)."""
@@ -212,7 +211,8 @@ class UrCommonKinematics:
 
     # ---- arm IK ----
     def arm_ik(self, target: Any, near_joints: Any, side: str = "left",
-               ref_joint: Any = None, allow_large: bool = False) -> np.ndarray:
+               ref_joint: Any = None, allow_large: bool = False,
+               local_refinement: bool = False) -> np.ndarray:
         """Target TCP pose + seed joints -> UR5 joint angles (6,).
 
         :param target: 4x4 transform, or [xyz, rotvec] (6,), in the UR BASE frame
@@ -223,25 +223,25 @@ class UrCommonKinematics:
         """
         target = np.asarray(target, dtype=np.float64)
         if target.shape == (4, 4):
-            cart = transform_to_rtde_pose(target)
+            cart = validate_transform(target)
         elif target.shape == (6,):
             cart = target
         else:
             raise ValueError("target must be a 4x4 transform or a 6-vector [xyz, rotvec]")
         return self.solver(side).solve(cart, near_joints, ref_joint=ref_joint,
-                                       allow_large=allow_large)
+                                       allow_large=allow_large, local_refinement=local_refinement)
 
     def arm_ik_eef9(self, eef9: Any, near_joints: Any, side: str,
-                    ref_joint: Any = None, allow_large: bool = False) -> np.ndarray:
+                    ref_joint: Any = None, allow_large: bool = False,
+                    local_refinement: bool = False) -> np.ndarray:
         """Canonical PND wrist EEF -> UR5 joint angles (6,).
 
         Exact inverse of `arm_fk_eef9`, so the execution path consumes what the
         observation path produced.
         """
-        capture_tcp = self.geometry.canonical_pose_to_capture_tcp(eef9, side)
-        ur_base_tcp = self.geometry.capture_tcp_to_ur_base_tcp(capture_tcp, side)
+        ur_base_tcp = self.geometry.canonical_pose_to_ur_base_tcp(eef9, side)
         return self.arm_ik(ur_base_tcp, near_joints, side=side,
-                           ref_joint=ref_joint, allow_large=allow_large)
+                           ref_joint=ref_joint, allow_large=allow_large, local_refinement=local_refinement)
 
     def arm_ik_wire_eef9(self, eef9: Any, near_joints: Any, side: str,
                          ref_joint: Any = None, allow_large: bool = False) -> np.ndarray:

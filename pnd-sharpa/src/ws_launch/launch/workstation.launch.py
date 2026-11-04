@@ -249,7 +249,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "pnd_bias_local_path",
                 default_value=(
-                    "/home/ps/Deploy-v2/pnd-sharpa/deploy/runtime/pnd_bias/"
+                    "/home/ps/Deploy/pnd-sharpa/deploy/runtime/pnd_bias/"
                     "bias_joints_set_with_init.json"
                 ),
             ),

@@ -33,12 +33,13 @@ from typing import Any
 
 import numpy as np
 
-from .geometry import matrix_to_rotvec, rotvec_to_matrix
+from .geometry import matrix_to_rotvec, rotvec_to_matrix, transform_to_rtde_pose, rtde_pose_to_transform
 from .safety import SafetyConfig
 
 # Shoulder-side joints cost more when they deviate: base/shoulder/elbow get a
 # larger weight, wrist joints a smaller one.
 _DEFAULT_JOINT_WEIGHTS = np.array([1.5, 1.5, 1.3, 1.0, 1.0, 0.8])
+_UNWRAP_OFFSETS = np.arange(-2, 3)[:, None, None]
 _NATIVE_STDERR_LOCK = threading.Lock()
 _GENERIC_IKFAST_ERROR = (
     b"Error: (inverse kinematics) failed to get ik solution\n"
@@ -64,6 +65,10 @@ def _inverse_with_filtered_stderr(kinematics: Any, pose: list[float]):
     few microseconds spent in IKFast; output from another thread is replayed
     unchanged after the call.
     """
+
+    quiet = getattr(kinematics, 'inverse_quiet', None)
+    if callable(quiet):
+        return quiet(pose)
 
     with _NATIVE_STDERR_LOCK:
         try:
@@ -174,6 +179,7 @@ class FastIKSolver:
             "no_feasible": 0,       # had raw solutions, all filtered out
             "solved": 0,
             "solved_rtde": 0,
+            "solved_local": 0,
             "soft_flip": 0,
             "j4_sign_kept": 0,
             "flip_held": 0,         # holds attributable to the flip filter
@@ -186,7 +192,8 @@ class FastIKSolver:
     # ---- internals ----
     def _raw_solutions(self, cart_pose: Any) -> np.ndarray:
         """Call ikfast, return (n,6) analytic solutions; empty array if none."""
-        ee = cart_to_matrix(cart_pose)
+        target = np.asarray(cart_pose)
+        ee = target[:3, :4] if target.shape == (4, 4) else cart_to_matrix(target)
         try:
             configs = _inverse_with_filtered_stderr(
                 self.kin, ee.reshape(-1).tolist()
@@ -219,28 +226,26 @@ class FastIKSolver:
         k0 = np.round((ref[None, :] - sols) / two_pi)
         nearest = sols + k0 * two_pi
 
-        result = nearest.copy()
-        best_inlimit_dist = np.full_like(sols, np.inf)
-        found_inlimit = np.zeros_like(sols, dtype=bool)
         # Scan +-2 turns around the nearest equivalent: with limits up to +-2pi
-        # there are at most 3 in-limit equivalents, so +-2 covers it.
-        for offset in (-2, -1, 0, 1, 2):
-            cand = sols + (k0 + offset) * two_pi
-            within = np.abs(cand) <= limit
-            dist = np.abs(cand - ref[None, :])
-            better = within & (dist < best_inlimit_dist)
-            result = np.where(better, cand, result)
-            best_inlimit_dist = np.where(better, dist, best_inlimit_dist)
-            found_inlimit |= within
-        return np.where(found_inlimit, result, nearest)
+        # there are at most 3 in-limit equivalents. argmin keeps the first
+        # offset on ties, exactly as the former strict-less-than scan did.
+        candidates = sols[None] + (k0[None] + _UNWRAP_OFFSETS) * two_pi
+        distances = np.where(np.abs(candidates) <= limit,
+                             np.abs(candidates - ref), np.inf)
+        indices = np.argmin(distances, axis=0)[None]
+        best = np.take_along_axis(candidates, indices, axis=0)[0]
+        found = np.isfinite(np.min(distances, axis=0))
+        return np.where(found, best, nearest)
 
     def solve(self, cart_pose: Any, current_joint: Any, ref_joint: Any = None,
-              allow_large: bool = False) -> np.ndarray:
+              allow_large: bool = False, local_refinement: bool = False) -> np.ndarray:
         """Solve and return 6 joint angles.
 
         On failure returns the previous target (hold) or current_joint.
 
-        :param cart_pose: [x,y,z, rx,ry,rz(rotvec)] in the UR base frame
+        :param cart_pose: [x,y,z, rx,ry,rz(rotvec)] or a validated 4x4 TCP
+            transform in the UR base frame. Matrix input avoids a redundant
+            matrix -> rotvec -> matrix round-trip on EEF chunks.
         :param current_joint: measured joint angles (fallback + first reference)
         :param ref_joint: selection reference; defaults to last_target_joint,
             then current_joint
@@ -248,10 +253,12 @@ class FastIKSolver:
             allows a large excursion to the (unwrapped) nearest solution, for
             returning home from an arbitrary pose. Limit filtering and unwrap
             still apply. Per-frame teleop following uses False.
+        :param local_refinement: opt-in EEF recovery when IKFast omits a nearby
+            branch. Bounded FK-based refinement must converge to the exact pose
+            and pass the normal candidate filters; it never admits a remote flip.
         """
         self.stats["calls"] += 1
         current_joint = np.asarray(current_joint, dtype=np.float64)
-        target = np.asarray(cart_pose, dtype=np.float64).reshape(-1)
         self.last_rejection = None
         self._last_filter_rejection = None
 
@@ -265,11 +272,20 @@ class FastIKSolver:
         sols = self._raw_solutions(cart_pose)
 
         if sols.shape[0] == 0:
+            if np.asarray(cart_pose).shape == (4, 4):
+                cart_pose = transform_to_rtde_pose(cart_pose)
+            target = np.asarray(cart_pose, dtype=np.float64).reshape(-1)
             # ikfast found nothing (near singularity / workspace edge). This is
             # a genuine analytic blind spot, not a false failure. Use the
             # numeric fallback; its solution still goes through the same
             # limit + flip checks.
             self.stats["no_raw_solution"] += 1
+            if local_refinement:
+                best = self._try_local_refinement(cart_pose, ref, allow_large)
+                if best is not None:
+                    self.stats['solved_local'] += 1
+                    self.last_target_joint = best.copy()
+                    return best.copy()
             best = self._try_rtde_fallback(cart_pose, ref, current_joint, allow_large)
             if best is None:
                 rejection = self._last_filter_rejection or {
@@ -299,7 +315,16 @@ class FastIKSolver:
         sols = self._unwrap_to_ref(sols, ref)
 
         best = self._filter_and_pick(sols, ref, allow_large)
+        if best is None and local_refinement:
+            best = self._try_local_refinement(cart_pose, ref, allow_large)
+            if best is not None:
+                self.stats['solved_local'] += 1
+                self.last_target_joint = best.copy()
+                return best.copy()
         if best is None:
+            if np.asarray(cart_pose).shape == (4, 4):
+                cart_pose = transform_to_rtde_pose(cart_pose)
+            target = np.asarray(cart_pose, dtype=np.float64).reshape(-1)
             self.stats["no_feasible"] += 1
             self.last_rejection = {
                 **(self._last_filter_rejection or {
@@ -319,6 +344,65 @@ class FastIKSolver:
         self.stats["solved"] += 1
         self.last_target_joint = best.copy()
         return best.copy()
+
+    def _try_local_refinement(self, target, ref, allow_large):
+        """Recover only a small continuous branch using this same UR5 FK.
+
+        IKFast's analytic branch tests can omit the local solution even for a
+        sub-millimetre EEF step. Damped Newton iterations from the committed
+        reference are bounded to 0.1 rad total / 0.05 rad per iteration and six
+        iterations. A distant, singular, unreachable or out-of-limit result
+        still returns None. No target projection or command clipping is used.
+        """
+        if not callable(getattr(self.kin, 'forward', None)):
+            return None
+        goal = np.asarray(target, dtype=np.float64)
+        if goal.shape != (4, 4):
+            goal = rtde_pose_to_transform(goal)
+        q = np.asarray(ref, dtype=np.float64).copy()
+        if q.shape != (self.n_joints,) or not np.isfinite(q).all():
+            return None
+
+        def fk(joints):
+            return np.asarray(self.kin.forward(joints.tolist()), dtype=np.float64).reshape(3, 4)
+
+        for iteration in range(7):
+            actual = fk(q)
+            error = np.r_[goal[:3, 3]-actual[:, 3],
+                          matrix_to_rotvec(goal[:3, :3] @ actual[:, :3].T)]
+            if not np.isfinite(error).all():
+                return None
+            if iteration == 0 and (np.linalg.norm(error[:3]) > .01
+                                    or np.linalg.norm(error[3:]) > np.deg2rad(5)):
+                return None
+            if np.max(np.abs(error)) <= 1e-8:
+                rejection = self._last_filter_rejection
+                best = self._filter_and_pick(q[None], ref, allow_large)
+                if best is None:
+                    self._last_filter_rejection = rejection
+                return best
+            if iteration == 6:
+                return None
+            jacobian = np.empty((6, self.n_joints))
+            epsilon = 1e-6
+            for axis in range(self.n_joints):
+                perturbed = q.copy()
+                perturbed[axis] += epsilon
+                moved = fk(perturbed)
+                jacobian[:3, axis] = (moved[:, 3]-actual[:, 3])/epsilon
+                rotation = moved[:, :3] @ actual[:, :3].T
+                jacobian[3:, axis] = np.array([rotation[2, 1]-rotation[1, 2],
+                    rotation[0, 2]-rotation[2, 0], rotation[1, 0]-rotation[0, 1]])/(2*epsilon)
+            try:
+                delta = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + 1e-10*np.eye(6), error)
+            except np.linalg.LinAlgError:
+                return None
+            if not np.isfinite(delta).all() or np.max(np.abs(delta)) > .05:
+                return None
+            q += delta
+            if np.max(np.abs(q-ref)) > .1 or np.any(np.abs(q) > self.joint_pos_limit):
+                return None
+        return None
 
     def _filter_and_pick(self, sols: Any, ref: np.ndarray,
                          allow_large: bool = False) -> np.ndarray | None:
@@ -531,8 +615,8 @@ class FastIKSolver:
         s = self.stats
         calls = max(1, s["calls"])
         return ("[IK stats] calls={calls} solved={solved}({sr:.1f}%) "
-                "rtde_fallback={rtde} no_raw={no_raw} no_feasible={no_feasible} "
+                "rtde_fallback={rtde} local_refined={local} no_raw={no_raw} no_feasible={no_feasible} "
                 "flip_held={flip}").format(
             calls=s["calls"], solved=s["solved"], sr=100.0 * s["solved"] / calls,
-            rtde=s["solved_rtde"], no_raw=s["no_raw_solution"],
+            rtde=s["solved_rtde"], local=s["solved_local"], no_raw=s["no_raw_solution"],
             no_feasible=s["no_feasible"], flip=s["flip_held"])

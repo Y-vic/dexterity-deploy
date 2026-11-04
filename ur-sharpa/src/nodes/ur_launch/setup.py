@@ -9,7 +9,7 @@ setup(
         ("share/ur_launch", ["package.xml"]),
         (
             "share/ur_launch/launch",
-            ["launch/ur.launch.py", "launch/teleop.launch.py", "launch/deploy.launch.py"],
+            ["launch/ur.launch.py", "launch/teleop.launch.py", "launch/deploy.launch.py", "launch/workbench.launch.py"],
         ),
     ],
     install_requires=["setuptools"],

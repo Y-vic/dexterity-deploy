@@ -18,6 +18,7 @@ explicit argument. The clipping arithmetic is unchanged.
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -27,14 +28,14 @@ import numpy as np
 from .geometry import matrix_to_rotvec
 
 # v1 defaults, from teleop_mocap_ur5_sharpa_hand_zed_ui.py and README_遥操作操作手册.md.
-DEFAULT_JUMP_VEL = 3.5        # m/s
-DEFAULT_JUMP_ROT_VEL = 1200.0  # deg/s
-DEFAULT_JUMP_MAX_REJECT = 5
-DEFAULT_JOINT_VEL_LIMIT = 0.35  # rad/frame
-DEFAULT_JOINT_POS_LIMIT = (6.28, 6.28, 6.28, 6.28, 6.28, 6.28)
+DEFAULT_JUMP_VEL = setting('ik', 'jump_vel')        # m/s
+DEFAULT_JUMP_ROT_VEL = setting('ik', 'jump_rot_vel')  # deg/s
+DEFAULT_JUMP_MAX_REJECT = setting('ik', 'jump_max_reject')
+DEFAULT_JOINT_VEL_LIMIT = setting('ur', 'joint_vel_limit')  # rad/frame
+DEFAULT_JOINT_POS_LIMIT = (setting('ur', 'max_abs_joint_rad'),) * 6
 DEFAULT_FREQUENCY = 30.0
 # Wrist-flip threshold defaults to 6x the per-frame velocity limit.
-FLIP_THRESHOLD_VEL_MULTIPLE = 6.0
+FLIP_THRESHOLD_VEL_MULTIPLE = setting('ik', 'flip_threshold_vel_multiple')
 
 
 @dataclass

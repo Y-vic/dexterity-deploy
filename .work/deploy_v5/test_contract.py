@@ -14,11 +14,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, "/home/yns/deploy/Deploy-v2/interface")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "interface"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import server as srv
 from sharpa_interface.server.action import parse_policy_action
+from sharpa_interface.server.execution import ExecutionValidationError
 from sharpa_interface.server.metadata import (
     validate_metadata_format,
     validate_reset_response,
@@ -226,10 +227,14 @@ def test_action_response_passes_parse_policy_action():
     parsed = parse_policy_action(
         response, expected_session_id=session_id, expected_request_id=7
     )
-    assert parsed.execution.action_length == srv.ACTION_HORIZON
-    assert parsed.execution.execute_length == srv.ACTION_HORIZON
-    assert parsed.execution.execute_start == 0
+    assert parsed.execution.action_length == srv.EXECUTION_HORIZON
+    # NOT the whole chunk: the first EXECUTE_START steps are expired intent by
+    # the time the chunk takes over. See the RTC_STEPS derivation in server.py.
+    assert parsed.execution.execute_length == srv.EXECUTE_LENGTH
+    assert parsed.execution.execute_start == srv.EXECUTE_START
     assert parsed.execution.rtc == srv.RTC_STEPS
+    # The arrays themselves stay full length; the client does the slicing.
+    assert parsed.left_wrist.eef.shape == (srv.EXECUTION_HORIZON, 9)
     assert parsed.execution.frequency_hz == pytest.approx(10.0)
 
 
@@ -248,7 +253,7 @@ def test_dry_run_chunk_holds_the_current_pose():
     for side in ("left", "right"):
         commanded = response["action"][f"{side}_wrist"]["eef"]
         measured = current[f"{side}_wrist"]["eef"]
-        assert commanded.shape == (srv.ACTION_HORIZON, 9)
+        assert commanded.shape == (srv.EXECUTION_HORIZON, 9)
         for step in commanded:
             assert np.allclose(step, measured, atol=1e-5)
 
@@ -262,7 +267,7 @@ def test_dry_run_holds_the_measured_hand_pose():
     for side in ("left", "right"):
         commanded = response["action"]["hand_joint"][side]
         measured = observation["state"]["current"]["hand_joint"][side]
-        assert commanded.shape == (srv.ACTION_HORIZON, 22)
+        assert commanded.shape == (srv.EXECUTION_HORIZON, 22)
         for step in commanded:
             assert np.allclose(step, measured, atol=0)
 
@@ -424,7 +429,7 @@ def test_metadata_satisfies_the_policy_client_identity_check():
     "模型身份不匹配：model <missing> != sharpa_policy_server" with the model
     running and idle. Checked here with the node's own function.
     """
-    sys.path.insert(0, "/home/yns/deploy/Deploy-v2/ur-sharpa/src/nodes/policy_client_node")
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "ur-sharpa/src/nodes/policy_client_node"))
     from policy_client_node.policy_client_node import metadata_identity_error
 
     error = metadata_identity_error(
@@ -435,3 +440,135 @@ def test_metadata_satisfies_the_policy_client_identity_check():
         expected_prompt="",
     )
     assert error == "", error
+
+
+# --- the anchor-lag timing --------------------------------------------------
+# These model TIME, which no other test here does. The defect they pin produced
+# perfectly valid chunks -- correct shape, correct anchor, green /healthz, 0.87 ms
+# inter-chunk gap -- while the arm made 13-22% of the ground-truth progress per
+# cycle, because the first steps of every chunk commanded a return to a pose the
+# arm had already left.
+def test_execute_start_equals_the_lag_between_anchoring_and_take_over():
+    """The dropped prefix must be exactly the steps that expire before take-over.
+
+    RTC asks the client to fetch with RTC_STEPS of the current slice still to
+    run, so a chunk begins executing RTC_STEPS periods after its observation was
+    taken. Dropping fewer steps leaves a retraction; dropping more discards real
+    intent. Equality is the whole property.
+    """
+    assert srv.EXECUTE_START == srv.RTC_STEPS
+
+
+def test_the_first_executed_step_is_the_one_that_means_now():
+    """Step k of a chunk is (k+1)*ACTION_STRIDE frames ahead of the observation.
+
+    At take-over the arm is RTC_STEPS periods past that observation, so the step
+    whose horizon matches "now" is the one this slice starts on. Derived from the
+    representation's own constants rather than restated, so a stride or fps change
+    cannot leave this passing while the alignment breaks.
+    """
+    import repr_bridge as rb
+
+    period_s = 1.0 / srv.FREQUENCY_HZ
+    lag_s = srv.RTC_STEPS * period_s
+    # Horizon of the first step this slice executes, in seconds.
+    first = srv.EXECUTE_START
+    horizon_s = (first + 1) * rb.ACTION_STRIDE / rb.TRAIN_FPS
+    # It should be the first step whose horizon reaches the lag.
+    assert horizon_s > lag_s
+    previous_s = first * rb.ACTION_STRIDE / rb.TRAIN_FPS
+    assert previous_s <= lag_s, (
+        f"step {first - 1} at {previous_s * 1000:.0f} ms already reaches the "
+        f"{lag_s * 1000:.0f} ms lag; the slice starts one step too late"
+    )
+
+
+def test_diagnostic_mode_is_strictly_sequential():
+    """No step is dropped and no inference is prefetched while executing."""
+    assert srv.RTC_STEPS == 0
+    assert srv.EXECUTE_START == 0
+    assert srv.EXECUTE_LENGTH == srv.EXECUTION_HORIZON
+
+
+def test_the_slice_fits_inside_the_chunk_the_server_sends():
+    assert srv.EXECUTE_START + srv.EXECUTE_LENGTH <= srv.EXECUTION_HORIZON
+
+
+def test_client_executes_the_slice_the_server_asked_for():
+    """Through the client's own slicing, not a re-implementation of it.
+
+    ``executable_action`` is what the ROS node publishes, so this is the number of
+    steps the arm will actually run and the pose it will start from.
+    """
+    policy_server = dry_run_server()
+    session_id = policy_server.handle_reset({})["session_id"]
+    obs = make_observation(session_id, request_id=11)
+    response = policy_server.handle_infer(obs)
+    parsed = parse_policy_action(
+        response, expected_session_id=session_id, expected_request_id=11
+    )
+
+    executable = parsed.executable_action()
+    for side in ("left", "right"):
+        assert executable[f"{side}_wrist"]["eef"].shape == (srv.EXECUTE_LENGTH, 9)
+        assert executable["hand_joint"][side].shape == (srv.EXECUTE_LENGTH, 22)
+    # And it must be the TAIL of the full array, not the head.
+    full = response["action"]["left_wrist"]["eef"]
+    assert np.allclose(
+        executable["left_wrist"]["eef"], full[srv.EXECUTE_START :], atol=0
+    )
+
+
+def test_sequential_gate_waits_for_done_before_the_next_inference():
+    """The next request cannot begin until the full active chunk reports done."""
+    from sharpa_interface.server.execution import SyncExecutionGate
+
+    policy_server = dry_run_server()
+    session_id = policy_server.handle_reset({})["session_id"]
+    gate = SyncExecutionGate()
+
+    def chunk(request_id: int):
+        response = policy_server.handle_infer(
+            make_observation(session_id, request_id)
+        )
+        return parse_policy_action(
+            response,
+            expected_session_id=session_id,
+            expected_request_id=request_id,
+        )
+
+    request_id, _ = gate.begin_inference()
+    command = gate.accept_action(chunk(request_id))
+    execution = command["execution"]
+
+    with pytest.raises(RuntimeError, match="cannot begin inference"):
+        gate.begin_inference()
+    with pytest.raises(ExecutionValidationError, match="rtc > 0"):
+        gate.begin_prefetch(
+            request_id=request_id,
+            action_id=command["action_id"],
+            revision=command["revision"],
+            execute_start=execution["execute_start"],
+            execute_length=execution["execute_length"],
+            executed_steps=execution["execute_start"],
+        )
+
+    feedback = gate.complete(
+        {
+            "schema": "sharpa_execution_done.v1",
+            "session_id": session_id,
+            "request_id": request_id,
+            "action_id": command["action_id"],
+            "revision": command["revision"],
+            "execute_start": execution["execute_start"],
+            "execute_length": execution["execute_length"],
+            "executed_steps": execution["execute_start"]
+            + execution["execute_length"],
+            "success": True,
+            "done": True,
+            "error": None,
+        }
+    )
+    assert feedback["success"]
+    next_request_id, _ = gate.begin_inference()
+    assert next_request_id == request_id + 1

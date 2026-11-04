@@ -96,7 +96,7 @@ def wait_phase(manager, phase, timeout_s=2.0):
 def test_catalog_and_start_use_only_catalog_launcher():
     runner = FakeRunner(catalog_payload())
     events = []
-    manager = RemoteModelManager(
+    manager = RemoteModelManager(remote_root="/remote",
         runner=runner,
         event_callback=events.append,
         startup_timeout_s=2.0,
@@ -125,11 +125,11 @@ def test_catalog_and_start_use_only_catalog_launcher():
 
 
 def test_start_rejects_unlaunchable_and_unknown_runs():
-    manager = RemoteModelManager(runner=FakeRunner(catalog_payload(launchable=False)))
+    manager = RemoteModelManager(remote_root="/remote", runner=FakeRunner(catalog_payload(launchable=False)))
     with pytest.raises(ModelManagerError, match="checkpoint"):
         manager.start("ur_pick_place_push", "full-run-id")
 
-    manager = RemoteModelManager(runner=FakeRunner(catalog_payload()))
+    manager = RemoteModelManager(remote_root="/remote", runner=FakeRunner(catalog_payload()))
     with pytest.raises(ModelManagerError, match="catalog"):
         manager.start("ur_pick_place_push", "not-a-run")
 
@@ -146,7 +146,7 @@ def test_server_switch_changes_both_lifecycle_and_policy_connection():
             "/remote/ps/scripts/deploy/task_config",
         ),
     }
-    manager = RemoteModelManager(
+    manager = RemoteModelManager(remote_root="/remote",
         profiles=profiles,
         default_server="baai",
         runner=runner,
@@ -169,30 +169,32 @@ def test_checked_in_profiles_define_baai_and_ps_code_and_asset_roots():
     profiles, default = load_server_profiles(path)
 
     assert default == "baai"
-    assert profiles["baai"].repo_root == "/share/project/yenaisheng/dreamzero"
-    assert profiles["ps"].repo_root == "/home/ps/dexterity"
-    assert profiles["ps"].asset_root == "/home/ps/dexterity"
-    assert profiles["ps"].ssh_host == "ps"
+    assert set(profiles) == {'baai','4090'}
+    assert profiles['baai'].repo_root == profiles['4090'].repo_root == ''
+    runner = FakeRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root="/remote", profile_path=path, runner=runner)
+    assert manager.catalog()['tasks'] == []
+    manager.select_server('4090')
+    assert manager.snapshot()['ssh_host'] == 'ps'
+    assert manager.catalog()['tasks'] == []
+    manager.stop()
+    assert runner.commands == []
 
 
-def test_start_always_reuses_fixed_default_port():
+def test_busy_port_is_rejected_without_killing_unowned_process():
     runner = FakeRunner(catalog_payload())
     runner.in_use_ports.add(5500)
-    manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
-
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
     manager.start("ur_pick_place_push", "full-run-id")
-    wait_phase(manager, "running")
-
-    assert manager.snapshot()["port"] == 5500
-    launch = next(
-        command[-1] for command, _ in runner.commands if "tmux new-session" in command[-1]
-    )
-    assert "exec env" not in launch
+    wait_phase(manager, "fault")
+    assert runner.launch_count == 0
+    assert not any('kill' in command[-1] for command, _ in runner.commands)
+    assert 5500 in runner.in_use_ports
 
 
 def test_launch_does_not_patch_method_specific_configuration():
     runner = FakeRunner(catalog_payload())
-    manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
 
     manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
@@ -205,7 +207,7 @@ def test_launch_does_not_patch_method_specific_configuration():
     assert "sed -e" not in launch
 
 
-def test_start_retries_once_on_the_same_fixed_port_after_process_failure():
+def test_failed_launch_reports_fault_and_cleans_owned_session():
     class FailFirstRunner(FakeRunner):
         def __call__(self, command, timeout_s):
             result = super().__call__(command, timeout_s)
@@ -214,12 +216,12 @@ def test_start_retries_once_on_the_same_fixed_port_after_process_failure():
             return result
 
     runner = FailFirstRunner(catalog_payload())
-    manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
 
     manager.start("ur_pick_place_push", "full-run-id")
-    wait_phase(manager, "running", timeout_s=4.0)
+    wait_phase(manager, "fault", timeout_s=4.0)
 
-    assert runner.launch_count == 2
+    assert runner.launch_count == 1
     assert manager.snapshot()["port"] == 5500
 
 
@@ -235,7 +237,7 @@ def test_loading_log_is_sanitized_and_kept_in_snapshot():
                 )
             return super().__call__(command, timeout_s)
 
-    manager = RemoteModelManager(
+    manager = RemoteModelManager(remote_root="/remote",
         runner=LogRunner(catalog_payload()), startup_timeout_s=2.0
     )
 
@@ -248,7 +250,7 @@ def test_loading_log_is_sanitized_and_kept_in_snapshot():
 
 def test_stop_kills_managed_server_and_releases_fixed_port():
     runner = FakeRunner(catalog_payload())
-    manager = RemoteModelManager(runner=runner, startup_timeout_s=2.0)
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
     manager.start("ur_pick_place_push", "full-run-id")
     wait_phase(manager, "running")
 
@@ -256,6 +258,82 @@ def test_stop_kills_managed_server_and_releases_fixed_port():
     wait_phase(manager, "stopped")
 
     assert manager.snapshot()["port"] == 0
-    cleanup = [command[-1] for command, _ in runner.commands if command[-1].startswith("set +e")]
+    cleanup = [command[-1] for command, _ in runner.commands if command[-1].startswith("tmux kill-session")]
     assert cleanup
-    assert "--port 5500" in cleanup[-1]
+    assert manager.session_name in cleanup[-1]
+    assert not any("pgrep" in command[-1] for command, _ in runner.commands)
+
+
+def test_unconfigured_default_does_not_contact_remote_host():
+    runner = FakeRunner(catalog_payload())
+    manager = RemoteModelManager(runner=runner)
+    assert manager.snapshot()['configured'] is False
+    assert manager.catalog()['tasks'] == []
+    with pytest.raises(ModelManagerError, match='catalog'):
+        manager.start('ur_pick_place_push', 'full-run-id')
+    manager.close()
+    assert runner.commands == []
+
+
+def test_managers_use_distinct_owned_sessions():
+    runner = FakeRunner(catalog_payload())
+    first = RemoteModelManager(remote_root='/remote', runner=runner)
+    second = RemoteModelManager(remote_root='/remote', runner=runner)
+    assert first.session_name != second.session_name
+    second.close()
+    assert not runner.commands
+
+
+def test_stop_during_launch_waits_then_cleans_only_owned_session():
+    import threading
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class SlowLaunchRunner(FakeRunner):
+        def __call__(self, command, timeout_s):
+            result = super().__call__(command, timeout_s)
+            if 'tmux new-session' in command[-1]:
+                entered.set()
+                assert release.wait(2.0)
+            return result
+
+    runner = SlowLaunchRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root='/remote', runner=runner, startup_timeout_s=2.0)
+    manager.start('ur_pick_place_push', 'full-run-id')
+    assert entered.wait(1.0)
+    assert manager.stop()['phase'] == 'stopping'
+    with pytest.raises(ModelManagerError, match='停止'):
+        manager.select_server('default')
+    release.set()
+    wait_phase(manager, 'stopped')
+    assert runner.launched_port is None
+    cleanup = [command[-1] for command, _ in runner.commands if 'kill-session' in command[-1]]
+    assert len(cleanup) == 1
+    assert manager.session_name in cleanup[0]
+    assert not any('pgrep' in command[-1] for command, _ in runner.commands)
+    manager.close()
+
+
+def test_closed_manager_rejects_new_start_or_server_switch():
+    manager = RemoteModelManager(remote_root='/remote', runner=FakeRunner(catalog_payload()))
+    manager.close()
+    with pytest.raises(ModelManagerError, match='关闭'):
+        manager.start('ur_pick_place_push', 'full-run-id')
+    with pytest.raises(ModelManagerError, match='关闭'):
+        manager.select_server('default')
+
+
+def test_delayed_notification_cannot_regress_model_status():
+    events = []
+    manager = RemoteModelManager(remote_root='/remote', runner=FakeRunner(catalog_payload()),
+                                 event_callback=events.append, startup_timeout_s=2.0)
+    starting = manager.start('ur_pick_place_push', 'full-run-id')
+    wait_phase(manager, 'running')
+    manager._notify(starting)
+    assert events[-1]['phase'] == 'running'
+    manager.stop()
+    wait_phase(manager, 'stopped')
+    manager._notify(starting)
+    assert events[-1]['phase'] == 'stopped'
+    manager.close()

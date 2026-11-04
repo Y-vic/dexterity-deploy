@@ -32,6 +32,7 @@ every rejected transition and surfaced on the web page.
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -298,15 +299,17 @@ class GateMachine:
     """
 
     mode: str = "teleop"
-    camera_max_age_s: float = 0.25
+    allow_mode_switch: bool = False
+    camera_max_age_s: float = field(default_factory=lambda: setting('status', 'camera_max_age_s'))
     execution_provider: str = "policy"
+    policy_recording: bool = False
     execution_paused: bool = False
     execution_dry_run: bool = False
     execution_scope: ExecutionScope = ExecutionScope.FULL
     execution_start_pending: bool = False
     execution_start_started_at: float = 0.0
     execution_start_started_wall_ns: int = 0
-    execution_start_timeout_s: float = 5.0
+    execution_start_timeout_s: float = field(default_factory=lambda: setting('status', 'execution_start_timeout_s'))
     ur_state: UrState = UrState.STOPPED
     sharpa_state: SharpaState = SharpaState.STOPPED
     record_state: RecordState = RecordState.IDLE
@@ -327,8 +330,8 @@ class GateMachine:
         if self.mode not in MODE_SOURCES:
             raise ValueError(f"mode must be one of {sorted(MODE_SOURCES)}")
         self.execution_provider = str(self.execution_provider).strip().lower()
-        if self.execution_provider not in {"policy", "replay"}:
-            raise ValueError("execution_provider must be policy or replay")
+        if self.execution_provider not in {"policy", "replay", "hil"}:
+            raise ValueError("execution_provider must be policy, replay or hil")
         if self.camera_max_age_s <= 0:
             raise ValueError("camera_max_age_s must be positive")
         self.execution_scope = ExecutionScope(self.execution_scope)
@@ -535,11 +538,12 @@ class GateMachine:
 
     def attempt_reset_both(self) -> Outcome:
         """Return both arms and both hands to their deployment home pose."""
-        if self.execution_dry_run:
+        if self.execution_dry_run and not self.execution_paused:
             return self._set_reason(
                 "machine reset blocked: stop trajectory preview first"
             )
-        if self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING:
+        if not self.execution_paused and (
+                self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING):
             return self._set_reason("machine reset blocked: pause the machine first")
         if self.bias_active:
             return self._set_reason("machine reset blocked: a reset is already active")
@@ -553,6 +557,8 @@ class GateMachine:
         self.execution_paused = False
         self.execution_dry_run = False
         self.execution_scope = ExecutionScope.FULL
+        # HOMING closes Actor publication, including a paused session. The
+        # previous chunk is discarded before Bias owns the reset trajectory.
         self.ur_state = UrState.HOMING
         self.sharpa_state = SharpaState.HOMING
         self.jog_preview = None
@@ -712,7 +718,7 @@ class GateMachine:
             return self._set_reason(
                 f"provider switch blocked: launch mode is {self.mode}, expected deploy"
             )
-        if requested not in {"policy", "replay"}:
+        if requested not in {"policy", "replay", "hil"}:
             return self._set_reason(
                 f"provider switch blocked: unsupported provider {requested!r}"
             )
@@ -726,8 +732,37 @@ class GateMachine:
                 "provider switch blocked: stop the machine before switching"
             )
         self.execution_provider = requested
-        if requested == "policy":
+        if requested in {"policy", "hil"}:
             self.execution_scope = ExecutionScope.FULL
+        self._clear_reason()
+        return _ok()
+
+    def attempt_set_workbench_mode(self, mode: str) -> Outcome:
+        """Change command ownership only behind closed hardware gates."""
+        if not self.allow_mode_switch:
+            return self._set_reason("mode switch requires workbench.launch.py")
+        if mode not in {"teleop", "policy", "hil", "replay"}:
+            return self._set_reason("unsupported workbench mode")
+        if (self.ur_state in {UrState.RUNNING, UrState.HOMING, UrState.STARTING}
+                or self.sharpa_state in {SharpaState.RUNNING, SharpaState.HOMING, SharpaState.STARTING}
+                or self.execution_dry_run or self.execution_paused
+                or self.execution_start_pending or self.bias_active
+                or self.record_state != RecordState.IDLE):
+            return self._set_reason("stop execution and recording before switching mode")
+        self.mode = "teleop" if mode == "teleop" else "deploy"
+        self.execution_provider = "policy" if mode == "teleop" else mode
+        self.execution_scope = ExecutionScope.FULL
+        self.session_id = ""
+        self._clear_reason()
+        return _ok()
+
+    def attempt_set_policy_recording(self, enabled: bool) -> Outcome:
+        if self.mode != 'deploy' or self.execution_provider != 'policy':
+            return self._set_reason('保存选项仅适用于 Policy 模式')
+        if (self.ur_state == UrState.RUNNING or self.sharpa_state == SharpaState.RUNNING
+                or self.execution_dry_run or self.execution_start_pending):
+            return self._set_reason('请先停止执行再修改保存选项')
+        self.policy_recording = bool(enabled)
         self._clear_reason()
         return _ok()
 
@@ -771,6 +806,24 @@ class GateMachine:
             self.gate_reason = "deployment stopped"
         return outcome
 
+    def attempt_stop(self) -> Outcome:
+        """Operator stop also cancels a pending start or reset."""
+        record_command = "stop" if self.record_state == RecordState.RECORDING else ""
+        self.ur_state = UrState.STOPPED
+        self.sharpa_state = SharpaState.STOPPED
+        self.record_state = RecordState.IDLE
+        self.session_id = ""
+        self.machine_ready = False
+        self.execution_start_pending = False
+        self.execution_start_started_at = 0.0
+        self.execution_start_started_wall_ns = 0
+        self.execution_paused = False
+        self.execution_dry_run = False
+        self.bias_request = self.bias_action_id = ""
+        self.bias_phase = "idle"
+        self.gate_reason = "operator stopped machine"
+        return _ok(record_command=record_command, hardware_stop=True)
+
     def attempt_pause_deploy(self) -> Outcome:
         """Freeze actor publication without closing or clearing its chunk."""
         if self.mode != "deploy":
@@ -798,20 +851,39 @@ class GateMachine:
         self.sharpa_state = SharpaState.HOMING
         return self._begin_bias("home_sharpa")
 
+    def attempt_start_teleop_recording(self) -> Outcome:
+        """Validate both gates before changing either lifecycle."""
+        if self.mode != "teleop":
+            return self._set_reason("手动遥操与录制仅在数采模式可用")
+        reason = self._record_start_reason()
+        if reason:
+            return self._set_reason(reason)
+        outcome = self.attempt_run_ur()
+        if not outcome:
+            return outcome
+        self._begin_recording()
+        return _ok(record_command="start", hardware_stop=outcome.hardware_stop)
+
+    def _record_start_reason(self, now=None):
+        if self.record_state == RecordState.RECORDING:
+            return "record start blocked: recording is already active"
+        return self.camera_gate_reason(now)
+
+    def _begin_recording(self, session_id=None):
+        self.record_state = RecordState.RECORDING
+        self.session_id = session_id or time.strftime("episode_%Y%m%d_%H%M%S")
+        self._clear_reason()
+
     def attempt_start_recording(self, session_id: str | None = None,
                                 now: float | None = None) -> Outcome:
-        if self.record_state == RecordState.RECORDING:
-            return self._set_reason("record start blocked: recording is already active")
         # Recording is an asynchronous observation pipeline.  It must remain
         # available while the machines are paused, and Vive is not part of the
         # recorded action contract.  Individual samples retain source
         # timestamps/validity so they can be aligned and audited afterwards.
-        camera_reason = self.camera_gate_reason(now)
-        if camera_reason:
-            return self._set_reason(camera_reason)
-        self.record_state = RecordState.RECORDING
-        self.session_id = session_id or time.strftime("episode_%Y%m%d_%H%M%S")
-        self._clear_reason()
+        reason = self._record_start_reason(now)
+        if reason:
+            return self._set_reason(reason)
+        self._begin_recording(session_id)
         return _ok(record_command="start")
 
     def attempt_stop_recording(self) -> Outcome:
@@ -867,6 +939,7 @@ class GateMachine:
             "active_source": int(self.active_source),
             "mode": self.mode,
             "execution_provider": self.execution_provider,
+            "policy_recording": self.policy_recording,
             "execution_paused": self.execution_paused,
             "execution_dry_run": self.execution_dry_run,
             "execution_scope": (

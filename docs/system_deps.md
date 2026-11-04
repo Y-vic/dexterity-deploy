@@ -22,6 +22,15 @@ NOT do this — it fails cleanly if these are missing, so you know to install.
 - CUDA runtime (for ZED). Pin the exact minor version used at the time you
   build ZED SDK.
 - `libusb-1.0-0-dev` (RTDE communication).
+- Vendor AE01 Avatar SDK, its Python 3.10 dependencies (including Zenoh), and
+  `pyzmq` for Vive input. See `ur-sharpa/scripts/install_ae01_python.sh`.
+- FFmpeg with the selected encoder; the workbench defaults to `hevc_nvenc`
+  and needs a compatible NVIDIA driver/GPU. Policy inference itself stays remote.
+- `ssh`, `tmux`, and `curl` for remote policy lifecycle; remote profiles start
+  with empty model paths until the operator configures them.
+- Pinocchio runtime for hand FK, available via the launch-time
+  `pinocchio_python_path` and `pinocchio_library_path` arguments. The existing
+  compiled IKFast binding targets system Python 3.10.
 
 ## PND robot only
 

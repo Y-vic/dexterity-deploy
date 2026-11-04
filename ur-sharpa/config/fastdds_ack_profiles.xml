@@ -2,9 +2,11 @@
 <dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
   <profiles>
     <!--
-      These are deliberately non-default, exact-topic profiles.  Hardware ACK
-      writers keep ROS RELIABLE QoS and synchronous publication; only their
+      These are deliberately non-default, exact-topic profiles. Hardware ACK
+      and small feedback writers keep ROS RELIABLE QoS and synchronous publication; only their
       RTPS repair heartbeat changes from Fast DDS' 3 s default to 50 ms.
+      Without prompt repair, a missing small sample can hold subsequent feedback
+      until the 10-sample history rolls over (~333 ms at 30 Hz).
     -->
     <publisher profile_name="/ur/command_result">
       <times>
@@ -22,6 +24,19 @@
           <nanosec>50000000</nanosec>
         </heartbeatPeriod>
       </times>
+    </publisher>
+
+    <publisher profile_name="/ur/state">
+      <times><heartbeatPeriod><sec>0</sec><nanosec>50000000</nanosec></heartbeatPeriod></times>
+    </publisher>
+    <publisher profile_name="/sharpa/state">
+      <times><heartbeatPeriod><sec>0</sec><nanosec>50000000</nanosec></heartbeatPeriod></times>
+    </publisher>
+    <publisher profile_name="/sharpa/tau">
+      <times><heartbeatPeriod><sec>0</sec><nanosec>50000000</nanosec></heartbeatPeriod></times>
+    </publisher>
+    <publisher profile_name="/sharpa/wrench">
+      <times><heartbeatPeriod><sec>0</sec><nanosec>50000000</nanosec></heartbeatPeriod></times>
     </publisher>
   </profiles>
 </dds>

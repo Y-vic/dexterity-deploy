@@ -43,3 +43,18 @@ def test_one_malformed_side_does_not_prevent_parsing_the_other():
     np.testing.assert_array_equal(left, np.arange(22, dtype=np.float32))
     with pytest.raises(ValueError, match="right joints missing"):
         ManusCore.joint_action_side_to_q(action, "right")
+
+
+def test_workbench_manus_routes_by_authoritative_owner():
+    from types import SimpleNamespace
+    import ast
+    from pathlib import Path
+    source = Path(__file__).parents[1] / 'manus_node/manus_node.py'
+    method = next(node for node in ast.walk(ast.parse(source.read_text()))
+                  if isinstance(node, ast.FunctionDef) and node.name == '_control')
+    context = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), context)
+    node=SimpleNamespace(_direct_pub='direct',_candidate_pub='candidate')
+    for source, expected in ((2,'direct'),(3,'candidate'),(0,'candidate')):
+        context['_control'](node,SimpleNamespace(active_source=source))
+        assert node.pub==expected

@@ -6,6 +6,7 @@ import json
 import math
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,10 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .model_manager import ModelManagerError, RemoteModelManager
+from ur_common.camera_preview import OnDemandCameraPreview
+from ur_common.reference_http import ReferenceHTTP
+from ur_common.recording_config import normalize_recording_root
+from ur_common.workbench import WorkbenchHTTP, workbench_snapshot
 
 
 DASHBOARD_ACTIONS = frozenset(
@@ -27,12 +32,31 @@ DASHBOARD_ACTIONS = frozenset(
         "stop_deploy",
         "select_policy",
         "select_replay",
+        "select_hil",
+        "enable_policy_recording",
+        "disable_policy_recording",
     }
 )
+OPERATOR_ACTIONS = frozenset({"select_teleop", "run_ur", "start_teleop_record", "start_record", "stop_record",
+                              "discard_record", "pause", "stop", "reset_both"})
 REPLAY_ACTIONS = frozenset(
     {"load", "start", "pause", "resume", "stop", "unload"}
 )
 LIVE_REPLAY_TIMEOUT_S = 6.0
+LEARNING_ACTIONS = frozenset({'takeover', 'release', 'failure'})
+
+
+def learning_command(payload, snapshot):
+    action = payload.get('action')
+    if action not in LEARNING_ACTIONS:
+        raise ValueError('未知 HIL 操作')
+    policy = snapshot.get('policy') or {}
+    model = snapshot.get('model') or {}
+    if snapshot.get('execution_provider', 'policy') != 'hil' or not policy.get('model_identity_ok'):
+        raise ValueError('请先选择 HIL 模式并连接远端策略')
+    if not (policy.get('hil') or {}).get('enabled'):
+        raise ValueError('部署未启用 HIL')
+    return dict(action=action, id=uuid.uuid4().hex, instance=model.get('instance'), issued_at=time.time())
 
 
 class DashboardState:
@@ -71,10 +95,15 @@ def wait_for_dashboard_state(
     raise ModelManagerError("Replay 状态切换超时，请检查节点日志和硬件状态")
 
 
-def forward_action(url: str, action: str, timeout_s: float = 2.0) -> dict[str, Any]:
-    if action not in DASHBOARD_ACTIONS:
+def forward_action(url: str, action: str, timeout_s: float = 2.0,
+                   *, reset_target: dict | None = None,
+                   allowed_actions=DASHBOARD_ACTIONS) -> dict[str, Any]:
+    if action not in allowed_actions:
         raise ValueError(f"unsupported dashboard action: {action}")
-    payload = json.dumps({"action": action}, separators=(",", ":")).encode()
+    body = {"action": action}
+    if action == "reset_both" and reset_target is not None:
+        body["reset_target"] = reset_target
+    payload = json.dumps(body, separators=(",", ":")).encode()
     request = Request(url, data=payload, headers={"Content-Type": "application/json"})
     try:
         with urlopen(request, timeout=timeout_s) as response:
@@ -108,6 +137,8 @@ def stop_policy_deployment(
 
 def actor_execution_active(snapshot: dict[str, Any]) -> bool:
     control = snapshot.get("control") or {}
+    if control.get("active_source") == 2:
+        return False
     hands_only = str(control.get("execution_scope", "full")) == "hands_only"
     return bool(
         (
@@ -117,6 +148,23 @@ def actor_execution_active(snapshot: dict[str, Any]) -> bool:
         or control.get("execution_dry_run")
         or control.get("execution_paused")
     )
+
+
+def recording_config_command(payload: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, str]:
+    root = normalize_recording_root(payload.get("recording_root"))
+    recording = snapshot.get("recording") or {}
+    if time.time() - float(recording.get("received_at", 0)) > 2.0:
+        raise ModelManagerError("数采节点未连接或状态过期，请等待连接后重试")
+    control = snapshot.get("control")
+    if control is None:
+        raise ModelManagerError("执行状态未连接，请等待连接后重试")
+    capture = (snapshot.get("policy") or {}).get("rollout_recording") or {}
+    if (control.get("execution_start_pending")
+            or control.get("ur_state") == 4 or control.get("sharpa_state") == 4
+            or recording.get("recording") or recording.get("saving")
+            or recording.get("rollout_requested") or capture.get("requested")):
+        raise ModelManagerError("请等待当前采集启动、录制或保存完成，再应用目录")
+    return {"id": uuid.uuid4().hex, "recording_root": str(root)}
 
 
 def validate_replay_command(payload: dict[str, Any]) -> dict[str, Any]:
@@ -206,6 +254,32 @@ def replay_config_matches_status(
         return False
 
 
+def load_replay_and_wait(state, publish_replay_command, command):
+    """Wait for this load command, ignoring errors from older requests."""
+    request_id = uuid.uuid4().hex
+    publish_replay_command({**command, "id": request_id})
+
+    def result(snapshot):
+        return (snapshot.get("replay") or {}).get("command_result") or {}
+
+    def failure(snapshot):
+        reply = result(snapshot)
+        if reply.get("id") == request_id and reply.get("accepted") is False:
+            return str(reply.get("reason") or "Replay 加载失败")
+        return ""
+
+    return wait_for_dashboard_state(
+        state,
+        lambda snapshot: (
+            result(snapshot).get("id") == request_id
+            and result(snapshot).get("accepted") is True
+            and replay_config_matches_status(snapshot.get("replay") or {}, command)
+            and (snapshot.get("replay") or {}).get("state") == "ready"
+        ),
+        failure=failure,
+    )
+
+
 def launch_live_replay(
     state: DashboardState,
     status_api_url: str,
@@ -226,34 +300,12 @@ def launch_live_replay(
     ):
         raise ModelManagerError("Replay 已完成，请先点击停止重置执行进度")
 
-    previous_execution_id = str(replay_before.get("execution_id") or "")
     gate_opened = False
     try:
         if replay_config_matches_status(replay_before, command):
             loaded = before
         else:
-            publish_replay_command(command)
-
-            def replay_load_failure(snapshot: dict[str, Any]) -> str:
-                replay = snapshot.get("replay") or {}
-                if (
-                    str(replay.get("execution_id") or "")
-                    != previous_execution_id
-                    and replay.get("state") == "fault"
-                ):
-                    return str(replay.get("error") or "Replay 加载失败")
-                return ""
-
-            loaded = wait_for_dashboard_state(
-                state,
-                lambda snapshot: (
-                    str((snapshot.get("replay") or {}).get("execution_id") or "")
-                    != previous_execution_id
-                    and (snapshot.get("replay") or {}).get("state") == "ready"
-                    and (snapshot.get("replay") or {}).get("dry_run") is False
-                ),
-                failure=replay_load_failure,
-            )
+            loaded = load_replay_and_wait(state, publish_replay_command, command)
         execution_id = str(
             (loaded.get("replay") or {}).get("execution_id") or ""
         )
@@ -353,27 +405,12 @@ def launch_replay_preview(
         == str(command.get("sample_dir") or "")
     ):
         raise ModelManagerError("Replay 已完成，请先点击停止重置执行进度")
-    previous_execution_id = str(replay_before.get("execution_id") or "")
     gate_opened = False
     try:
         if replay_config_matches_status(replay_before, command):
             loaded = before
         else:
-            publish_replay_command(command)
-            loaded = wait_for_dashboard_state(
-                state,
-                lambda snapshot: (
-                    str((snapshot.get("replay") or {}).get("execution_id") or "")
-                    != previous_execution_id
-                    and (snapshot.get("replay") or {}).get("state") == "ready"
-                    and (snapshot.get("replay") or {}).get("dry_run") is True
-                ),
-                failure=lambda snapshot: (
-                    str((snapshot.get("replay") or {}).get("error") or "Replay 加载失败")
-                    if (snapshot.get("replay") or {}).get("state") == "fault"
-                    else ""
-                ),
-            )
+            loaded = load_replay_and_wait(state, publish_replay_command, command)
         execution_id = str((loaded.get("replay") or {}).get("execution_id") or "")
         selected = forward(status_api_url, "select_replay")
         if not selected.get("accepted"):
@@ -543,6 +580,10 @@ def make_handler(
     model_manager: RemoteModelManager,
     publish_replay_command: Any,
     demo_api_url: str = "http://127.0.0.1:8089",
+    reference_http: ReferenceHTTP | None = None,
+    publish_learning_command: Any = None,
+    publish_recording_config: Any = None,
+    workbench_http: Any = None,
 ):
     class Handler(BaseHTTPRequestHandler):
         def _demo_proxy(self, path: str, payload: dict | None = None) -> None:
@@ -552,12 +593,18 @@ def make_handler(
             try:
                 with urlopen(request, timeout=3.0) as response:
                     self._send(response.read(), response.headers.get("Content-Type", "application/json"), response.status)
+            except (BrokenPipeError, ConnectionResetError):
+                return  # Closing the Demo switch aborts in-flight preview requests.
             except HTTPError as exc:
                 self._send(exc.read(), exc.headers.get("Content-Type", "application/json"), exc.code)
             except (URLError, TimeoutError, OSError):
                 self._send_json({"error": "Demo 服务未连接", "connected": False}, 503)
 
         def do_GET(self) -> None:
+            if workbench_http is not None and workbench_http.handle(self):
+                return
+            if reference_http is not None and reference_http.handle(self):
+                return
             if self.path.split("?", 1)[0] == "/api/demo/frame.jpg":
                 self._demo_proxy("/frame.jpg")
                 return
@@ -569,35 +616,52 @@ def make_handler(
                 payload["model"] = model_manager.snapshot()
                 self._send_json(payload)
                 return
-            if self.path == "/api/models":
-                try:
-                    self._send_json(model_manager.catalog())
-                except ModelManagerError as exc:
-                    self._send_json({"error": str(exc)}, 502)
-                return
             if self.path == "/api/servers":
                 self._send_json(model_manager.servers())
                 return
-            if self.path == "/" or self.path.startswith("/index"):
-                body = Path(__file__).with_name("dashboard.html").read_bytes()
-                self._send(body, "text/html; charset=utf-8")
+            if self.path == "/api/models":
+                try:
+                    self._send_json(model_manager.catalog())
+                except (ModelManagerError, ValueError, OSError) as exc:
+                    self._send_json({"error": str(exc)}, 502)
                 return
             self.send_error(404)
 
         def do_POST(self) -> None:
+            if workbench_http is not None and workbench_http.handle(self):
+                return
+            if reference_http is not None and reference_http.handle(self):
+                return
             try:
                 payload = self._read_json()
+                if self.path == '/api/recording/config':
+                    if publish_recording_config is None:
+                        raise ValueError('数采配置通道未连接')
+                    command = recording_config_command(payload, state.snapshot())
+                    publish_recording_config(command)
+                    self._send_json({'accepted': True, 'queued': True, 'command_id': command['id']}, 202)
+                    return
+                if self.path == '/api/learning':
+                    if publish_learning_command is None:
+                        raise ValueError('HIL / online RL 控制通道未连接')
+                    snapshot = {**state.snapshot(), 'model': model_manager.snapshot()}
+                    command = learning_command(payload, snapshot)
+                    publish_learning_command(command)
+                    self._send_json({'accepted': True, 'queued': True, 'command_id': command['id']}, 202)
+                    return
                 if self.path == "/api/demo/command":
-                    if payload.get("action") not in {"start", "stop", "delete"}:
-                        raise ValueError("expected start, stop or delete")
+                    if payload.get("action") not in {"enable", "disable", "start", "stop", "delete"}:
+                        raise ValueError("expected enable, disable, start, stop or delete")
                     self._demo_proxy("/command", payload)
                     return
                 if self.path == "/api/action":
                     action = str(payload.get("action", ""))
+                    if action == 'select_hil' and not (state.snapshot().get('policy', {}).get('hil') or {}).get('available'):
+                        raise ValueError('请以 enable_hil:=true 启动部署后选择 HIL')
                     if action in {"start_deploy", "preview_deploy"}:
                         snapshot = state.snapshot()
                         provider = snapshot.get("execution_provider", "policy")
-                        if provider == "policy":
+                        if provider in {"policy", "hil"}:
                             if model_manager.snapshot()["phase"] != "running":
                                 raise ModelManagerError("请先启动并等待模型服务就绪")
                             policy = snapshot.get("policy") or {}
@@ -616,30 +680,40 @@ def make_handler(
                     if (
                         action == "stop_deploy"
                         and state.snapshot().get("execution_provider", "policy")
-                        == "policy"
+                        in {"policy", "hil"}
                     ):
                         result = stop_policy_deployment(
                             status_api_url, model_manager
                         )
                     else:
-                        result = forward_action(status_api_url, action)
+                        result = forward_action(
+                            status_api_url, action,
+                            timeout_s=15.0 if action == "reset_both" else 2.0,
+                            reset_target=payload.get("reset_target") if action == "reset_both" else None,
+                        )
                     if result.get("accepted") and action in {
                         "select_policy",
                         "select_replay",
+                        "select_hil",
                     }:
                         state.update(
                             "execution_provider",
-                            "policy" if action == "select_policy" else "replay",
+                            action.removeprefix('select_'),
                         )
+                    if result.get('accepted') and action in {'enable_policy_recording', 'disable_policy_recording'}:
+                        state.update('policy_recording', action == 'enable_policy_recording')
                     self._send_json(result)
                     return
                 if self.path == "/api/replay":
                     command = validate_replay_command(payload)
+                    command['id'] = uuid.uuid4().hex
                     publish_replay_command(command)
                     self._send_json(
                         {
                             "accepted": True,
                             "replay_action": command["action"],
+                            "queued": True,
+                            "command_id": command['id'],
                         },
                         202,
                     )
@@ -672,11 +746,16 @@ def make_handler(
                         )
                     )
                     return
+                if self.path == "/api/server/select":
+                    if actor_execution_active(state.snapshot()):
+                        raise ModelManagerError("请先停止执行，再切换服务器")
+                    result = model_manager.select_server(str(payload.get("server_id", "")))
+                    self._send_json({"accepted": True, "model": result})
+                    return
                 if self.path == "/api/model/start":
-                    result = model_manager.start(
-                        str(payload.get("task", "")),
-                        str(payload.get("run_id", "")),
-                    )
+                    if actor_execution_active(state.snapshot()):
+                        raise ModelManagerError("请先停止执行，再加载模型")
+                    result = model_manager.start(str(payload.get("task", "")), str(payload.get("run_id", "")))
                     self._send_json({"accepted": True, "model": result}, 202)
                     return
                 if self.path == "/api/model/stop":
@@ -693,12 +772,6 @@ def make_handler(
                         },
                         202,
                     )
-                    return
-                if self.path == "/api/server/select":
-                    result = model_manager.select_server(
-                        str(payload.get("server_id", ""))
-                    )
-                    self._send_json({"accepted": True, "model": result})
                     return
                 self.send_error(404)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
@@ -747,7 +820,7 @@ def main(args=None) -> None:
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, Bool
     from ur_msgs.msg import (
         ActorTrajectory,
         CameraSet,
@@ -762,36 +835,45 @@ def main(args=None) -> None:
         def __init__(self) -> None:
             super().__init__("dashboard_node")
             self.declare_parameter("port", 8088)
+            self.declare_parameter("workbench_mode", False)
+            self.declare_parameter("enable_hil", False)
+            self.declare_parameter("recording_root", "/home/yns/data/test")
+            self.declare_parameter("upload_host", "BAAI")
+            self.declare_parameter("upload_path", "/share/project/yenaisheng/datasets/postrain/ur-sharpa/raw_data")
             self.declare_parameter("demo_api_url", "http://127.0.0.1:8089")
             self.declare_parameter(
                 "status_api_url", "http://127.0.0.1:8080/api/action"
             )
-            self.declare_parameter("model_ssh_host", "BAAI")
-            self.declare_parameter(
-                "model_remote_root",
-                "/share/project/yenaisheng/sharpa-deploy",
-            )
-            self.declare_parameter("model_server_config", "")
+            self.declare_parameter("model_config", "")
+            self.declare_parameter("reference_dataset_root", "/home/yns/data/0916_ppp")
+            self.declare_parameter("shared_memory_prefix", "ur_sharpa_camera_v1")
+            self.preview = OnDemandCameraPreview(str(self.get_parameter("shared_memory_prefix").value))
             self._model_status_pub = self.create_publisher(
                 String, "/model/status", 10
             )
             self._replay_command_pub = self.create_publisher(
                 String, "/replay/command", 10
             )
-            server_config = str(
-                self.get_parameter("model_server_config").value
-            ).strip()
-            manager_options: dict[str, Any] = {
-                "event_callback": self._model_event,
-            }
-            if server_config:
-                manager_options["profile_path"] = server_config
-            else:
-                manager_options.update(
-                    ssh_host=str(self.get_parameter("model_ssh_host").value),
-                    remote_root=str(self.get_parameter("model_remote_root").value),
-                )
-            self.model_manager = RemoteModelManager(**manager_options)
+            self._learning_pub = self.create_publisher(String, '/learning/command', 10)
+            self._record_config_pub = self.create_publisher(String, '/control/record_config', 10)
+            from monitor_node.monitor_node import MonitorController
+            self._bias_pub = self.create_publisher(String, '/control/bias_request', 10)
+            self._label_pub = self.create_publisher(String, '/control/record_label', 10)
+            self.operator = MonitorController(
+                recording_root=str(self.get_parameter("recording_root").value),
+                upload_host=str(self.get_parameter("upload_host").value),
+                upload_path=str(self.get_parameter("upload_path").value),
+                publish_bias=lambda value: self._publish_operator(self._bias_pub, value),
+                publish_label=lambda value: self._publish_operator(self._label_pub, value),
+                publish_config=self._publish_recording_config)
+            for topic, key in (("/teleop/vive_status", "vive_status"), ("/teleop/glove_status", "glove_status")):
+                self.create_subscription(String, topic,
+                    lambda msg, key=key: self.operator.update_upstream(key, self._json(msg)), 10)
+            model_config = str(self.get_parameter("model_config").value).strip()
+            if not model_config:
+                raise ValueError("model_config must point to the remote server configuration")
+            self.model_manager = RemoteModelManager(
+                profile_path=model_config, event_callback=self._model_event)
             self.create_timer(
                 0.5,
                 lambda: self._model_event(self.model_manager.snapshot()),
@@ -802,6 +884,10 @@ def main(args=None) -> None:
                 self.model_manager,
                 self._publish_replay_command,
                 str(self.get_parameter("demo_api_url").value),
+                ReferenceHTTP(self.preview, str(self.get_parameter("reference_dataset_root").value)),
+                publish_learning_command=self._publish_learning_command,
+                publish_recording_config=self._publish_recording_config,
+                workbench_http=WorkbenchHTTP(self._workbench_snapshot, self._operator_action, self.preview),
             )
             self.server = ThreadingHTTPServer(
                 ("127.0.0.1", int(self.get_parameter("port").value)), handler
@@ -816,6 +902,9 @@ def main(args=None) -> None:
                 ControlStatus, "/control/status", self._control, 10
             )
             self.create_subscription(String, "/policy/status", self._policy, 10)
+            self.create_subscription(String, '/control/record_status', self._recording, 10)
+            self.create_subscription(Bool, '/control/policy_recording',
+                                     lambda msg: state.update('policy_recording', bool(msg.data)), 10)
             self.create_subscription(String, "/replay/status", self._replay, 10)
             self.create_subscription(
                 String,
@@ -856,12 +945,50 @@ def main(args=None) -> None:
             self._last_motion_update = 0.0
             self._prediction_kin = None
 
+        def _workbench_snapshot(self):
+            deployment = {**state.snapshot(), "model": self.model_manager.snapshot()}
+            return workbench_snapshot(self.operator.snapshot(), deployment,
+                switchable=bool(self.get_parameter("workbench_mode").value))
+
+        @staticmethod
+        def _publish_operator(publisher, value):
+            message = String(); message.data = value; publisher.publish(message)
+
+        def _operator_action(self, payload):
+            action = str(payload.get("action", ""))
+            if action in {"start_teleop_record", "run_ur", "reset_both", "pause", "stop", "start_record", "stop_record", "discard_record", "select_teleop"}:
+                return forward_action(str(self.get_parameter("status_api_url").value), action,
+                    timeout_s=15.0 if action == "reset_both" else 2.0,
+                    reset_target=payload.get("reset_target") if action == "reset_both" else None,
+                    allowed_actions=OPERATOR_ACTIONS)
+            if action not in {"save_bias", "mark_success", "mark_fail", "drop_sample", "upload"}:
+                raise ValueError("未知工作台操作")
+            return self.operator.action(payload)
+
         def _publish_replay_command(self, payload: dict[str, Any]) -> None:
             message = String()
             message.data = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":")
             )
             self._replay_command_pub.publish(message)
+
+        def _publish_learning_command(self, payload):
+            message = String()
+            message.data = json.dumps(payload)
+            self._learning_pub.publish(message)
+
+        def _publish_recording_config(self, payload):
+            message = String()
+            message.data = json.dumps(payload, ensure_ascii=False)
+            self._record_config_pub.publish(message)
+
+        def _recording(self, message: String) -> None:
+            payload = self._json(message)
+            if isinstance(payload, dict):
+                state.update('recording', {**payload, 'received_at': time.time()})
+                self.operator.update_upstream('record_status', payload)
+                if payload.get('recording_root'):
+                    self.operator.recording_root = payload['recording_root']
 
         def _model_event(self, payload: dict[str, Any]) -> None:
             state.update("model", payload)
@@ -897,6 +1024,7 @@ def main(args=None) -> None:
                     "gate_reason": message.gate_reason,
                 },
             )
+            self.operator.update_status(state.snapshot()["control"])
 
         def _policy(self, message: String) -> None:
             payload = self._json(message)
@@ -926,6 +1054,7 @@ def main(args=None) -> None:
 
         def _bias(self, message: String) -> None:
             state.update("bias", self._json(message))
+            self.operator.update_upstream("bias_status", self._json(message))
 
         def _ur(self, message: UrStateFrame) -> None:
             payload = {
@@ -939,6 +1068,7 @@ def main(args=None) -> None:
             }
             self._visual_ur = payload
             state.update("ur", payload)
+            self.operator.update_upstream("ur_status", payload)
             self._update_measured_motion()
 
         def _sharpa(self, message: HandStateFrame) -> None:
@@ -956,6 +1086,7 @@ def main(args=None) -> None:
             }
             self._visual_hand = payload
             state.update("sharpa", payload)
+            self.operator.update_upstream("sharpa_status", payload)
             self._update_measured_motion()
 
         def _prediction(self, message: ActorTrajectory) -> None:
@@ -1034,6 +1165,7 @@ def main(args=None) -> None:
             state.update("measured_motion", payload)
 
         def _camera(self, message: CameraSet) -> None:
+            self.preview.accept_source(message)
             state.update(
                 "camera",
                 {
@@ -1055,6 +1187,8 @@ def main(args=None) -> None:
             )
 
         def destroy_node(self):
+            self.preview.release()
+            self.model_manager.close()
             self.server.shutdown()
             self.server.server_close()
             return super().destroy_node()

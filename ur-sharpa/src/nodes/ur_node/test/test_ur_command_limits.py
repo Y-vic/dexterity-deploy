@@ -18,6 +18,44 @@ class FakeDriver:
         )
 
 
+@pytest.mark.parametrize('limiter_change', [1e-16, .01])
+def test_policy_targets_preserved_or_rejected_at_limiter(limiter_change):
+    node = UrNode.__new__(UrNode)
+    node.enable_motion_limits = node.enable_joint_step_limit = False
+    node.enable_joint_clip = True
+    node.max_joint_step_rad = .35
+    node.max_abs_joint_rad = 6.28
+    node.driver = FakeDriver()
+    node.kinematics = SimpleNamespace(limit_joints=lambda target, current: target + limiter_change)
+    message = SimpleNamespace(left_joint=np.full(6,.1),right_joint=np.full(6,-.1),
+        left_enable=True,right_enable=True,strict_targets=True)
+    if limiter_change > 1e-12:
+        with pytest.raises(ValueError,match='would be changed'):
+            node.resolve_targets(message)
+    else:
+        left,right = node.resolve_targets(message)
+        np.testing.assert_array_equal(left,message.left_joint)
+        np.testing.assert_array_equal(right,message.right_joint)
+    message.left_joint = np.full(6,2*np.pi-.1)
+    with pytest.raises(ValueError,match='step exceeds'):
+        node.resolve_targets(message)  # must not unwrap to -0.1
+
+
+def test_policy_command_flags_survive_ros_serialization():
+    from rclpy.serialization import serialize_message, deserialize_message
+    from ur_msgs.msg import HandCommand
+    for kind in (ArmCommand, HandCommand):
+        message = kind()
+        assert not message.strict_targets
+        message.strict_targets = True
+        if kind is HandCommand:
+            message.policy_session_id = 'openpi-test-session'
+        restored = deserialize_message(serialize_message(message),kind)
+        assert restored.strict_targets
+        if kind is HandCommand:
+            assert restored.policy_session_id == message.policy_session_id
+
+
 def test_resolve_targets_rejects_before_joint_clipping():
     node = UrNode.__new__(UrNode)
     node.enable_motion_limits = True

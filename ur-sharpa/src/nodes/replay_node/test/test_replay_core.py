@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+from replay_node.sample import _resample_source_rows
 
 from replay_node.replay_node import (
     ReplayConfig,
     ReplaySample,
     ReplaySequencer,
-    _resample_source_rows,
     execution_identity,
 )
 
@@ -154,6 +154,8 @@ def test_replay_stop_keeps_sample_and_resets_sequencer_cursor():
 
 def test_config_rejects_unsafe_values():
     with pytest.raises(ValueError, match="execution_steps"):
+        ReplayConfig(execution_steps=1001)
+    with pytest.raises(ValueError, match="execution_steps"):
         ReplayConfig(execution_steps=0)
     with pytest.raises(ValueError, match="frequency_hz"):
         ReplayConfig(frequency_hz=2.0)
@@ -163,3 +165,10 @@ def test_config_rejects_unsafe_values():
         ReplayConfig(loop="false")
     with pytest.raises(ValueError, match="execution_scope"):
         ReplayConfig(execution_scope="arms_only")
+
+
+def test_empty_sample_path_does_not_resolve_to_working_directory():
+    from replay_node.replay_node import DEFAULT_SAMPLE_DIR
+    assert DEFAULT_SAMPLE_DIR == ""
+    with pytest.raises(ValueError, match="select a Replay sample"):
+        ReplaySample.load("")

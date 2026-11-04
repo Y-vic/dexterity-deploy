@@ -359,6 +359,40 @@ def test_unwrap_rescues_an_equivalent_angle_within_limits() -> None:
     assert solver.stats["solved"] == 1
 
 
+def test_quiet_binding_skips_stderr_redirection_and_keeps_rejection(monkeypatch) -> None:
+    import ur_common.ik_solver as module
+    class QuietKinematics(FakeKinematics):
+        def inverse_quiet(self, pose):
+            return self.inverse(pose)
+    monkeypatch.setattr(module.tempfile, 'TemporaryFile',
+                        lambda: pytest.fail('quiet IK redirected process stderr'))
+    ref = np.zeros(6)
+    for solutions in ([ref], []):
+        solver = FastIKSolver(QuietKinematics(solutions), config=SafetyConfig.v1_defaults())
+        np.testing.assert_array_equal(solver.solve(IDENTITY_CART, ref), ref)
+        if solutions:
+            assert solver.last_rejection is None
+        else:
+            assert solver.last_rejection['stage'] == 'IKFAST_NO_SOLUTION'
+
+
+def test_matrix_ik_keeps_rtde_fallback_and_rejection_tcp_as_six_vectors():
+    from ur_common.geometry import transform_to_rtde_pose
+    tcp = transform([.2, -.3, .4], [.1, -.2, .3])
+    expected = transform_to_rtde_pose(tcp)
+    calls = []
+    def fallback(cart, reference):
+        calls.append(cart.copy())
+        return reference.copy()
+    solver = FastIKSolver(FakeKinematics([]), config=SafetyConfig.v1_defaults(), rtde_ik_fn=fallback)
+    np.testing.assert_array_equal(solver.solve(tcp, np.zeros(6)), np.zeros(6))
+    np.testing.assert_array_equal(calls[0], expected)
+    assert solver.stats['solved_rtde'] == 1
+    solver.rtde_ik_fn = None
+    solver.solve(tcp, np.zeros(6))
+    np.testing.assert_array_equal(solver.last_rejection['target_tcp'], expected)
+
+
 def test_no_solution_holds_previous_target(capfd) -> None:
     class NoisyNoSolutionKinematics(FakeKinematics):
         def inverse(self, _pose):
@@ -392,6 +426,27 @@ def test_unwrap_prefers_in_limit_equivalent_angle() -> None:
     solver = FastIKSolver(FakeKinematics([sol]), config=SafetyConfig())
     out = solver.solve(IDENTITY_CART, ref, ref_joint=ref)
     assert out[0] == pytest.approx(6.885 - 2.0 * np.pi, abs=1e-9)
+
+
+def test_vectorized_unwrap_matches_ordered_scan_including_ties_and_limits():
+    rng = np.random.default_rng(74)
+    solver = FastIKSolver(FakeKinematics([]), config=SafetyConfig())
+    for _ in range(100):
+        sols = rng.uniform(-20, 20, (8, 6))
+        sols[0] = np.pi
+        ref = rng.uniform(-10, 10, 6)
+        ref[0] = 0
+        solver.joint_pos_limit = rng.uniform(.1, 8, 6)
+        k0 = np.round((ref-sols)/(2*np.pi))
+        expected = sols+k0*(2*np.pi)
+        distance = np.full_like(sols, np.inf)
+        for offset in (-2, -1, 0, 1, 2):
+            candidate = sols+(k0+offset)*(2*np.pi)
+            delta = np.abs(candidate-ref)
+            better = (np.abs(candidate) <= solver.joint_pos_limit) & (delta < distance)
+            expected = np.where(better, candidate, expected)
+            distance = np.where(better, delta, distance)
+        np.testing.assert_array_equal(solver._unwrap_to_ref(sols, ref), expected)
 
 
 def test_rtde_fallback_used_when_ikfast_has_nothing() -> None:

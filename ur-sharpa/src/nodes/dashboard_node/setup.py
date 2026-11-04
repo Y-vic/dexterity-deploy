@@ -10,9 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    # The page is a single self-contained HTML file shipped next to the sources:
-    # no build step, no npm, no CDN.
-    package_data={package_name: ["dashboard.html"]},
+    # Shared workbench assets are installed by ur_common.
     include_package_data=True,
     install_requires=["setuptools"],
     tests_require=["pytest"],

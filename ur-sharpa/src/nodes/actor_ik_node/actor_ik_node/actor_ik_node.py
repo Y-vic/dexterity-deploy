@@ -7,6 +7,7 @@ messages and publishes one terminal ExecutionDone for every received action.
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 from collections import OrderedDict
 from dataclasses import dataclass
 import json
@@ -17,15 +18,24 @@ import time
 from typing import Any
 
 import numpy as np
+from ur_common.command_guards import validate_arm_step
 
 from .trajectory import ExecutionTraceWriter, build_trajectory_payload
 
 
-ARM_MAX_STEP_RAD = 0.25
-HAND_MAX_STEP_RAD = 0.4
+ARM_MAX_STEP_RAD = setting('actor', 'arm_tracking_error_rad')
+HAND_MAX_STEP_RAD = setting('actor', 'hand_step_rad')
 ACK_OBSERVATION_RETENTION_S = 5.0
 ACK_OBSERVATION_HISTORY = 256
 CONTROL_TIMER_PERIOD_S = 0.001
+
+
+def actor_execution_requested(message) -> bool:
+    """Only Actor-owned ControlStatus can activate policy/replay execution."""
+    return int(message.active_source) == 3 and bool(
+        message.execution_dry_run or (
+            int(message.sharpa_state) == 1
+            and (int(message.execution_scope) == 1 or int(message.ur_state) == 2)))
 
 
 def required_execution_devices(execution_scope: str) -> frozenset[str]:
@@ -299,7 +309,8 @@ def limit_joint_target(current: Any, target: Any, max_delta: float) -> np.ndarra
     if not np.isfinite(max_delta) or max_delta <= 0.0:
         raise ActorIkError("max_delta must be finite and positive")
     delta = np.clip(target_array - current_array, -max_delta, max_delta)
-    return current_array + delta
+    return np.where(np.abs(target_array - current_array) <= max_delta,
+                    target_array, current_array + delta)
 
 
 def next_step_due(scheduled_deadline: float, frequency_hz: float) -> float:
@@ -448,6 +459,8 @@ def main(args=None) -> None:
             self._left = np.zeros(6, dtype=np.float32)
             self._right = np.zeros(6, dtype=np.float32)
             self._hand = np.zeros(44, dtype=np.float32)
+            self._ur_stamp = self._hand_stamp = 0
+            self._ur_received_ns = self._hand_received_ns = 0
             self._ur_valid = False
             self._hand_valid = False
             self._arm_pub = self.create_publisher(ArmCommand, "/ur/command", 10)
@@ -470,6 +483,12 @@ def main(args=None) -> None:
             self._scheduled = None
             self._next_chunk_due = None
             self._execution_provider = "policy"
+            self.declare_parameter("enable_hil", False)
+            self._hil_enabled = bool(self.get_parameter("enable_hil").value)
+            self.declare_parameter("hil_return_duration_s", setting("hil", "return_duration_s"))
+            self._hil_return_duration_s = float(self.get_parameter("hil_return_duration_s").value)
+            if not np.isfinite(self._hil_return_duration_s) or self._hil_return_duration_s <= 0:
+                raise ValueError("hil_return_duration_s must be positive and finite")
             self._machine_running = False
             self._execution_paused = False
             self._execution_dry_run = False
@@ -548,11 +567,17 @@ def main(args=None) -> None:
             # Absolute deadlines prevent timer jitter from accumulating into a
             # lower command frequency.  The 1 ms timer bounds normal wake-up
             # quantisation without changing the requested command period.
+            self.declare_parameter("deformation_shm_prefix", "ur_sharpa_deformation_v1")
+            self._deformation_shm_prefix = str(self.get_parameter("deformation_shm_prefix").value)
+            self.declare_parameter("camera_shm_prefix", "ur_sharpa_camera_v1")
+            from .remote_bridge import RemoteExecutionBridge
+            self._human_publish = False
+            self._remote = RemoteExecutionBridge(self)
             self._watchdog = self.create_timer(CONTROL_TIMER_PERIOD_S, self._process)
 
         def _provider_update(self, message):
             provider = str(message.data).strip().lower()
-            if provider in {"policy", "replay"}:
+            if provider in {"policy", "replay", "hil"}:
                 if (
                     provider != self._execution_provider
                     and self._plans.current is not None
@@ -586,6 +611,8 @@ def main(args=None) -> None:
                 self.get_logger().warning(f"invalid deploy execution event: {exc}")
 
         def _control_status(self, message):
+            self._control_seen = time.monotonic()
+            self._control_timestamp_ns = int(message.timestamp_ns)
             execution_scope = (
                 "hands_only"
                 if int(message.execution_scope)
@@ -600,7 +627,9 @@ def main(args=None) -> None:
                 )
             )
             dry_run = bool(message.execution_dry_run)
-            running = bool(live_running or dry_run)
+            # A unified graph also carries direct teleop state. Actor must
+            # never infer or execute while Vive/AE01 own the hardware gate.
+            running = actor_execution_requested(message)
             paused = bool(message.execution_paused)
             mode_changed = bool(
                 self._machine_running
@@ -749,8 +778,13 @@ def main(args=None) -> None:
                 self._latency_monitor_clear_pending = False
             if running and not paused:
                 self._process()
+            else:
+                # Close paused/stopped rollouts before a rapid next state update.
+                self._remote.tick()
+                self._remote.publish_status()
 
         def destroy_node(self):
+            self._remote.close()
             path = self._trace.stop(
                 "actor_node_destroyed",
                 final_state={
@@ -901,6 +935,8 @@ def main(args=None) -> None:
                 )
 
         def _ur_state(self, message):
+            self._ur_received_ns = time.time_ns()
+            self._ur_stamp = int(message.timestamp_ns)
             left = np.asarray(message.left_joint, dtype=np.float32)
             right = np.asarray(message.right_joint, dtype=np.float32)
             self._ur_valid = bool(
@@ -915,6 +951,8 @@ def main(args=None) -> None:
                 self._right = right
 
         def _hand_state(self, message):
+            self._hand_received_ns = time.time_ns()
+            self._hand_stamp = int(message.timestamp_ns)
             hand = np.asarray(message.q, dtype=np.float32)
             self._hand_valid = bool(
                 message.left_valid
@@ -1029,8 +1067,11 @@ def main(args=None) -> None:
                 ack_receive_monotonic_ns=received_monotonic_ns,
                 ack_delivery_latency_ms=delivery_latency_ms,
                 command_to_ack_ms=command_to_ack_ms,
-                execution_continued=True,
+                execution_continued=bool(message.success),
             )
+            if not message.success and observation is not None and self._machine_running and not self._execution_paused:
+                self._remote.rejected(str(message.failure_code), str(message.failure_message or message.failure_code))
+                return
             if observation is None:
                 warning = self._recent_ack_warnings.get(key)
                 if warning is not None:
@@ -1151,6 +1192,8 @@ def main(args=None) -> None:
                 self._recent_ack_warnings.popitem(last=False)
 
         def _advance_after_publish(self, action, plan, step, schedule_base):
+            if self._human_publish:
+                return
             executed_in_slice = int(step) + 1
             execute_fetch, execute_done = execution_edges(
                 action.execute_length,
@@ -1192,6 +1235,7 @@ def main(args=None) -> None:
             }
 
         def _process(self):
+            remote_ready = self._remote.tick()
             if self._execution_paused:
                 return
             now = time.monotonic()
@@ -1218,6 +1262,8 @@ def main(args=None) -> None:
                             execution_continued=True,
                         )
                     self._ack_observations.pop(key, None)
+            if not remote_ready or not self._machine_running:
+                return
             scheduled = self._scheduled
             if (
                 scheduled is None
@@ -1243,7 +1289,28 @@ def main(args=None) -> None:
                     str(exc),
                 )
 
+
+        def _publish_human_target(self, target, token, counter):
+            action = ExecutableAction()
+            action.session_id = 'hil-' + token
+            action.action_id = action.session_id + '-' + str(counter)
+            action.timestamp_ns = time.time_ns()
+            action.frequency_hz = 30.0
+            action.action_length = action.execute_length = 1
+            plan = IkPlan(target[None,:6], target[None,6:12], target[None,12:])
+            self._human_publish = True
+            try:
+                self._publish_step(action, plan, 0, time.monotonic())
+            finally:
+                self._human_publish = False
+
         def _publish_step(self, action, plan, step, scheduled_due):
+            if self._remote.handback is not None and not self._human_publish:
+                target = self._remote.effective(np.r_[plan.left_joint[step],plan.right_joint[step],plan.hand_joint[step]], action.frequency_hz)
+                left, right, hand = plan.left_joint.copy(), plan.right_joint.copy(), plan.hand_joint.copy()
+                left[step], right[step], hand[step] = target[:6], target[6:12], target[12:]
+                plan = IkPlan(left,right,hand)
+
             if not self._hand_valid:
                 raise ActorIkError("valid SharpA state is required")
             hands_only = self._execution_scope == "hands_only"
@@ -1275,6 +1342,7 @@ def main(args=None) -> None:
                 arm.left_enable = True
                 arm.right_enable = True
                 arm.dry_run = bool(self._execution_dry_run)
+                arm.strict_targets = False
             hand = HandCommand()
             hand.source = HandCommand.SOURCE_ACTOR
             hand.action_id = action.action_id
@@ -1284,7 +1352,15 @@ def main(args=None) -> None:
             hand.left_enable = True
             hand.right_enable = True
             hand.dry_run = bool(self._execution_dry_run)
+            hand.strict_targets = False
+            hand.policy_session_id = ""
+            hand.is_hil = bool(self._human_publish)
             key = (action.action_id, int(action.revision), step)
+            command_timestamp_ns = time.time_ns()
+            for command in (arm, hand):
+                if command is not None:
+                    command.header.stamp.sec = command_timestamp_ns // 1_000_000_000
+                    command.header.stamp.nanosec = command_timestamp_ns % 1_000_000_000
             published_at = time.monotonic()
             period_s = 1.0 / float(action.frequency_hz)
             schedule_lateness_s = max(0.0, published_at - float(scheduled_due))
@@ -1304,9 +1380,12 @@ def main(args=None) -> None:
                 "warning_deadline": published_at + period_s,
                 "expires_at": published_at + ACK_OBSERVATION_RETENTION_S,
             }
+            self._remote.proposed(action, plan, step)
             if arm is not None:
                 self._arm_pub.publish(arm)
             self._hand_pub.publish(hand)
+            if not hands_only:
+                self._remote.committed(np.r_[left_target,right_target,hand_target], action.frequency_hz)
             self._trace.event(
                 "command_published",
                 action_id=str(action.action_id),
@@ -1315,13 +1394,16 @@ def main(args=None) -> None:
                 dry_run=bool(self._execution_dry_run),
                 execution_scope=self._execution_scope,
                 arm_command_published=arm is not None,
+                command_timestamp_ns=command_timestamp_ns,
+                expected_devices=list(observed_devices),
+                source=int(hand.source),
                 scheduled_deadline_monotonic_ns=int(float(scheduled_due) * 1e9),
                 command_publish_monotonic_ns=int(published_at * 1e9),
                 publish_jitter_ms=schedule_lateness_s * 1000.0,
                 requested_period_ms=period_s * 1000.0,
-                left_arm_joint=[] if left_target is None else left_target.tolist(),
-                right_arm_joint=[] if right_target is None else right_target.tolist(),
-                hand_joint=hand_target.tolist(),
+                left_arm_joint=[] if arm is None else [float(value) for value in arm.left_joint],
+                right_arm_joint=[] if arm is None else [float(value) for value in arm.right_joint],
+                hand_joint=[float(value) for value in hand.q_cmd],
             )
             if step == 0:
                 sample = self._latency.mark_next_command_published(
@@ -1438,6 +1520,11 @@ def main(args=None) -> None:
             self._process()
 
         def _action(self, action, provider="policy"):
+            if provider == "policy" and self._execution_provider == "hil":
+                provider = "hil"
+            if provider == "hil" and self._remote.human.active:
+                return
+
             try:
                 self._trace.event(
                     "actor_action_received",

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from policy_client_node.policy_client_node import (
     PolicyClientCore,
     PolicyRequestMetrics,
+    action_period_deadline,
     activate_reset_metadata,
     completion_belongs_to_session,
     deployment_ready,
@@ -12,6 +13,16 @@ from policy_client_node.policy_client_node import (
     summarize_metadata,
     validate_server_eef_contract,
 )
+
+
+def test_action_period_deadline_waits_for_the_native_step_period():
+    assert action_period_deadline(12.5, 10.0) == pytest.approx(12.6)
+
+
+@pytest.mark.parametrize("frequency", [0.0, -1.0, np.inf, np.nan])
+def test_action_period_deadline_rejects_invalid_frequency(frequency):
+    with pytest.raises(ValueError, match="frequency_hz"):
+        action_period_deadline(12.5, frequency)
 
 
 def _metadata_format(format_id):

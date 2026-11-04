@@ -1,16 +1,19 @@
 from pathlib import Path
 from types import SimpleNamespace
+import json
 
 import pytest
 
 from dashboard_node.dashboard_node import (
     DASHBOARD_ACTIONS,
+    OPERATOR_ACTIONS,
     DashboardState,
     actor_execution_active,
     action_visualization,
     forward_action,
     hand_motion_visualization,
     launch_live_replay,
+    load_replay_and_wait,
     launch_replay_preview,
     replay_config_matches_status,
     stop_policy_deployment,
@@ -20,96 +23,70 @@ from dashboard_node.dashboard_node import (
 )
 
 
-def test_dashboard_exposes_machine_and_model_controls():
-    html = Path(__file__).parents[1] / "dashboard_node" / "dashboard.html"
-    page = html.read_text(encoding="utf-8")
+def test_dashboard_forwards_selected_reset_target(monkeypatch):
+    sent = []
 
-    for control_id in (
-        "machineReset",
-        "machineStart",
-        "machinePause",
-        "machineStop",
-        "machineContinue",
-        "machinePreview",
-        "modelSelect",
-        "modelServer",
-        "modelStart",
-        "modelStop",
-        "sourcePolicy",
-        "sourceReplay",
-        "replayLoad",
-        "replayClear",
-        "replaySteps",
-        "replayFrequency",
-        "replayScope",
-        "cameraEgoState",
-        "cameraLeftState",
-        "cameraRightState",
-        "modelLogPanel",
-        "modelLogOutput",
-        "chunkLatencyCurrent",
-        "chunkLatencyAverage",
-    ):
-        assert f'id="{control_id}"' in page
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self):
+            return b'{"accepted":true}'
+
+    def fake_open(request, timeout):
+        sent.append((json.loads(request.data), timeout))
+        return Response()
+
+    monkeypatch.setattr("dashboard_node.dashboard_node.urlopen", fake_open)
+    target = {"mode": "episode", "root": "/media/yns/My Passport/data", "episode": "success/one"}
+    assert forward_action("http://127.0.0.1:8080/api/action", "reset_both",
+                          timeout_s=15, reset_target=target)["accepted"]
+    assert sent == [({"action": "reset_both", "reset_target": target}, 15)]
+    assert forward_action("http://127.0.0.1:8080/api/action", "start_teleop_record",
+                          allowed_actions=OPERATOR_ACTIONS)["accepted"]
+    assert sent[-1][0] == {"action": "start_teleop_record"}
+
+
+def test_dashboard_exposes_workbench_machine_and_remote_model_controls():
+    from html.parser import HTMLParser
+    from ur_common.workbench import ASSETS
+
+    class Controls(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.ids = set()
+            self.modes = []
+            self.scripts = []
+
+        def handle_starttag(self, tag, attrs):
+            attrs = dict(attrs)
+            if 'id' in attrs:
+                self.ids.add(attrs['id'])
+            if 'data-mode' in attrs:
+                self.modes.append(attrs['data-mode'])
+            if tag == 'script' and 'src' in attrs:
+                self.scripts.append(attrs['src'])
+
+    page = Controls()
+    page.feed((ASSETS / 'index.html').read_text(encoding='utf-8'))
+    assert page.modes == ['teleop', 'policy', 'replay']
+    assert {'reset', 'resetMode', 'start', 'pause', 'resume', 'stop',
+            'startRecord', 'record', 'finish', 'serverSelect', 'chooseModel',
+            'unloadModel', 'modelDialog', 'modelLog', 'policyRecord',
+            'loadReplay', 'unloadReplay', 'replaySteps', 'replayHz',
+            'replayScope', 'referenceRoot', 'referenceEpisode'} <= page.ids
+    assert not {'rtcEnabled', 'executionHorizon', 'syncSkipSteps', 'rltControls'} & page.ids
+    for script in page.scripts:
+        assert (ASSETS / script.removeprefix('/')).is_file()
     assert DASHBOARD_ACTIONS == {
-        "reset_both",
-        "start_deploy",
-        "start_hands_deploy",
-        "continue_deploy",
-        "preview_deploy",
-        "preview_hands_deploy",
-        "pause_deploy",
-        "stop_deploy",
-        "select_policy",
-        "select_replay",
+        'reset_both', 'start_deploy', 'start_hands_deploy', 'continue_deploy',
+        'preview_deploy', 'preview_hands_deploy', 'pause_deploy', 'stop_deploy',
+        'select_policy', 'select_replay', 'select_hil',
+        'enable_policy_recording', 'disable_policy_recording',
     }
-    assert "/api/model/start" in page
-    assert "/api/model/stop" in page
-    assert "/api/servers" in page
-    assert "/api/server/select" in page
-    assert 'onclick="startModel()"' in page
-    assert "if(selectedTask&&selectedRun)await startSelectedModel()" in page
-    assert "模型启动中" in page
-    assert "模型加载中" in page
-    assert "模型就绪" in page
-    assert "model_identity_ok" in page
-    assert "model.log_tail" in page
-    assert "paintModelLog()" in page
-    assert "latest.actor_latency" in page
-    assert "current_latency_ms" in page
-    assert "average_latency_ms" in page
-    assert "#inferenceValue, #inferenceValue.ok, #inferenceValue.bad { color: var(--green); }" in page
-    assert "action:'pause_deploy'" in page
-    assert "continuing?'continue_deploy':'start_deploy'" in page
-    assert "control.execution_paused" in page
-    assert "control.execution_dry_run" in page
-    assert "syncPredictionPlayback(actorRunning,paused)" in page
-    assert 'aria-label="启动和停止"' in page
-    assert 'aria-label="暂停和继续"' in page
-    assert "continueSelectedExecution()" in page
-    assert 'onclick="previewSelectedExecution()">预览</button>' in page
-    assert ">预览轨迹</button>" not in page
-    assert 'onclick="clearReplay()">卸载样本</button>' in page
-    assert "async function stopReplayExecution()" in page
-    assert "JSON.stringify({action:'stop'})" in page
-    assert "JSON.stringify({action:'unload'})" in page
-    assert "/api/replay" in page
-    assert "/api/replay/live/start" in page
-    assert "/api/replay/preview/start" in page
-    assert "execution_steps:Number.parseInt(replaySteps.value,10)" in page
-    assert "frequency_hz:Number(replayFrequency.value)" in page
-    assert "execution_scope:replayScope.value" in page
-    assert '<option value="hands_only">仅手部</option>' in page
-    assert "history ${history} · current ${current}" in page
-    assert "/media/yns/T9/0824_yns_unscrew_cap/success/2026-08-24_16-01-44.683076" in page
-
-    dashboard_source = (
-        Path(__file__).parents[1] / "dashboard_node" / "dashboard_node.py"
-    ).read_text(encoding="utf-8")
-    assert '"/actor_ik/latency_status"' in dashboard_source
-    assert '"/actor_ik/trajectory"' in dashboard_source
-    assert '"/policy/executable_action"' not in dashboard_source
-    assert '"/replay/preview_action"' not in dashboard_source
 
 
 def test_dashboard_rejects_any_other_machine_action_before_forwarding():
@@ -378,6 +355,8 @@ def test_live_replay_launch_waits_for_each_gate_before_starting():
         events.append(("replay", command["action"]))
         replay = dict(state.snapshot()["replay"])
         if command["action"] == "load":
+            replay.update(command)
+            replay["command_result"] = {"id": command["id"], "accepted": True}
             replay.update(
                 state="ready",
                 execution_id="new",
@@ -484,14 +463,6 @@ def test_hands_only_replay_opens_only_the_hands_gate():
     ]
 
 
-def test_dashboard_start_button_does_not_require_reset_state():
-    html = Path(__file__).parents[1] / "dashboard_node" / "dashboard.html"
-    page = html.read_text(encoding="utf-8")
-
-    assert "机器复位可选，也可直接从当前位置启动" in page
-    assert "control.ur_state!==1||!hardwareReady||!sourceReady" not in page
-
-
 def test_live_replay_continue_reuses_loaded_execution_and_cursor():
     state = DashboardState()
     state.update("control", {"ur_state": 1, "sharpa_state": 3})
@@ -564,6 +535,8 @@ def test_replay_preview_loads_dry_run_and_waits_for_playback():
         events.append(("replay", command["action"]))
         replay = dict(state.snapshot()["replay"])
         if command["action"] == "load":
+            replay.update(command)
+            replay["command_result"] = {"id": command["id"], "accepted": True}
             replay.update(
                 state="ready",
                 execution_id="preview-execution",
@@ -658,57 +631,77 @@ def test_hand_motion_visualization_uses_canonical_wrist_pose():
     assert result["left_keypoints"][1] == [1.1, 2.0, 3.0]
 
 
-def test_dashboard_uses_urdf_keypoints_instead_of_approximate_hand_geometry():
-    html = Path(__file__).parents[1] / "dashboard_node" / "dashboard.html"
-    page = html.read_text(encoding="utf-8")
-
-    assert "left_keypoints" in page
-    assert "right_keypoints" in page
-    assert "function handPoints" not in page
-    assert "plotPoint=p=>[p[0],p[2],p[1]]" in page
-    assert "sceneCenter=[0,.28,.35],sceneSpan=.9,visualZoom=1.14" in page
-    assert "gridStep=sceneSpan/8,spaceHeight=.64" in page
-    assert "ctx.lineWidth=1.55" in page
-    assert "'#35d4c3'" in page
-    assert "'#ff9a6c'" in page
-    assert "ORIGINAL VIEW" in page
-    assert "handVisualScale" not in page
-    assert "canonicalScreenX" not in page
-    assert "drawWristAxes" not in page
-    assert "mins=[0,1,2]" not in page
-
-
-def test_camera_subscribers_match_best_effort_publisher_qos():
+def test_dashboard_camera_subscription_matches_qos_and_policy_uses_raw_frames():
+    import ast
     nodes = Path(__file__).parents[2]
-    dashboard = (nodes / "dashboard_node" / "dashboard_node" / "dashboard_node.py").read_text(encoding="utf-8")
-    policy_client = (nodes / "policy_client_node" / "policy_client_node" / "policy_client_node.py").read_text(encoding="utf-8")
+    dashboard = (nodes / 'dashboard_node/dashboard_node/dashboard_node.py').read_text(encoding='utf-8')
+    policy = (nodes / 'policy_client_node/policy_client_node/policy_client_node.py').read_text(encoding='utf-8')
 
-    for source in (dashboard, policy_client):
-        assert "reliability=ReliabilityPolicy.BEST_EFFORT" in source
-        assert "CameraSet," in source
-        assert '"/camera/set",' in source
-        assert "self._camera," in source
-        assert "camera_qos" in source
+    def camera_subscriptions(source):
+        return [node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == 'create_subscription' and len(node.args) >= 4
+                and isinstance(node.args[1], ast.Constant) and node.args[1].value == '/camera/set']
 
-    assert '"/robot_states/status"' not in dashboard
-    assert 'payload.get("buffers")' in dashboard
+    subscriptions = camera_subscriptions(dashboard)
+    assert len(subscriptions) == 1
+    assert isinstance(subscriptions[0].args[3], ast.Name)
+    assert subscriptions[0].args[3].id == 'camera_qos'
+    qos = next(node.value for node in ast.walk(ast.parse(dashboard))
+               if isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == 'camera_qos' for target in node.targets))
+    reliability = next(item.value for item in qos.keywords if item.arg == 'reliability')
+    assert isinstance(reliability, ast.Attribute) and reliability.attr == 'BEST_EFFORT'
+    # The model must not silently fall back to the slower UI JPEG stream.
+    assert camera_subscriptions(policy) == []
+    assert 'SharedCameraReader' in policy and 'self._raw_cameras' in policy
+    # Native-image encoding, freshness and callback behavior have behavioral
+    # coverage in test_remote_observation.py and test_remote_callbacks.py.
 
 
-def test_model_picker_only_shows_launchable_runs():
-    html = Path(__file__).parents[1] / "dashboard_node" / "dashboard.html"
-    page = html.read_text(encoding="utf-8")
+def test_remote_model_picker_explains_unavailable_entries():
+    from ur_common.workbench import ASSETS
+    script = (ASSETS / 'workbench.js').read_text(encoding='utf-8')
+    assert 'run.disabled_reason' in script
+    assert 'String(!!run.launchable)' in script
+    assert "e.dataset.launchable !== 'true'" in script
+    assert '/api/servers' in script and '/api/server/select' in script
+    assert '尚未配置模型目录' in script
+    # Actual selection, rejection, empty catalogs and load requests execute
+    # against an offline DOM/network fixture in workbench_remote_ui_test.cjs.
 
-    assert "只显示配置完整并且可以直接部署" in page
-    assert ".filter(run=>run.launchable)" in page
-    assert "'READY':'INVALID'" not in page
-    assert "runStatusLabels" not in page
-    assert "defaultBadge" not in page
+
+@pytest.mark.parametrize("launch", [launch_live_replay, launch_replay_preview])
+def test_replay_load_failure_reports_error_without_new_execution_id(launch):
+    state = DashboardState()
+    state.update("replay", {"state": "ready", "execution_id": "existing"})
+    def publish(command):
+        state.update("replay", {
+            "state": "fault", "execution_id": "existing",
+            "command_result": {"id": command["id"], "accepted": False,
+                            "reason": "sample checksum mismatch"},
+        })
+    def forward(*args):
+        pytest.fail("load failure must not open a machine gate")
+    with pytest.raises(RuntimeError, match="sample checksum mismatch"):
+        launch(state, "unused", publish, {"action": "load"}, forward=forward)
 
 
-def test_dashboard_plays_prediction_chunk_without_measured_history():
-    html = Path(__file__).parents[1] / "dashboard_node" / "dashboard.html"
-    page = html.read_text(encoding="utf-8")
-
-    assert "requestAnimationFrame(animatePrediction)" in page
-    assert "prediction.frames" in page
-    assert "measured.history" not in page
+def test_replay_load_ignores_stale_fault_until_matching_reply():
+    command = dict(action="load", sample_dir="/sample", execution_steps=40,
+                   frequency_hz=30., joint_source="measured", execution_scope="full",
+                   dry_run=True, loop=False)
+    class Replies:
+        calls = 0
+        request_id = None
+        def snapshot(self):
+            self.calls += 1
+            if self.calls < 3:
+                return {"replay": {"state": "fault", "error": "previous failure",
+                    "command_result": {"id": "previous", "accepted": False}}}
+            return {"replay": {**command, "state": "ready", "execution_id": "new",
+                "command_result": {"id": self.request_id, "accepted": True}}}
+    state = Replies()
+    def publish(payload):
+        state.request_id = payload["id"]
+    assert load_replay_and_wait(state, publish, command)["replay"]["execution_id"] == "new"

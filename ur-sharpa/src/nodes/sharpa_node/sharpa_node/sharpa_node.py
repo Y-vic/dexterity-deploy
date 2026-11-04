@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import array
+import json
 import os
+from pathlib import Path
 import threading
 import time
 from typing import Any
+from types import SimpleNamespace
 
 import numpy as np
+from ur_common.command_guards import validate_hand_range
 
 
 ACTOR_SOURCE = 3
@@ -27,6 +31,10 @@ def validate_hand_command(command: Any) -> tuple[np.ndarray, int, bool, bool, bo
     dry_run = bool(command.dry_run)
     if dry_run and source != ACTOR_SOURCE:
         raise ValueError("only Actor commands may use dry_run")
+    if getattr(command,'strict_targets',False):
+        if source != ACTOR_SOURCE or not getattr(command,'policy_session_id','') or not (left_enable and right_enable):
+            raise ValueError('strict policy requires Actor source, session ID and both hands')
+        validate_hand_range(values)
     return values, source, left_enable, right_enable, dry_run
 
 
@@ -60,13 +68,17 @@ class SuccessfulHandCommandCache:
         self._valid = False
         self._timestamp_ns = 0
         self._source = 0
+        self._is_hil = False
+        self._invalid_reason = "not_commanded"
 
-    def invalidate(self) -> None:
+    def invalidate(self, reason: str = "command_failed") -> None:
         with self._lock:
             self._q_cmd.fill(np.nan)
             self._valid = False
             self._timestamp_ns = 0
             self._source = 0
+            self._is_hil = False
+            self._invalid_reason = str(reason)
 
     def record(
         self,
@@ -74,10 +86,11 @@ class SuccessfulHandCommandCache:
         *,
         source: int,
         timestamp_ns: int | None = None,
+        is_hil: bool = False,
     ) -> None:
         stamp = time.time_ns() if timestamp_ns is None else int(timestamp_ns)
         if set(dispatched) != {"left", "right"}:
-            self.invalidate()
+            self.invalidate("partial_command")
             return
         left = np.asarray(dispatched["left"], dtype=np.float32).reshape(-1)
         right = np.asarray(dispatched["right"], dtype=np.float32).reshape(-1)
@@ -89,7 +102,7 @@ class SuccessfulHandCommandCache:
             or stamp <= 0
             or int(source) <= 0
         ):
-            self.invalidate()
+            self.invalidate("invalid_command")
             return
         with self._lock:
             self._q_cmd[:22] = left
@@ -97,21 +110,27 @@ class SuccessfulHandCommandCache:
             self._valid = True
             self._timestamp_ns = stamp
             self._source = int(source)
+            self._is_hil = bool(is_hil) and int(source) == 3
+            self._invalid_reason = ""
 
-    def snapshot(self) -> tuple[np.ndarray, bool, int, int]:
+    def snapshot(self, *, include_hil=False, include_reason=False):
         with self._lock:
-            return (
+            result = (
                 self._q_cmd.copy(),
                 bool(self._valid),
                 int(self._timestamp_ns),
                 int(self._source),
             )
+            if include_hil:
+                result = (*result, self._is_hil)
+            return (*result, self._invalid_reason) if include_reason else result
 
 
 def main(args=None) -> None:
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy
     from std_msgs.msg import Bool, String
     from ur_msgs.msg import (
         ControlStatus,
@@ -124,6 +143,7 @@ def main(args=None) -> None:
     )
     from ur_common.drivers import SharpADevicePair
     from ur_common.execution_log import execution_event_json
+    from ur_common.deformation_transport import DeformationWriter, DEFAULT_PREFIX as DEFORMATION_PREFIX
     from .arbitration import SharpaState, Source, arbitrate
 
     class RosSharpaNode(Node):
@@ -131,9 +151,21 @@ def main(args=None) -> None:
             super().__init__("sharpa_node")
             self.declare_parameter("sdk_root", os.environ.get("SHARPA_SDK_ROOT", ""))
             self.declare_parameter("skip_tactile", False)
+            self.declare_parameter("deformation_shm_prefix", DEFORMATION_PREFIX)
+            self._skip_tactile = bool(self.get_parameter("skip_tactile").value)
+            self._deformation_writer = (None if self._skip_tactile else
+                DeformationWriter(str(self.get_parameter("deformation_shm_prefix").value)))
             self._sdk_lock = threading.RLock()
+            sdk_root = str(self.get_parameter("sdk_root").value)
+            version_file = Path(sdk_root).expanduser() / "VERSION"
+            try:
+                sdk_version = next(line for line in version_file.read_text().splitlines()
+                                   if line.startswith("VERSION="))
+            except (OSError, StopIteration):
+                sdk_version = "VERSION=unknown"
+            self.get_logger().info(f"SharpA SDK root={sdk_root}; {sdk_version}")
             self.driver = SharpADevicePair(
-                sdk_root=str(self.get_parameter("sdk_root").value),
+                sdk_root=sdk_root,
                 enable_control=True,
                 skip_tactile=bool(self.get_parameter("skip_tactile").value),
             )
@@ -154,10 +186,15 @@ def main(args=None) -> None:
             else:
                 self._control_mode = "position"
                 self._refresh_control_error()
+                if self._control_error:
+                    self.get_logger().warning(self._control_error)
             self.pub = self.create_publisher(HandStateFrame, "/sharpa/state", 10)
             self.tau_pub = self.create_publisher(TauFrame, "/sharpa/tau", 10)
-            self.wrench_pub = self.create_publisher(WrenchFrame, "/sharpa/wrench", 10)
-            self.deformation_pub = self.create_publisher(DeformationFrame, "/sharpa/deformation", 1)
+            self.wrench_pub = (None if self._skip_tactile else
+                               self.create_publisher(WrenchFrame, "/sharpa/wrench", 10))
+            self.deformation_pub = (None if self._skip_tactile else
+                                    self.create_publisher(DeformationFrame, "/sharpa/deformation", 1))
+            self.get_logger().info(f"SharpA tactile enabled={not self._skip_tactile}; joint state/torque and commands remain enabled")
             self.result = self.create_publisher(HardwareCommandResult, "/sharpa/command_result", 10)
             self._execution_event_pub = self.create_publisher(
                 String, "/deploy/execution_event", 100
@@ -169,6 +206,15 @@ def main(args=None) -> None:
             self._reconnect_running = False
             self._last_connection_report = self._control_error
             self._command_cache = SuccessfulHandCommandCache()
+            self._state_callback_count = 0
+            self._state_last_started_ns = 0
+            self._state_last_duration_ms = 0.0
+            self._state_max_duration_ms = 0.0
+            self._state_max_interval_ms = 0.0
+            self._acquisition_status = self.create_publisher(
+                String, "/sharpa/acquisition_status",
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
+            self.create_timer(1.0, self._publish_acquisition_status)
             self.create_subscription(HandCommand, "/sharpa/command", self._command, 10)
             self.create_subscription(ControlStatus, "/control/status", self._status, 10)
             self.create_subscription(Bool, "/hardware/stop", self._stop, 10)
@@ -234,15 +280,46 @@ def main(args=None) -> None:
                     self._active_source = Source.UNKNOWN
 
                 if self._active_source != previous_source:
-                    self._command_cache.invalidate()
+                    # Status and hardware/stop can arrive in either order.
+                    stopped = self._stopped or self._sharpa_state == SharpaState.STOPPED
+                    self._command_cache.invalidate("stopped" if stopped else "source_changed")
 
         def _stop(self, message):
             with self._sdk_lock:
                 self._stopped = bool(message.data)
                 if self._stopped:
-                    self._command_cache.invalidate()
+                    self._command_cache.invalidate("stopped")
 
         def _state(self):
+            started_ns = time.monotonic_ns()
+            if self._state_last_started_ns:
+                self._state_max_interval_ms = max(
+                    self._state_max_interval_ms,
+                    (started_ns - self._state_last_started_ns) / 1e6)
+            self._state_last_started_ns = started_ns
+            self._state_callback_count += 1
+            try:
+                self._publish_state()
+            finally:
+                self._state_last_duration_ms = (time.monotonic_ns() - started_ns) / 1e6
+                self._state_max_duration_ms = max(self._state_max_duration_ms,
+                                                  self._state_last_duration_ms)
+
+        def _publish_acquisition_status(self):
+            message = String()
+            message.data = json.dumps({
+                "timestamp_ns": time.time_ns(),
+                "monotonic_ns": time.monotonic_ns(),
+                "state_callback_count": self._state_callback_count,
+                "state_last_started_monotonic_ns": self._state_last_started_ns,
+                "state_last_duration_ms": self._state_last_duration_ms,
+                "state_max_duration_ms": self._state_max_duration_ms,
+                "state_max_interval_ms": self._state_max_interval_ms,
+                "tactile_enabled": not self._skip_tactile,
+            }, separators=(",", ":"))
+            self._acquisition_status.publish(message)
+
+        def _publish_state(self):
             msg = HandStateFrame(); msg.timestamp_ns = time.time_ns()
             msg.control_mode = self._control_mode
             msg.position_control_ready = False
@@ -256,7 +333,7 @@ def main(args=None) -> None:
                 with self._sdk_lock:
                     raw = self.driver.read()
                     snapshot = SharpaStateCore.normalize(raw)
-                    command_snapshot = self._command_cache.snapshot()
+                    command_snapshot = self._command_cache.snapshot(include_hil=True, include_reason=True)
             except Exception as exc:
                 self.get_logger().error(str(exc)); msg.left_valid = False; msg.right_valid = False; self.pub.publish(msg); return
             stamp = snapshot["timestamp_ns"]
@@ -275,24 +352,40 @@ def main(args=None) -> None:
             msg.tau = np.concatenate((raw.left_tau, raw.right_tau)).tolist()
             msg.tau_valid = bool(raw.left_tau_valid and raw.right_tau_valid)
             msg.dq = [0.0] * 44; msg.dq_valid = False
-            q_cmd, q_cmd_valid, q_cmd_timestamp_ns, q_cmd_source = command_snapshot
+            q_cmd, q_cmd_valid, q_cmd_timestamp_ns, q_cmd_source, is_hil, invalid_reason = command_snapshot
             msg.q_cmd = q_cmd.tolist()
             msg.q_cmd_valid = q_cmd_valid
             msg.q_cmd_timestamp_ns = q_cmd_timestamp_ns
             msg.q_cmd_source = q_cmd_source
+            msg.q_cmd_invalid_reason = invalid_reason
+            msg.is_hil = is_hil
             self.pub.publish(msg)
 
             tau = TauFrame(); tau.timestamp_ns = stamp
             tau.left = np.asarray(raw.left_tau, dtype=np.float32).tolist(); tau.right = np.asarray(raw.right_tau, dtype=np.float32).tolist()
             tau.left_valid = bool(raw.left_tau_valid); tau.right_valid = bool(raw.right_tau_valid); self.tau_pub.publish(tau)
 
+            if self._skip_tactile:
+                return
+
             wrench = WrenchFrame(); wrench.timestamp_ns = stamp
             wrench.left = np.asarray(raw.left_wrench, dtype=np.float32).reshape(-1).tolist(); wrench.right = np.asarray(raw.right_wrench, dtype=np.float32).reshape(-1).tolist()
             wrench.left_valid = np.asarray(raw.left_wrench_valid, dtype=bool).tolist(); wrench.right_valid = np.asarray(raw.right_wrench_valid, dtype=bool).tolist(); self.wrench_pub.publish(wrench)
 
-            deformation = DeformationFrame(); deformation.timestamp_ns = stamp
-            deformation.left = array.array("B", np.asarray(raw.left_deformation, dtype=np.uint8).reshape(-1).tobytes()); deformation.right = array.array("B", np.asarray(raw.right_deformation, dtype=np.uint8).reshape(-1).tobytes())
-            deformation.left_valid = np.asarray(raw.left_deformation_valid, dtype=bool).tolist(); deformation.right_valid = np.asarray(raw.right_deformation_valid, dtype=bool).tolist(); self.deformation_pub.publish(deformation)
+            deformation = SimpleNamespace(timestamp_ns=stamp,
+                left=np.asarray(raw.left_deformation, dtype=np.uint8).reshape(-1),
+                right=np.asarray(raw.right_deformation, dtype=np.uint8).reshape(-1),
+                left_valid=np.asarray(raw.left_deformation_valid, dtype=bool).tolist(),
+                right_valid=np.asarray(raw.right_deformation_valid, dtype=bool).tolist())
+            self._deformation_writer.write(deformation)
+            # Keep the public ROS interface for remote/legacy consumers. Local
+            # recording drains the ring without fragmenting 576 KB over DDS.
+            if self.deformation_pub.get_subscription_count():
+                message = DeformationFrame(timestamp_ns=stamp,
+                    left=array.array("B", deformation.left.tobytes()),
+                    right=array.array("B", deformation.right.tobytes()),
+                    left_valid=deformation.left_valid, right_valid=deformation.right_valid)
+                self.deformation_pub.publish(message)
 
         def _fault_state(self):
             """Publish device-side faults into the active Deploy event log."""
@@ -362,6 +455,8 @@ def main(args=None) -> None:
                         values[:22], values[22:],
                         left_enable=left_enable,
                         right_enable=right_enable,
+                        **(dict(strict_targets=True,policy_session_id=command.policy_session_id)
+                           if getattr(command,"strict_targets",False) else {}),
                         event_callback=lambda event, **fields: self._execution_event(
                             event, command, device="sharpa", **fields
                         ),
@@ -378,6 +473,7 @@ def main(args=None) -> None:
                         dispatched,
                         source=int(command.source),
                         timestamp_ns=time.time_ns(),
+                        is_hil=bool(command.is_hil),
                     )
                 result.success = True
             except Exception as exc:
@@ -427,6 +523,8 @@ def main(args=None) -> None:
             self._closing = True
             with self._sdk_lock:
                 self.driver.close()
+            if self._deformation_writer is not None:
+                self._deformation_writer.close()
             return super().destroy_node()
 
     rclpy.init(args=args); node = RosSharpaNode()

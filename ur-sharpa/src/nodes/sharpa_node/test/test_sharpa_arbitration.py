@@ -55,6 +55,23 @@ def test_successful_hand_command_cache_holds_full_command():
     assert cache.snapshot()[1] is True
 
 
+def test_hil_flag_follows_the_successful_command_and_clears_with_invalidation():
+    cache = SuccessfulHandCommandCache()
+    dispatched = {'left': np.full(22, 0.2), 'right': np.full(22, -0.3)}
+    for flag in (False, True, False):
+        cache.record(dispatched, source=3, timestamp_ns=100, is_hil=flag)
+        snapshot = cache.snapshot(include_hil=True)
+        assert snapshot[1:] == (True, 100, 3, flag)
+        np.testing.assert_allclose(snapshot[0][:22], 0.2)
+    cache.record(dispatched, source=3, timestamp_ns=101, is_hil=True)
+    cache.invalidate()  # Stop, source switch or SDK failure.
+    assert cache.snapshot(include_hil=True)[1:] == (False, 0, 0, False)
+    cache.record({'left': dispatched['left']}, source=3, timestamp_ns=102, is_hil=True)
+    assert cache.snapshot(include_hil=True)[1:] == (False, 0, 0, False)
+    cache.record(dispatched, source=2, timestamp_ns=103, is_hil=True)
+    assert cache.snapshot(include_hil=True)[-1] is False
+
+
 def test_partial_hand_command_is_not_a_valid_full_action():
     cache = SuccessfulHandCommandCache()
     cache.record(
@@ -97,6 +114,23 @@ def test_invalidate_clears_the_held_successful_command():
     assert np.isnan(q_cmd).all()
     assert timestamp_ns == 0
     assert source == 0
+
+
+def test_command_cache_reports_boundary_and_failure_causes_atomically():
+    cache = SuccessfulHandCommandCache()
+    assert cache.snapshot(include_reason=True)[-1] == 'not_commanded'
+    complete = {'left': np.zeros(22), 'right': np.zeros(22)}
+    for reason in ('stopped', 'source_changed', 'command_failed'):
+        cache.record(complete, source=3, timestamp_ns=100, is_hil=True)
+        assert cache.snapshot(include_hil=True, include_reason=True)[1:] == (True, 100, 3, True, '')
+        cache.invalidate(reason)
+        snapshot = cache.snapshot(include_hil=True, include_reason=True)
+        assert snapshot[1:] == (False, 0, 0, False, reason)
+        assert np.isnan(snapshot[0]).all()
+    cache.record({'left': np.zeros(22)}, source=3)
+    assert cache.snapshot(include_reason=True)[-1] == 'partial_command'
+    cache.record({'left': np.zeros(1), 'right': np.zeros(22)}, source=3)
+    assert cache.snapshot(include_reason=True)[-1] == 'invalid_command'
 
 
 def test_actor_dry_run_hand_command_is_validated_without_sdk_state():

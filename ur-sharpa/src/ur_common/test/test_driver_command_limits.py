@@ -122,10 +122,12 @@ class FakeControlledHand(FakeHand):
     def __init__(
         self, *, mode=10, source=7, ignore_mode_write=False,
         fail_redundant_mode_write=False, fail_redundant_source_write=False,
+        enabled=True,
     ):
         super().__init__()
         self.mode = mode
         self.source = source
+        self.enabled = enabled
         self.ignore_mode_write = ignore_mode_write
         self.fail_redundant_mode_write = fail_redundant_mode_write
         self.fail_redundant_source_write = fail_redundant_source_write
@@ -138,10 +140,14 @@ class FakeControlledHand(FakeHand):
             return SimpleNamespace(code=2, message="Failure to connect to server")
         if not self.ignore_mode_write:
             self.mode = mode
+            self.enabled = True
         return SimpleNamespace(code=0, message="")
 
     def get_control_mode(self):
         return SimpleNamespace(code=0, message=""), self.mode
+
+    def get_enable_state(self):
+        return SimpleNamespace(code=0, message=""), self.enabled
 
     def set_control_source(self, source):
         self.source_writes += 1
@@ -155,15 +161,32 @@ class FakeControlledHand(FakeHand):
 
 
 class FakeConnectHand(FakeControlledHand):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.started = False
+        self.speed_coefficient = 0.2
+        self.current_coefficient = 0.2
+        self.setting_writes = []
 
-    def set_speed_coeff(self, _value):
+    def set_speed_coeff(self, value):
+        self.setting_writes.append('speed')
+        self.speed_coefficient = value
         return SimpleNamespace(code=0, message="")
 
-    def set_current_coeff(self, _value):
+    def get_speed_coeff(self):
+        return SimpleNamespace(code=0, message=""), self.speed_coefficient
+
+    def set_current_coeff(self, value):
+        self.setting_writes.append('current')
+        self.current_coefficient = value
         return SimpleNamespace(code=0, message="")
+
+    def get_current_coeff(self):
+        return SimpleNamespace(code=0, message=""), self.current_coefficient
+
+    def set_control_source(self, source):
+        self.setting_writes.append('source')
+        return super().set_control_source(source)
 
     def set_tactile_callback(self, _callback):
         pass
@@ -470,6 +493,10 @@ def test_sharpa_command_reports_each_blocking_sdk_stage():
         for event, fields in events
         if event == "sharpa_sdk_hand_command_started"
     ] == ["left", "right"]
+    for event, fields in events:
+        if event == "sharpa_sdk_hand_command_completed":
+            np.testing.assert_allclose(fields["target_rad"],
+                                       driver.hands[fields["side"]].commands[-1])
 
 
 def test_sharpa_commands_connected_left_without_right_hand():
@@ -522,6 +549,174 @@ def test_sharpa_partial_connect_reports_side_stage_and_reconnects_only_missing()
     assert driver.connection_error == ""
 
 
+def test_sharpa_skip_tactile_keeps_joints_without_tactile_connection_or_arrays():
+    class Manager(FakeWaveManager):
+        def connect(self, serial_number, skip_tactile=False):
+            assert skip_tactile
+            hand = super().connect(serial_number, skip_tactile)
+            hand.set_tactile_callback = lambda _: pytest.fail("tactile callback must be disabled")
+            return hand
+    device = SimpleNamespace(sn="left-sn", ip="test", hand_side=0, device_type=9)
+    driver = SharpADevicePair(sdk_root="/unused", skip_tactile=True)
+    driver.sdk = SimpleNamespace(ControlMode=SimpleNamespace(POSITION=13),
+                                 ControlSource=SimpleNamespace(SDK=4),
+                                 HandSide=SimpleNamespace(LEFT=0))
+    driver.manager = Manager([device])
+    driver._connect_devices([device])
+    assert "left" in driver.hands
+    snapshot = driver.read()
+    assert snapshot.left_joint_valid and snapshot.left_tau_valid
+    assert snapshot.left_deformation.nbytes == snapshot.right_deformation.nbytes == 0
+    assert not snapshot.left_deformation_valid.any()
+
+
+def test_tactile_freshness_is_per_finger_side_and_modality(monkeypatch):
+    from ur_common.drivers import TACTILE_CHANNELS
+    now = [10.]
+    monkeypatch.setattr('ur_common.drivers.time.monotonic', lambda: now[0])
+    driver = SharpADevicePair(sdk_root='/unused')
+    hand = SimpleNamespace(get_states=lambda: SimpleNamespace(angles=[0.]*22, torques=[0.]*22))
+    driver.hands = {'left': hand, 'right': hand}
+    callback = driver._tactile_callback('left')
+    first, second = TACTILE_CHANNELS['left'][:2]
+    callback(dict(channel=first, content={'F6': [1.]*6, 'DEFORM': [1]*(240*240)}))
+    snapshot = driver.read()
+    assert list(snapshot.left_wrench_valid) == [True, False, False, False, False]
+    assert snapshot.left_deformation_valid[0]
+    assert not snapshot.right_wrench_valid.any()
+    now[0] = 10.2
+    callback(dict(channel=second, content={'F6': [2.]*6}))
+    callback(dict(channel=first, content={'DEFORM': [2]*(240*240)}))
+    now[0] = 10.26
+    snapshot = driver.read()
+    assert list(snapshot.left_wrench_valid) == [False, True, False, False, False]
+    assert list(snapshot.left_deformation_valid) == [True, False, False, False, False]
+    assert not snapshot.left_wrench[0].any()
+    assert (snapshot.left_wrench[1] == 2).all()
+    driver.hands.pop('left')
+    snapshot = driver.read()
+    assert not snapshot.left_wrench_valid.any() and not snapshot.left_deformation_valid.any()
+
+
+@pytest.mark.parametrize('bad_force', [[1.]*5, [float('nan')]*6, None, 'bad'])
+def test_invalid_tactile_revokes_cached_force_without_losing_deformation(bad_force):
+    from ur_common.drivers import TACTILE_CHANNELS
+    driver = SharpADevicePair(sdk_root='/unused')
+    driver.hands['left'] = SimpleNamespace(get_states=lambda: SimpleNamespace(angles=[0.]*22, torques=[0.]*22))
+    callback = driver._tactile_callback('left')
+    channel = TACTILE_CHANNELS['left'][0]
+    callback(dict(channel=channel, content={'F6': [1.]*6, 'DEFORM': [1]*(240*240)}))
+    callback(dict(channel=channel, content={'F6': bad_force}))
+    snapshot = driver.read()
+    assert not snapshot.left_wrench_valid.any()
+    assert snapshot.left_deformation_valid[0]
+    assert not snapshot.left_wrench.any()
+
+
+def connection_driver(hand):
+    device = SimpleNamespace(sn='left-sn', ip='192.168.10.10', hand_side=0, device_type=9)
+    manager = FakeWaveManager([device])
+    def connect(serial, _skip_tactile=False):
+        manager.connected[serial] = hand
+        return hand
+    manager.connect = connect
+    driver = SharpADevicePair(sdk_root='/unused', skip_tactile=True)
+    driver.sdk = SimpleNamespace(ControlMode=SimpleNamespace(POSITION=13),
+                                 ControlSource=SimpleNamespace(SDK=4),
+                                 HandSide=SimpleNamespace(LEFT=0))
+    driver.manager = manager
+    return driver, device
+
+
+def test_sharpa_connection_does_not_retrigger_ready_mode_or_source():
+    hand = FakeConnectHand(mode=13, source=4, enabled=True,
+                           fail_redundant_mode_write=True, fail_redundant_source_write=True)
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert hand.started
+    assert hand.mode_writes == hand.source_writes == 0
+    assert not hand.commands
+
+
+def test_sharpa_connection_configures_coefficients_before_changing_source():
+    hand = FakeConnectHand()
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert hand.setting_writes == ['speed', 'current', 'source']
+    assert hand.mode == 13 and hand.enabled and hand.source == 4
+    assert not hand.commands
+
+
+def test_sharpa_connection_does_not_resend_existing_sdk_source_after_mode_change():
+    hand = FakeConnectHand(mode=10, source=4, fail_redundant_source_write=True)
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert hand.started and hand.mode_writes == 1
+    assert hand.source_writes == 0
+
+
+def test_sharpa_connection_accepts_float32_coefficient_readbacks_without_rewriting():
+    hand = FakeConnectHand()
+    hand.speed_coefficient = np.float32(0.5)
+    hand.current_coefficient = np.float32(0.6)
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert hand.setting_writes == ['source']
+
+
+def test_sharpa_connection_waits_for_mode_transition_without_retriggering(monkeypatch):
+    clock = [0.0]
+    hand = FakeConnectHand(mode=10, source=4)
+    def mode_readback():
+        return SimpleNamespace(code=0, message=''), 13 if hand.mode_writes and clock[0] >= 0.07 else 10
+    hand.get_control_mode = mode_readback
+    monkeypatch.setattr('ur_common.drivers.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('ur_common.drivers.time.sleep', lambda duration: clock.__setitem__(0, clock[0] + duration))
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert clock[0] >= 0.07
+    assert hand.started and hand.mode_writes == 1 and hand.source_writes == 0
+
+
+def test_sharpa_connection_enters_position_when_already_position_but_disabled():
+    hand = FakeConnectHand(mode=13, source=4, enabled=False)
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert driver.connection_error == ''
+    assert hand.mode_writes == 1 and hand.enabled
+    assert hand.source_writes == 0
+
+
+@pytest.mark.parametrize('setting', ['control_mode', 'control_source', 'speed_coeff', 'current_coeff'])
+def test_sharpa_connection_rejects_ignored_setting_without_starting(setting, monkeypatch):
+    hand = FakeConnectHand()
+    setattr(hand, 'set_' + setting, lambda _: SimpleNamespace(code=0, message=''))
+    driver, device = connection_driver(hand)
+    clock = [0.0]
+    monkeypatch.setattr('ur_common.drivers.time.monotonic', lambda: clock[0])
+    monkeypatch.setattr('ur_common.drivers.time.sleep', lambda duration: clock.__setitem__(0, clock[0] + duration))
+    driver._connect_device(device, side='left')
+    assert 'readback' in driver.connection_error
+    assert setting in driver.connection_error
+    assert not hand.started
+    assert not driver.hands and not driver.manager.connected
+
+
+def test_sharpa_connection_rejects_failed_initial_read_without_changing_device():
+    hand = FakeConnectHand()
+    hand.get_control_mode = lambda: (SimpleNamespace(code=2, message='Failure to connect to server'), 13)
+    driver, device = connection_driver(hand)
+    driver._connect_device(device, side='left')
+    assert 'get_control_mode' in driver.connection_error
+    assert 'Failure to connect' in driver.connection_error
+    assert hand.mode_writes == 0 and not hand.setting_writes and not hand.started
+
+
 def test_ur_single_arm_command_does_not_servo_disabled_arm():
     driver = UrRtdePair(enable_control=True)
     driver.receivers = {side: FakeReceiver() for side in ("left", "right")}
@@ -536,3 +731,94 @@ def test_ur_single_arm_command_does_not_servo_disabled_arm():
 
     assert len(driver.controllers["left"].commands) == 1
     assert driver.controllers["right"].commands == []
+
+
+def test_strict_sharpa_never_slews_policy_command_and_resets_session():
+    from ur_common.command_guards import hand_bounds, ExecutionContractError
+    driver = SharpADevicePair(sdk_root='/unused',enable_control=True)
+    driver.hands={side:FakeHand() for side in ('left','right')}
+    from ur_common.command_guards import firmware_limit_profile
+    for side in ('left', 'right'):
+        info = SimpleNamespace(**firmware_limit_profile()['hands'][side]['device'])
+        driver.hands[side].get_device_info = lambda info=info: info
+    lo,hi=hand_bounds();q=np.clip(np.zeros(44,np.float32),lo,hi)
+    for i,side in enumerate(('left','right')):driver.hands[side].angles=q[i*22:i*22+22].copy()
+    target=q.copy();target[0]=.35
+    sent=driver.command(target[:22],target[22:],strict_targets=True,policy_session_id='one')
+    np.testing.assert_array_equal(sent['left'],target[:22])
+    # Tracking lag is not a request to alter the next target.
+    driver.hands['left'].angles=q[:22].copy()
+    target[0]=.45
+    sent=driver.command(target[:22],target[22:],strict_targets=True,policy_session_id='one')
+    assert sent['left'][0] == target[0]
+    before=[len(driver.hands[side].commands) for side in ('left','right')]
+    target[22+5]=lo[22+5]-.1
+    with pytest.raises(ExecutionContractError,match='range_rejected'):
+        driver.command(target[:22],target[22:],strict_targets=True,policy_session_id='one')
+    assert before == [len(driver.hands[side].commands) for side in ('left','right')]
+    target=q.copy();target[0]=1.0
+    driver.hands['left'].angles=q[:22].copy()
+    with pytest.raises(ExecutionContractError,match='startup_pose_incompatible'):
+        driver.command(target[:22],target[22:],strict_targets=True,policy_session_id='two')
+
+
+def test_strict_sharpa_rejects_unknown_firmware_before_either_hand_moves():
+    from ur_common.command_guards import firmware_limit_profile, ExecutionContractError
+    driver = SharpADevicePair(sdk_root='/unused', enable_control=True)
+    driver.hands = {side: FakeHand() for side in ('left', 'right')}
+    for side in ('left', 'right'):
+        info = SimpleNamespace(**firmware_limit_profile()['hands'][side]['device'])
+        if side == 'right':
+            info.firmware_version = 'unknown'
+        driver.hands[side].get_device_info = lambda info=info: info
+    with pytest.raises(ExecutionContractError, match='firmware_limits_mismatch'):
+        driver.command(np.zeros(22), np.zeros(22), strict_targets=True, policy_session_id='one')
+    assert all(not hand.commands for hand in driver.hands.values())
+
+
+def test_ur_side_receipts_preserve_partial_sdk_failure_and_guard_history():
+    driver = UrRtdePair(enable_control=True, enable_motion_limits=True, max_joint_step_rad=.35)
+    driver.receivers = {side: FakeReceiver() for side in ('left', 'right')}
+    driver.controllers = {side: FakeController(driver.receivers[side]) for side in ('left', 'right')}
+    def fail(*args):
+        raise RuntimeError('right SDK disconnected')
+    driver.controllers['right'].servoJ = fail
+    events = []
+    with pytest.raises(HardwareCommandError, match='right SDK disconnected'):
+        driver.command_joint_step(np.full(6, .1), np.full(6, .2), 1/30,
+            event_callback=lambda event, **fields: events.append(dict(event=event, **fields)))
+    receipts = {row['side']: row for row in events if row['event'] == 'ur_sdk_arm_command_completed'}
+    assert receipts['left']['success'] is True and receipts['right']['success'] is False
+    assert receipts['left']['target_rad'] == [.1]*6
+    assert receipts['right']['target_rad'] == [.2]*6
+    assert receipts['right']['completed_timestamp_ns'] >= receipts['right']['command_timestamp_ns']
+    context = next(row for row in events if row['event'] == 'ur_guard_context')
+    assert context['max_joint_step_rad'] == .35
+    assert context['previous_targets'] == dict(left=None, right=None)
+
+
+@pytest.mark.parametrize("rejected_side", ["left", "right"])
+def test_ur_false_servoj_return_is_a_failed_receipt(rejected_side):
+    driver = UrRtdePair(enable_control=True)
+    driver.receivers = {side: FakeReceiver() for side in ("left", "right")}
+    driver.controllers = {
+        side: FakeController(driver.receivers[side]) for side in ("left", "right")
+    }
+    stopped = []
+    driver.controllers[rejected_side].servoJ = lambda *_args: False
+    driver.controllers[rejected_side].servoStop = lambda: stopped.append(rejected_side)
+    events = []
+    with pytest.raises(HardwareCommandError, match=f"{rejected_side} UR rejected servoJ"):
+        driver.command_joint_step(
+            np.full(6, .1), np.full(6, .1), .1,
+            event_callback=lambda event, **fields: events.append(dict(event=event, **fields)),
+        )
+    receipt = next(
+        row for row in events
+        if row["event"] == "ur_sdk_arm_command_completed" and row["side"] == rejected_side
+    )
+    assert receipt["success"] is False
+    assert "rejected servoJ" in receipt["error"]
+    assert stopped == [rejected_side]
+    assert driver.last_target_joint[rejected_side] is None
+    assert np.array_equal(driver.receivers[rejected_side].joint, np.zeros(6))

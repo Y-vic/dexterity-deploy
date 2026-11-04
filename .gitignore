@@ -46,3 +46,16 @@ pnd-sharpa/src/noitom_node/vendor/
 
 # Keep the AstrBot container directory, but never vendor the AstrBot repository.
 /astribot-sharpa/AstrBot/
+
+# Workstation-specific remote model paths.
+ur-sharpa/config/model_servers.local.json
+
+# Local investigation outputs and machine-specific experiment snapshots.
+/.work/ros_logs/
+/.work/training_data_audit/
+/.work/deploy_v5/reports/
+/.work/deploy_v5/stopped_snapshots/
+/.work/deploy_v5/*_fetched.*
+/.work/deploy_v5/*.pre_*_bak
+/ur-sharpa/.work/
+/ur-sharpa/config/*.bak

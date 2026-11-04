@@ -17,10 +17,26 @@ from vive_node.tracker_source import (
 )
 from ur_common.geometry import UrSharpAWireGeometry, matrix_to_rotvec, rotvec_to_matrix
 from vive_node.vive_node import (
+    joint_step_gate,
     solve_ik_with_cartesian_backtracking,
     validate_ik_joint_step,
     vive_side_validity,
 )
+
+
+def test_hil_entry_uses_running_step_limit_and_can_restore_initial_gate():
+    current = np.zeros(6)
+    target = current.copy(); target[0] = .08
+    limit, stage = joint_step_gate(True, True, False, .05, .35)
+    validate_ik_joint_step(current, target, limit, 'left', stage=stage)
+    for hil_mode, enabled in ((False, False), (True, True)):
+        limit, stage = joint_step_gate(True, hil_mode, enabled, .05, .35)
+        with pytest.raises(RuntimeError, match='INITIAL_STEP_LIMIT'):
+            validate_ik_joint_step(current, target, limit, 'left', stage=stage)
+    target[0] = .36
+    limit, stage = joint_step_gate(True, True, False, .05, .35)
+    with pytest.raises(RuntimeError, match='JOINT_STEP_LIMIT'):
+        validate_ik_joint_step(current, target, limit, 'left', stage=stage)
 
 
 def message(topic, position, orientation=None):
@@ -478,3 +494,27 @@ def test_vive_joint_step_treats_full_turn_as_equivalent():
     )
 
     assert delta[0] == pytest.approx(0.1)
+
+
+def test_workbench_vive_routing_resets_alignment_and_old_takeover():
+    from types import SimpleNamespace
+    import ast
+    from pathlib import Path
+    from ur_msgs.msg import ArmCommand
+    source = Path(__file__).parents[1] / 'vive_node/vive_node.py'
+    method = next(node for node in ast.walk(ast.parse(source.read_text()))
+                  if isinstance(node, ast.FunctionDef) and node.name == '_on_control')
+    context = {'ArmCommand': ArmCommand}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), context)
+    resets=[]
+    node=SimpleNamespace(workbench_mode=True, hil_mode=True, _hil_active=True,
+                         _hil_seen=123, _candidate_pub='candidate', _direct_pub='direct',
+                         _control_running=lambda: False, _reset_alignment=lambda: resets.append(True))
+    msg=SimpleNamespace(active_source=2, ur_state=0, execution_dry_run=False, execution_paused=False)
+    context['_on_control'](node,msg)
+    assert node.command_pub=='direct' and not node.hil_mode
+    assert not node._hil_active and node._hil_seen==0
+    msg.active_source=3
+    context['_on_control'](node,msg)
+    assert node.command_pub=='candidate' and node.hil_mode
+    assert resets

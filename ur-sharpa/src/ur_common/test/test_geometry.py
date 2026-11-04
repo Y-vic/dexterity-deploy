@@ -21,6 +21,22 @@ F64_TOL = 1.0e-12    # stays in float64
 SIDES = ("left", "right")
 
 
+def test_fast_transform_validation_preserves_original_tolerances():
+    rng = np.random.default_rng(71)
+    for _ in range(300):
+        t = np.eye(4)
+        t += rng.normal(size=(4, 4)) * 10 ** rng.uniform(-9, -4)
+        r = t[:3, :3]
+        accepted = (np.allclose(t[3], [0, 0, 0, 1], atol=1e-7)
+                    and np.allclose(r.T @ r, np.eye(3), atol=1e-6)
+                    and np.isclose(np.linalg.det(r), 1, atol=1e-6))
+        if accepted:
+            np.testing.assert_array_equal(g.validate_transform(t), t)
+        else:
+            with pytest.raises(ValueError):
+                g.validate_transform(t)
+
+
 def random_rotation(rng: np.random.Generator) -> np.ndarray:
     """Uniform random rotation via a normalised Gaussian quaternion."""
     q = rng.standard_normal(4)
@@ -32,6 +48,27 @@ def random_transform(rng: np.random.Generator) -> np.ndarray:
     t[:3, :3] = random_rotation(rng)
     t[:3, 3] = rng.uniform(-0.8, 0.8, 3)
     return t
+
+
+@pytest.mark.parametrize('side', SIDES)
+def test_composed_canonical_chain_matches_capture_chain_and_calibration_edits(side):
+    geometry = g.UrSharpAWireGeometry()
+    rng = np.random.default_rng(73)
+    for step in range(60):
+        # Both replacement and in-place edits must invalidate cached calibration.
+        if step == 20:
+            geometry.capture_root_from_ur_base[side] = random_transform(rng)
+        if step == 40:
+            geometry.capture_tcp_to_ur_tcp[side][:] = random_transform(rng)
+        tcp = random_transform(rng)
+        pose = geometry.capture_tcp_to_canonical_pose(
+            geometry.ur_base_tcp_to_capture_tcp(tcp, side), side)
+        np.testing.assert_allclose(geometry.ur_base_tcp_to_canonical_pose(tcp, side), pose,
+                                   atol=2e-7, rtol=0)
+        expected = geometry.capture_tcp_to_ur_base_tcp(
+            geometry.canonical_pose_to_capture_tcp(pose, side), side)
+        np.testing.assert_allclose(geometry.canonical_pose_to_ur_base_tcp(pose, side), expected,
+                                   atol=F64_TOL, rtol=0)
 
 
 # ---------------------------------------------------------------------------

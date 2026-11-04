@@ -12,8 +12,10 @@ Image.fromarray(np.random.randint(0,255,(256,256,3),dtype=np.uint8)).save(buf, f
 jpeg = buf.getvalue()
 print("jpeg bytes:", len(jpeg))
 
-c = SharpaV3PolicyClient(url="ws://127.0.0.1:5500/infer", ssh_host="orca",
-                         ssh_remote_host="127.0.0.1", ssh_remote_port=5500, timeout_s=180.0)
+import os
+PORT = int(os.environ.get("SHARPA_PROBE_PORT", "5500"))
+c = SharpaV3PolicyClient(url=f"ws://127.0.0.1:{PORT}/infer", ssh_host="orca",
+                         ssh_remote_host="127.0.0.1", ssh_remote_port=PORT, timeout_s=180.0)
 try:
     md = validate_server_metadata(c.metadata)
     print("metadata:", md["policy_family"], "| ckpt:", md["checkpoint_id"])

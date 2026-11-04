@@ -6,12 +6,28 @@ from status_node.gates import (
     SharpaState,
     UrState,
 )
+from status_node.status_node import resolve_reset_target
 
 def fresh(m, now):
     m.update_cameras({"ego":int(now*1e9),"left_wrist":int(now*1e9),"right_wrist":int(now*1e9)}, {"ego":True,"left_wrist":True,"right_wrist":True}, now)
 
 def hardware_ready(m):
     m.update_hardware_readiness(ur_ready=True, sharpa_ready=True)
+
+
+def test_reset_target_selection_preserves_bias_and_resolves_episode(monkeypatch):
+    assert resolve_reset_target({"action": "reset_both"}) is None
+    assert resolve_reset_target({"reset_target": {"mode": "bias"}}) is None
+    calls = []
+    monkeypatch.setattr(
+        "status_node.status_node.episode_initial_target",
+        lambda root, episode: calls.append((root, episode)) or {"source": "episode"},
+    )
+    target = resolve_reset_target({"reset_target": {
+        "mode": "episode", "root": "/media/yns/My Passport/data", "episode": "success/one",
+    }})
+    assert target == {"source": "episode"}
+    assert calls == [("/media/yns/My Passport/data", "success/one")]
 
 def bias_status(m, phase, **extra):
     payload = {"phase": phase, "action_id": m.bias_action_id, **extra}

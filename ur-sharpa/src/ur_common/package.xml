@@ -10,6 +10,9 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>ffmpeg</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <!-- pinocchio: only needed for hand fingertip FK; arm FK/IK works without it. -->
   <exec_depend>python3-pinocchio</exec_depend>

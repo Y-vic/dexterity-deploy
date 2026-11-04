@@ -43,3 +43,11 @@ float32[44] q_cmd
 bool q_cmd_valid
 uint64 q_cmd_timestamp_ns
 uint8 q_cmd_source
+
+# Why q_cmd_valid is false; empty after a successful full command.
+# not_commanded / source_changed / stopped describe lifecycle boundaries.
+# command_failed / partial_command / invalid_command describe real failures.
+string q_cmd_invalid_reason
+
+# HIL label of the same successfully dispatched q_cmd; false when invalid.
+bool is_hil

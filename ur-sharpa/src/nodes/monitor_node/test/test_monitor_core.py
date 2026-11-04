@@ -70,14 +70,24 @@ def test_default_remote_data_path_is_exposed_to_monitor():
     assert DEFAULT_REMOTE_DATA_PATH.endswith("/ur-sharpa/raw_data")
 
 
-def test_monitor_forwards_pause_action():
+@pytest.mark.parametrize("action", ["pause", "start_teleop_record"])
+def test_monitor_forwards_control_action(action):
     commands = []
     controller = MonitorController(publish_command=commands.append)
 
-    result = controller.action({"action": "pause"})
+    result = controller.action({"action": action})
 
     assert result["accepted"] is True
-    assert commands == ["pause"]
+    assert commands == [action]
+
+
+def test_monitor_forwards_selected_episode_with_reset_command():
+    import json
+    commands = []
+    controller = MonitorController(publish_command=commands.append)
+    target = {"mode": "episode", "root": "/media/yns/My Passport/data", "episode": "success/one"}
+    assert controller.action({"action": "reset_both", "reset_target": target})["accepted"]
+    assert json.loads(commands[0]) == {"action": "reset_both", "reset_target": target}
 
 
 def test_monitor_forwards_sample_classification():
@@ -200,3 +210,27 @@ def test_recording_path_cannot_change_during_sample():
     result = controller.action({"action": "set_paths", "recording_root": "/new"})
     assert result["accepted"] is False
     assert controller.recording_root == "/old"
+
+
+def test_directory_update_waits_for_recorder_confirmation(tmp_path):
+    messages=[]
+    controller=MonitorController(tmp_path, publish_config=messages.append)
+    destination=tmp_path/'new'
+    result=controller.action({'action':'set_paths','recording_root':str(destination)})
+    assert result['command_id']==messages[0]['id']
+    assert controller.recording_root==str(tmp_path)
+    controller.update_upstream('record_status',{'recording_root':str(destination)})
+    assert controller.recording_root==str(destination)
+
+
+@pytest.mark.parametrize('action', ['mark_success', 'mark_fail', 'drop_sample'])
+def test_classification_rejects_stale_sample_or_saving(action):
+    labels=[]
+    controller=MonitorController(publish_label=labels.append)
+    controller.update_upstream('record_status',{'saved_path':'/new','validation':{'available':True}})
+    assert not controller.action({'action':action,'saved_path':'/old'})['accepted']
+    controller.update_upstream('record_status',{'saved_path':'/new','saving':True,'validation':{'available':True}})
+    assert not controller.action({'action':action,'saved_path':'/new'})['accepted']
+    controller.update_upstream('record_status',{'saved_path':'/new','recording':True,'validation':{'available':True}})
+    assert not controller.action({'action':action,'saved_path':'/new'})['accepted']
+    assert not labels

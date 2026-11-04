@@ -3,34 +3,16 @@
   "default": "baai",
   "servers": {
     "baai": {
-      "label": "BAAI H100",
+      "label": "BAAI",
       "ssh_host": "BAAI",
-      "repo_root": "/share/project/yenaisheng/dreamzero",
-      "asset_root": "/share/project/yenaisheng/dreamzero",
-      "task_config_root": "/share/project/yenaisheng/dreamzero/scripts/deploy/task_config",
-      "remote_host": "127.0.0.1",
-      "port": 5500,
-      "env_file": ""
+      "repo_root": "",
+      "port": 5500
     },
-    "orca": {
-      "label": "ORCA MoT v5",
-      "ssh_host": "orca",
-      "repo_root": "/share/project/zjk/orca",
-      "asset_root": "/share/project/zjk/orca",
-      "task_config_root": "/share/project/zjk/orca/scripts/deploy/task_config",
-      "remote_host": "127.0.0.1",
-      "port": 5500,
-      "env_file": ""
-    },
-    "ps": {
-      "label": "PS 4090",
+    "4090": {
+      "label": "4090",
       "ssh_host": "ps",
-      "repo_root": "/home/ps/dexterity",
-      "asset_root": "/home/ps/dexterity",
-      "task_config_root": "/home/ps/dexterity/scripts/deploy/task_config",
-      "remote_host": "127.0.0.1",
-      "port": 5500,
-      "env_file": "/home/ps/dexterity/.env.local"
+      "repo_root": "",
+      "port": 5500
     }
   }
 }

@@ -39,3 +39,6 @@ bool right_enable
 # Validate and acknowledge this command without writing to the UR controller.
 # Only Actor commands may use dry-run.
 bool dry_run
+
+# Local policy: reject unsafe targets; never silently clip or unwrap.
+bool strict_targets

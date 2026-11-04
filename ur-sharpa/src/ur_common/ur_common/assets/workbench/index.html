@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>UR Deploy</title>
+  <link rel="stylesheet" href="/workbench.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">UR <strong>Deploy</strong></a>
+    <nav class="modes" aria-label="工作模式">
+      <button data-mode="teleop">数采</button>
+      <button data-mode="policy">推理</button>
+      <button data-mode="replay">Replay</button>
+    </nav>
+    <div class="top-status"><span id="connection">连接中</span><span id="stage">已停止</span><span id="ownership"></span></div>
+    <button id="showProtection" class="danger subtle" hidden>最近保护</button>
+  </header>
+
+  <main>
+    <div class="feedback-line"><p id="feedback" role="status" aria-live="polite">正在连接控制器…</p><span id="modeReason"></span></div>
+
+    <section class="operations" aria-label="操作区">
+      <article class="panel machine-panel">
+        <div class="heading"><h2>机器控制</h2><span id="readiness" class="muted"></span></div>
+        <div class="reset-row">
+          <button id="reset" class="reset-button" disabled>机器复位</button>
+          <label class="field">复位目标
+            <select id="resetMode"><option value="bias">当前 Bias</option><option value="episode">参考 episode 初始姿态</option></select>
+          </label>
+          <button id="saveBias" class="subtle">保存 Bias</button>
+        </div>
+        <p id="resetHint" class="hint">使用当前 Bias 位置复位。</p>
+        <div class="execution-buttons">
+          <button id="start" class="primary" disabled>启用遥操</button>
+          <button id="pause" disabled>暂停</button>
+          <button id="resume" disabled>继续</button>
+          <button id="stop" class="danger" disabled>停止</button>
+        </div>
+      </article>
+
+      <article class="panel source-panel">
+        <div class="heading"><h2 id="modeLabel">数采</h2><span id="sourcePhase" class="muted"></span></div>
+        <div data-modes="teleop"><p class="source-name">Vive + AE01 人工示教</p><p class="hint">先复位，再启用遥操。录制单独开始和结束。</p></div>
+        <div data-modes="policy hil" hidden>
+          <p id="currentModel" class="source-name">尚未加载模型</p>
+          <label class="field">推理服务器<select id="serverSelect" aria-label="推理服务器"></select></label>
+          <p id="serverHint" class="hint">选择 BAAI 或 4090；配置模型后可连接推理。</p>
+          <div class="row"><button id="chooseModel">选择 / 加载模型</button><button id="unloadModel">卸载模型</button></div>
+          <label id="policyRecordLabel" class="check"><input id="policyRecord" type="checkbox">保存推理数据</label>
+        </div>
+        <div data-modes="hil" hidden>
+          <div class="row hil-actions"><button data-learning="takeover">人工接管</button><button data-learning="release">交还策略</button><button data-learning="failure" class="danger subtle">失败并结束</button></div>
+          <p id="hilTransition" class="hint">交还时重新推理，并平滑过渡至模型动作。</p>
+
+        </div>
+        <div data-modes="replay" hidden>
+          <p id="replaySelection" class="source-name">选择下方参考 episode</p>
+          <div class="row"><button id="loadReplay">加载参考 episode</button><button id="unloadReplay">卸载</button><select id="replayScope" aria-label="Replay 执行范围"><option value="full">双臂 + 双手</option><option value="hands_only">仅双手</option></select></div>
+          <div class="replay-settings"><label>频率 <input id="replayHz" type="number" min="5" max="125" value="30"> Hz</label><label>Chunk <input id="replaySteps" type="number" min="1" max="1000" value="40"></label><span id="replayProgress" class="hint"></span></div>
+          <p id="replayStatus" class="hint" role="status" aria-live="polite">尚未加载样本。</p>
+          <p id="replaySample" class="path" hidden></p>
+          <p id="replayError" class="hint error" role="alert" hidden></p>
+        </div>
+      </article>
+
+      <article class="panel recording-panel">
+        <div class="heading"><h2>数据保存</h2><span id="captureStatus" class="muted">等待数采</span></div>
+        <label for="recordRoot" class="sr-only">数据保存目录</label>
+        <div class="path-picker"><input id="recordRoot" placeholder="选择或输入保存目录" title="输入或粘贴机器人主机上的绝对路径，点击应用目录生效"><button id="chooseDirectory">选择目录</button></div>
+        <div class="directory-apply"><p id="recordRootActual" class="hint">等待数采节点连接</p><button id="applyRoot">应用目录</button></div>
+        <div data-modes="teleop" class="row"><button id="startRecord" class="primary" disabled>开始采集并录制</button><button id="record" disabled>开始录制</button><button id="finish" disabled>结束录制</button></div>
+        <p id="recordingHint" class="hint"></p>
+        <div class="sample-outcome">
+          <div class="outcome-heading"><span>Episode 结果</span><span id="sampleCategory" class="outcome-badge">等待保存</span></div>
+          <div class="row"><button data-label="mark_success" class="success-button">标记成功</button><button data-label="mark_fail" class="danger subtle">标记失败</button><button data-label="drop_sample" class="danger subtle" title="直接永久删除当前 episode 的全部数据">丢弃数据</button></div>
+          <p id="classificationHint" class="hint">保存完成后选择成功、失败或丢弃；丢弃会永久删除本条数据。</p>
+        </div>
+        <div class="record-metrics"><span id="episode">尚无记录</span><span id="duration">—</span><span id="frames">—</span></div>
+      </article>
+    </section>
+
+    <section class="cameras" aria-label="实时画面与参考对照">
+      <div class="ego-column">
+      <article class="panel ego-panel">
+        <div class="camera-title"><h2>Ego · 场景对照</h2><div class="row"><label class="check"><input id="referenceEnabled" type="checkbox" checked>叠加参考</label><span data-camera-state="ego" class="muted">等待画面</span></div></div>
+        <div class="camera ego" id="egoStage">
+          <img data-camera="ego" alt="当前 Ego 实时画面" hidden>
+          <img id="referenceImage" alt="参考 episode 的历史帧" hidden>
+          <div class="camera-empty" data-camera-empty="ego">等待实时 Ego 画面</div>
+          <span id="referenceBadge" class="image-badge" hidden>历史参考帧</span>
+        </div>
+        <div class="reference-controls">
+          <div class="frame-controls"><button id="previousFrame" aria-label="上一帧" disabled>←</button><input id="referenceTime" type="range" aria-label="参考帧时间" min="0" max="0" step="0.001" value="0" disabled><button id="nextFrame" aria-label="下一帧" disabled>→</button><span id="referenceFrame">未选择参考帧</span></div>
+          <label class="opacity-control">参考透明度<input id="referenceAlpha" type="range" min="0" max="100" value="50"><output id="referenceAlphaValue">50%</output></label>
+        </div>
+        <p id="referenceError" class="hint error" role="status"></p>
+      </article>
+      <section class="panel reference-selection" aria-label="共用参考样本">
+      <div class="reference-fields">
+        <label class="field dataset-field">参考数据集
+          <div class="input-action"><input id="referenceRoot" placeholder="输入参考数据集绝对路径"><button id="chooseReferenceDirectory">选择目录</button><button id="scanReference">加载目录</button></div>
+        </label>
+        <label class="field episode-field">参考 episode
+          <select id="referenceEpisode" disabled><option value="">请选择 episode</option></select>
+        </label>
+      </div>
+      <p id="referenceStatus" class="hint" role="status">同一个 episode 用于 Ego 对照、初始姿态复位和 Replay；选择会自动记忆。</p>
+    </section>
+      </div>
+      <div class="wrists">
+        <article class="panel wrist-panel"><div class="camera-title"><h2>左腕</h2><span data-camera-state="left_wrist" class="muted">等待画面</span></div><div class="camera"><img data-camera="left_wrist" alt="左腕实时画面" hidden><div class="camera-empty" data-camera-empty="left_wrist">等待相机连接</div></div></article>
+        <article class="panel wrist-panel"><div class="camera-title"><h2>右腕</h2><span data-camera-state="right_wrist" class="muted">等待画面</span></div><div class="camera"><img data-camera="right_wrist" alt="右腕实时画面" hidden><div class="camera-empty" data-camera-empty="right_wrist">等待相机连接</div></div></article>
+      </div>
+    </section>
+
+    <section class="panel results">
+      <div class="heading"><h2>最近保存结果 <span id="quality" class="muted"></span></h2><div class="row"><button data-label="upload">上传</button></div></div>
+      <p id="savedPath" class="path">尚无已保存样本</p><p id="recordError" class="error"></p><p id="uploadStatus" class="hint"></p>
+      <details><summary>采集质量明细</summary><div class="table-scroll"><table><thead><tr><th>数据项</th><th>有效帧</th><th>Hz</th><th>检查结果</th></tr></thead><tbody id="validation"></tbody></table></div></details>
+    </section>
+    <section class="panel device-section" aria-labelledby="devicesTitle">
+      <div class="heading"><div><h2 id="devicesTitle">设备状态</h2><p class="hint">硬件反馈、遥操输入与采集状态</p></div><span id="deviceSummary" class="muted">等待状态</span></div>
+      <div id="deviceCards" class="device-grid"></div>
+    </section>
+  </main>
+
+  <dialog id="modelDialog" aria-labelledby="modelTitle">
+    <div class="dialog-heading"><h2 id="modelTitle">选择模型</h2><button data-close="modelDialog" aria-label="关闭模型选择">×</button></div>
+    <div class="dialog-content"><div class="row"><select id="modelTask" aria-label="模型任务"></select><button id="refreshModels">刷新清单</button></div><p id="taskPrompt" class="hint"></p><div id="modelList" class="model-list"></div><p id="modelPhase" class="hint"></p><details><summary>加载日志</summary><pre id="modelLog"></pre></details></div>
+  </dialog>
+  <dialog id="directoryDialog" aria-labelledby="directoryTitle">
+    <div class="dialog-heading"><div><h2 id="directoryTitle">选择数据保存目录</h2><p class="hint">浏览机器人主机上的目录，也可以输入新的绝对路径。</p></div><button data-close="directoryDialog" aria-label="关闭目录选择">×</button></div>
+    <div class="dialog-content"><div class="input-action"><input id="directoryPath" aria-label="目录绝对路径"><button id="browseDirectory">打开</button></div><div id="directoryLocations" class="row"></div><div class="row"><button id="directoryParent" class="subtle">↑ 上一级</button><button id="newDirectory">新建文件夹</button></div>
+      <form id="createDirectoryForm" class="input-action" hidden><input id="newDirectoryName" aria-label="新文件夹名称" placeholder="输入新文件夹名称" required><button id="createDirectory" type="submit">创建并进入</button><button id="cancelCreateDirectory" type="button">取消</button></form><div id="directoryList" class="directory-list"></div><p id="directoryError" class="hint error" role="status"></p></div>
+    <div class="dialog-footer"><span id="directoryApplyHint" class="hint"></span><button id="useDirectory" class="primary">使用此目录</button></div>
+  </dialog>
+  <dialog id="protectionDialog" aria-labelledby="protectionTitle">
+    <div class="dialog-heading"><h2 id="protectionTitle">执行保护</h2><button data-close="protectionDialog" aria-label="关闭保护提示">×</button></div>
+    <div class="dialog-content"><p id="protectionDetail"></p><p id="protectionMeta" class="hint"></p><details><summary>本次保护诊断</summary><pre id="protectionRaw"></pre></details></div>
+    <div class="dialog-footer"><button data-close="protectionDialog">知道了</button></div>
+  </dialog>
+  <script src="/workbench-state.js"></script>
+  <script src="/workbench-reference.js"></script>
+  <script src="/workbench.js" defer></script>
+</body>
+</html>

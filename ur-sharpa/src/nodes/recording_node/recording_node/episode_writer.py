@@ -1,10 +1,13 @@
 """PND-style asynchronous episode writer.
 
 Structured samples, tactile deformation, and the three camera streams use
-independent queues. Camera JPEG payloads are remuxed into MP4 without image
-re-encoding, so ROS callbacks never wait for FFmpeg or filesystem I/O.
+independent queues. Raw BGR frames use NVENC HEVC; the legacy JPEG backend
+remuxes MJPEG. ROS callbacks never wait for FFmpeg or filesystem I/O.
 """
 from __future__ import annotations
+
+from ur_common.raw_camera import unpack_bgr, RAW_ENCODING
+from .video_encoding import nvenc_command, write_frame
 
 import datetime
 import hashlib
@@ -21,10 +24,12 @@ from typing import Any
 
 import numpy as np
 
+from .message_journal import MessageJournal
+from .rate_metrics import cadence, MIN_VALID_RATE_HZ, RATE_TOLERANCE
+
 CAMERA_NAMES = ("ego", "left_wrist", "right_wrist")
 CAMERA_COLOR_KEYS = ("color_0", "color_1", "color_2")
 FINGER_NAMES = ("小指", "无名指", "中指", "食指", "拇指")
-MIN_VALID_RATE_HZ = 25.0
 
 
 def _complete_jpeg(data: bytes) -> bool:
@@ -53,7 +58,7 @@ def _missing_finger_summary(valid: np.ndarray, plane_names: tuple[str, ...]) -> 
 
 
 def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> dict:
-    """Read the finalized files and return the eight-item Monitor summary."""
+    """Read finalized files and measure valid rows, advancing sources and gaps."""
     directory = Path(directory)
     clock = np.load(directory / "timeline" / "clock.npz", allow_pickle=False)
     timeline_rows = int(len(clock["time_unix_ns"]))
@@ -65,23 +70,31 @@ def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> 
         duration_s = nominal_period
     else:
         duration_s = 0.0
+    minimum_hz = float(frequency) * (1. - RATE_TOLERANCE)
+    sampling = cadence(clock['time_unix_ns'], frequency, duration_s)
 
     def item(key, label, frames, *, missing=0, details=None, files_ok=True,
-             finger_missing=None):
+             finger_missing=None, source_stamps=(), cadence_required=True):
         details = list(details or [])
         finger_missing = list(finger_missing or [])
         missing = max(0, int(missing))
         if not files_ok:
             details.insert(0, "file missing")
         rate = _validation_rate(int(frames), duration_s)
-        rate_ok = bool(rate >= MIN_VALID_RATE_HZ)
+        rate_ok = bool(rate >= minimum_hz)
+        timing = cadence(source_stamps, frequency, duration_s,
+                         window_start_ns=int(clock['time_unix_ns'][0]) if timeline_rows else None)
+        timing["cadence_required"] = cadence_required
         if not rate_ok:
-            details.append(f"低于 {MIN_VALID_RATE_HZ:g} Hz")
+            details.append(f"低于 {minimum_hz:g} Hz（目标 {frequency:g} Hz）")
+        if cadence_required and not timing['stable']:
+            details.append(f"源帧 {timing['source_hz']:g} Hz；重复 {timing['repeated_frames']} 帧；长间隔 {timing['gap_count']} 次")
         details.extend(
             f"{row['finger']} {row['ratio_percent']:.2f}%"
             for row in finger_missing
         )
-        ok = bool(files_ok and rate_ok and not finger_missing and not any(
+        timing_ok = timing['stable'] if cadence_required else timing['backwards'] == 0
+        ok = bool(files_ok and rate_ok and timing_ok and not finger_missing and not any(
             text in {"valid shape invalid", "video missing", "file missing"}
             for text in details
         ))
@@ -91,7 +104,8 @@ def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> 
             "frames": int(frames),
             "duration_s": round(duration_s, 3),
             "hz": rate,
-            "minimum_hz": MIN_VALID_RATE_HZ,
+            "minimum_hz": minimum_hz,
+            "timing": timing,
             "rate_ok": rate_ok,
             "missing": missing,
             "ok": ok,
@@ -108,51 +122,61 @@ def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> 
         index_path = directory / "cameras" / name / "index.npz"
         video_path = directory / "cameras" / name / "rgb.mp4"
         count = 0
+        source_stamps = []
         details = []
         if index_path.is_file():
             index = np.load(index_path, allow_pickle=False)
             valid = np.asarray(index["valid"], dtype=bool)
             count = int(np.count_nonzero(valid))
+            source_stamps = index['source_timestamp_ns'][valid]
         if not video_path.is_file() or video_path.stat().st_size <= 0:
             details.append("video missing")
         missing = max(0, timeline_rows - count)
         items.append(item(f"{name}_camera", label, count, missing=missing, details=details,
-                          files_ok=index_path.is_file()))
+                          files_ok=index_path.is_file(), source_stamps=source_stamps))
 
     arm_path = directory / "ur" / "physical_12.npz"
     arm_count = 0
+    arm_stamps = []
     if arm_path.is_file():
         arm = np.load(arm_path, allow_pickle=False)
         arm_count = int(np.count_nonzero(np.asarray(arm["valid"], dtype=bool)))
+        arm_stamps = arm['timestamp_ns'][np.asarray(arm['valid'], dtype=bool)]
     items.append(item("arm_state", "Arm State", arm_count,
-                      missing=timeline_rows-arm_count, files_ok=arm_path.is_file()))
+                      missing=timeline_rows-arm_count, files_ok=arm_path.is_file(), source_stamps=arm_stamps))
 
     joints_path = directory / "sharpa" / "joints_44.npz"
+    hand_stamps, action_stamps = [], []
     if joints_path.is_file():
         joints = np.load(joints_path, allow_pickle=False)
         hand_valid = np.asarray(joints["q_valid"], dtype=bool)
         action_valid = np.asarray(joints["q_cmd_valid"], dtype=bool)
         if "q_cmd_source" in joints:
-            action_valid &= np.asarray(joints["q_cmd_source"], dtype=np.uint8) == 2
+            action_valid &= np.isin(np.asarray(joints["q_cmd_source"], dtype=np.uint8), (2, 3))
         hand_count = int(np.count_nonzero(hand_valid))
         action_count = int(np.count_nonzero(action_valid))
+        hand_stamps = joints['q_timestamp_ns'][hand_valid]
+        action_stamps = joints['q_cmd_timestamp_ns'][action_valid]
     else:
         hand_count = action_count = 0
     items.append(item("hand_state", "Hand State", hand_count,
-                      missing=timeline_rows-hand_count, files_ok=joints_path.is_file()))
+                      missing=timeline_rows-hand_count, files_ok=joints_path.is_file(), source_stamps=hand_stamps))
     items.append(item("hand_action", "Hand Action", action_count,
-                      missing=timeline_rows-action_count, files_ok=joints_path.is_file()))
+                      missing=timeline_rows-action_count, files_ok=joints_path.is_file(),
+                      source_stamps=action_stamps, cadence_required=False))
 
     wrench_path = directory / "sharpa" / "tactile" / "force6d.npz"
     wrench_count = 0
     wrench_details = []
     wrench_finger_missing = []
+    wrench_stamps = []
     if wrench_path.is_file():
         wrench = np.load(wrench_path, allow_pickle=False)
         wrench_valid = np.asarray(wrench["valid"], dtype=bool)
         if wrench_valid.ndim == 3 and wrench_valid.shape[1:] == (2, 5):
             received_frames = np.any(wrench_valid, axis=(1, 2))
             wrench_count = int(np.count_nonzero(received_frames))
+            wrench_stamps = wrench['timestamp_ns'][received_frames]
             wrench_finger_missing = _missing_finger_summary(
                 wrench_valid[received_frames].reshape(-1, 10),
                 tuple(f"{side}{finger}" for side in ("左", "右") for finger in FINGER_NAMES),
@@ -162,21 +186,21 @@ def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> 
     items.append(item("wrench", "Wrench", wrench_count,
                       missing=timeline_rows-wrench_count, details=wrench_details,
                       files_ok=wrench_path.is_file(),
-                      finger_missing=wrench_finger_missing))
+                      finger_missing=wrench_finger_missing, source_stamps=wrench_stamps))
 
     deform_path = directory / "sharpa" / "tactile" / "deform_index.npz"
     deform_count = 0
     deform_details = []
     deform_finger_missing = []
+    deform_stamps = []
     if deform_path.is_file():
         deform = np.load(deform_path, allow_pickle=False)
         deform_valid = np.asarray(deform["valid"], dtype=bool)
         if deform_valid.ndim == 2 and deform_valid.shape[1] == 10:
-            timeline_index = np.asarray(deform["timeline_row"], dtype=np.int64)
-            valid_timeline_index = timeline_index[
-                (timeline_index >= 0) & (timeline_index < timeline_rows)
-            ]
-            deform_count = int(np.unique(valid_timeline_index).size)
+            # The independently arriving stream may map adjacent source frames
+            # to the same nearest timeline row. Count actual saved frames.
+            deform_count = int(np.count_nonzero(np.any(deform_valid, axis=1)))
+            deform_stamps = deform['source_timestamp_ns'][np.any(deform_valid, axis=1)]
             deform_finger_missing = _missing_finger_summary(
                 deform_valid,
                 tuple(f"{side}{finger}" for side in ("右", "左") for finger in FINGER_NAMES),
@@ -186,18 +210,30 @@ def validate_saved_episode(directory: Path, frequency: float, quality: dict) -> 
     items.append(item("deform", "Deform", deform_count,
                       missing=timeline_rows-deform_count, details=deform_details,
                       files_ok=deform_path.is_file(),
-                      finger_missing=deform_finger_missing))
+                      finger_missing=deform_finger_missing, source_stamps=deform_stamps))
 
+    # Joint motor torques are separate from the fingertip's Tx/Ty/Tz.
+    if joints_path.is_file():
+        tau_valid = np.asarray(joints['tau_valid'], dtype=bool)
+        tau_count = int(np.count_nonzero(tau_valid))
+        items.append(item('joint_torque', 'Joint Torque', tau_count, missing=timeline_rows-tau_count,
+                          source_stamps=joints['tau_timestamp_ns'][tau_valid]))
+
+    disabled = [] if quality.get("tactile_enabled", True) else ["wrench", "deform"]
+    items = [row for row in items if row["key"] not in disabled]
     quality_errors = [str(row.get("message", "")) for row in quality.get("errors", []) if row.get("message")]
     result = {
         "available": True,
         "episode": directory.name,
         "duration_s": round(duration_s, 3),
         "timeline_rows": timeline_rows,
-        "minimum_hz": MIN_VALID_RATE_HZ,
-        "ok": bool(quality.get("ok", False) and all(row["ok"] for row in items)),
+        "minimum_hz": minimum_hz,
+        "target_hz": float(frequency),
+        "sampling": sampling,
+        "ok": bool(quality.get("ok", False) and sampling['stable'] and all(row["ok"] for row in items)),
         "items": items,
         "errors": quality_errors,
+        "disabled_modalities": disabled,
     }
     (directory / "validation.json").write_text(
         json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -256,22 +292,47 @@ class EpisodeWriterCompat:
         workers: int | None = None,
         queue_size: int = 100,
         ffmpeg: str = "ffmpeg",
+        raw_message_budget_bytes: int = 64 * 1024 * 1024,
+        record_tactile: bool = True,
+        video_backend: str = "mjpeg",
+        ego_bitrate_mbps: float = 30.0,
+        wrist_bitrate_mbps: float = 12.0,
+        prepare_item=None,
     ) -> None:
         self.root = Path(root).expanduser()
         self.frequency = float(frequency)
         self.workers = max(1, int(workers or os.environ.get("EPISODE_WRITER_THREADS", "4")))
         self.ffmpeg = str(ffmpeg).strip() or "ffmpeg"
         self.ffprobe = os.environ.get("EPISODE_WRITER_FFPROBE", "ffprobe")
+        self.raw_message_budget_bytes = int(raw_message_budget_bytes)
+        if self.raw_message_budget_bytes <= 0:
+            raise ValueError("raw message budget must be positive")
+        self.message_journal = None
+        self.record_tactile = bool(record_tactile)
+        self.prepare_item = prepare_item
+        if video_backend not in ("mjpeg", "hevc_nvenc"):
+            raise ValueError("unsupported video_backend")
+        self.video_backend = video_backend
+        self.video_codec = "hevc" if video_backend == "hevc_nvenc" else "mjpeg"
+        self.source_encoding = RAW_ENCODING if video_backend == "hevc_nvenc" else "jpeg"
+        self.video_bitrates = {"ego": float(ego_bitrate_mbps),
+                               "left_wrist": float(wrist_bitrate_mbps),
+                               "right_wrist": float(wrist_bitrate_mbps)}
+        if any(not np.isfinite(v) or v <= 0 for v in self.video_bitrates.values()):
+            raise ValueError("video bitrates must be finite and positive")
+        self._camera_dimensions = {}
+        self._camera_failed = {}
+        self._video_stats = {}
 
         queue_size = max(1, int(queue_size))
         self._q = queue.Queue(maxsize=queue_size)
         self._deformation_q = queue.Queue(maxsize=queue_size)
         # A blocked FFmpeg stdin for one camera must not hold up the other two.
         # Keep one bounded queue and one writer thread per stream.
-        # Camera recording is completeness-first. These queues are unbounded:
-        # a temporary encoder/disk slowdown increases stop latency, but never
-        # discards a captured frame. Monitor uses a separate latest-frame path.
-        self._camera_queues = {name: queue.Queue() for name in CAMERA_NAMES}
+        # Raw BGR queues must be bounded: 64 HD720 frames are ~169 MiB.
+        # Overflow is explicitly reported, never hidden by unbounded RAM use.
+        self._camera_queues = {name: queue.Queue(maxsize=64 if self.video_backend == "hevc_nvenc" else 0)
+                               for name in CAMERA_NAMES}
         self._threads: list[threading.Thread] = []
         self._stop = False
 
@@ -336,6 +397,13 @@ class EpisodeWriterCompat:
                 return episode_id
             time.sleep(0.000001)
 
+    def _episode_info(self):
+        info = _default_info(self.frequency)
+        if not self.record_tactile:
+            info.pop("tactile", None)
+            info["tactile_enabled"] = False
+        return info
+
     def start(self) -> bool:
         if self.active:
             return False
@@ -350,7 +418,6 @@ class EpisodeWriterCompat:
             "timeline",
             "ur",
             "sharpa",
-            "sharpa/tactile",
             "cameras",
         ):
             (self.episode_dir / relative_path).mkdir(parents=True, exist_ok=True)
@@ -362,7 +429,9 @@ class EpisodeWriterCompat:
         deformation_path = (
             self.episode_dir / "sharpa" / "tactile" / "deform_u8.raw.tmp"
         )
-        self._deformation_handle = deformation_path.open("wb")
+        if self.record_tactile:
+            deformation_path.parent.mkdir(parents=True, exist_ok=True)
+            self._deformation_handle = deformation_path.open("wb")
         self._deformation_frames = 0
         self._deformation_rows = []
         self._started_unix_ns = time.time_ns()
@@ -372,6 +441,14 @@ class EpisodeWriterCompat:
         self._errors = []
         self._camera_rows = {name: [] for name in CAMERA_NAMES}
         self._camera_probe = {}
+        self._camera_dimensions = {}
+        self._camera_failed = {}
+        self._video_stats = {name: {"accepted": 0, "written": 0, "rejected": 0,
+                                   "queue_peak": 0, "write_ms_sum": 0.0,
+                                   "write_ms_max": 0.0, "queue_wait_ms_max": 0.0}
+                             for name in CAMERA_NAMES}
+        self.message_journal = MessageJournal(
+            self.episode_dir / "raw", self.raw_message_budget_bytes)
         self._start_camera_streams()
         self.active = True
         return True
@@ -398,6 +475,8 @@ class EpisodeWriterCompat:
             return False
 
     def add_deformation(self, msg: Any, timeline_row: int, time_unix_ns: int) -> bool:
+        if not self.record_tactile:
+            return False
         if not self.active:
             return False
         record = {
@@ -424,7 +503,10 @@ class EpisodeWriterCompat:
         if not self.active or name not in CAMERA_NAMES:
             return False
         with self._camera_lock:
-            if name not in self._camera_processes:
+            if name in self._camera_failed:
+                self._video_stats[name]["rejected"] += 1
+                return False
+            if self.video_backend == "mjpeg" and name not in self._camera_processes:
                 return False
         record = {
             "name": name,
@@ -432,18 +514,34 @@ class EpisodeWriterCompat:
             "source_timestamp_ns": int(source_timestamp_ns),
             "timeline_row": int(timeline_row),
             "time_unix_ns": int(time_unix_ns),
+            "enqueued_monotonic": time.monotonic(),
         }
+        valid_payload = _complete_jpeg(record["jpeg"])
+        if self.video_backend == "hevc_nvenc":
+            try:
+                width, height, _ = unpack_bgr(record["jpeg"])
+                valid_payload = width % 2 == 0 and height % 2 == 0
+            except ValueError:
+                valid_payload = False
         if (
-            not _complete_jpeg(record["jpeg"])
+            not valid_payload
             or record["source_timestamp_ns"] <= 0
         ):
+            with self._camera_lock:
+                self._video_stats[name]["rejected"] += 1
             return False
         with self._lock:
             self._camera_pending += 1
         try:
             self._camera_queues[name].put_nowait(record)
+            with self._camera_lock:
+                stats = self._video_stats[name]
+                stats["accepted"] += 1
+                stats["queue_peak"] = max(stats["queue_peak"], self._camera_queues[name].qsize())
             return True
         except queue.Full:
+            with self._camera_lock:
+                self._video_stats[name]["rejected"] += 1
             with self._lock:
                 self._camera_pending -= 1
             return False
@@ -480,6 +578,8 @@ class EpisodeWriterCompat:
             except queue.Empty:
                 continue
             try:
+                if self.prepare_item is not None:
+                    item = self.prepare_item(item)
                 with self._lock:
                     self._items.append(item)
             except Exception as exc:
@@ -507,7 +607,44 @@ class EpisodeWriterCompat:
                     self._deformation_pending -= 1
                 self._deformation_q.task_done()
 
+    def video_status(self):
+        with self._camera_lock:
+            return {"backend": self.video_backend, "hardware_encode": self.video_backend == "hevc_nvenc",
+                    "gop": 2 if self.video_backend == "hevc_nvenc" else 1,
+                    "bitrate_mbps": dict(self.video_bitrates),
+                    "cameras": {name: {**values, "queue_depth": self._camera_queues[name].qsize(),
+                                       "error": self._camera_failed.get(name, "")}
+                                for name, values in self._video_stats.items()}}
+
+    def queue_status(self):
+        with self._lock:
+            return dict(structured=dict(depth=self._q.qsize(), pending=self._pending,
+                                        capacity=self._q.maxsize),
+                        deformation=dict(depth=self._deformation_q.qsize(), pending=self._deformation_pending,
+                                         capacity=self._deformation_q.maxsize))
+
+    def _start_raw_stream(self, name, width, height):
+        camera_dir = self.episode_dir / "cameras" / name
+        command = nvenc_command(self.ffmpeg, width, height, self.frequency,
+                                self.video_bitrates[name], camera_dir / "rgb.mp4.tmp")
+        (camera_dir / "encoder_command.json").write_text(json.dumps(command, indent=2))
+        log = (camera_dir / "ffmpeg.log.tmp").open("wb")
+        try:
+            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                       stderr=log, bufsize=0, start_new_session=True)
+            os.set_blocking(process.stdin.fileno(), False)
+        except Exception:
+            log.close()
+            raise
+        with self._camera_lock:
+            self._camera_processes[name] = process
+            self._camera_logs[name] = log
+            self._camera_dimensions[name] = (width, height)
+        return process
+
     def _start_camera_streams(self) -> None:
+        if self.video_backend == "hevc_nvenc":
+            return  # Open lazily with the first raw frame's actual dimensions.
         executable = shutil.which(self.ffmpeg)
         if executable is None:
             self._errors.append((None, f"ffmpeg not found: {self.ffmpeg}"))
@@ -543,16 +680,43 @@ class EpisodeWriterCompat:
 
     def _write_camera_frame(self, record: dict) -> None:
         name = record["name"]
+        if name in self._camera_failed:
+            raise RuntimeError(self._camera_failed[name])
         with self._camera_lock:
             process = self._camera_processes.get(name)
+        payload = record["jpeg"]
+        if self.video_backend == "hevc_nvenc":
+            width, height, payload = unpack_bgr(payload)
+            if process is None:
+                process = self._start_raw_stream(name, width, height)
+            if self._camera_dimensions[name] != (width, height):
+                raise RuntimeError(f"{name} resolution changed during recording")
         if process is None or process.stdin is None:
             raise RuntimeError(f"{name} MP4 stream is closed")
         if process.poll() is not None:
             raise RuntimeError(f"{name} ffmpeg exited with code {process.returncode}")
         # Each process has exactly one owning camera thread, so the potentially
         # blocking pipe write does not need the global camera metadata lock.
-        process.stdin.write(record["jpeg"])
+        began = time.monotonic()
+        if self.video_backend == "hevc_nvenc":
+            try:
+                write_frame(process, payload)
+            except Exception as exc:
+                # A partial raw frame cannot be followed by another frame:
+                # terminate the stream to avoid permanently shifted pixels.
+                with self._camera_lock:
+                    self._camera_failed[name] = str(exc)
+                process.kill()
+                raise
+        else:
+            process.stdin.write(payload)
+        elapsed_ms = (time.monotonic()-began)*1000
         with self._camera_lock:
+            stats = self._video_stats[name]
+            stats["written"] += 1
+            stats["write_ms_sum"] += elapsed_ms
+            stats["write_ms_max"] = max(stats["write_ms_max"], elapsed_ms)
+            stats["queue_wait_ms_max"] = max(stats["queue_wait_ms_max"], (began-record["enqueued_monotonic"])*1000)
             frame_index = len(self._camera_rows[name])
             self._camera_rows[name].append({
                 "time_unix_ns": record["time_unix_ns"],
@@ -576,6 +740,12 @@ class EpisodeWriterCompat:
                     f"camera:{record.get('name', '')}:"
                     f"{record.get('source_timestamp_ns', 0)}"
                 )
+                if self.video_backend == "hevc_nvenc":
+                    with self._camera_lock:
+                        self._camera_failed[name] = str(exc)
+                        process = self._camera_processes.get(name)
+                    if process is not None and process.poll() is None:
+                        process.kill()
                 with self._lock:
                     self._errors.append((key, str(exc)))
             finally:
@@ -629,7 +799,7 @@ class EpisodeWriterCompat:
         if write_raw_contract and self._raw_rows:
             try:
                 self._write_raw_contract(saved_dir, items)
-                payload = {"info": _default_info(self.frequency), "data": items}
+                payload = {"info": self._episode_info(), "data": items}
                 (saved_dir / "data.json").write_text(
                     json.dumps(payload, ensure_ascii=False, indent=4),
                     encoding="utf-8",
@@ -670,11 +840,26 @@ class EpisodeWriterCompat:
         timeout: float = 30.0,
         dropped_frames: int = 0,
         quality_errors: list[str] | None = None,
+        camera_input_dropped: dict[str, int] | None = None,
+        boundary_frames: dict[str, int] | None = None,
+        sampling_work: dict | None = None,
     ) -> Path | None:
         if not self.active:
             return None
 
+        if self.message_journal is not None:
+            if not self.message_journal.close(timeout):
+                raise RuntimeError("raw message journal is still draining; retry stop before starting another episode")
+            raw_status = self.message_journal.status()
+            if not raw_status["complete"]:
+                with self._lock:
+                    self._errors.append((None, "raw message journal incomplete: " +
+                                         "; ".join(raw_status["errors"])))
+        else:
+            raw_status = None
         drained = self._drain(timeout)
+        if not drained:
+            raise RuntimeError("writer queues still draining; retry stop before starting another episode")
         deformation_error = self._close_deformation_stream(save)
         camera_errors = self._close_camera_streams(save)
         with self._lock:
@@ -686,7 +871,11 @@ class EpisodeWriterCompat:
         if deformation_error is not None:
             errors.append((None, deformation_error))
         errors.extend((None, error) for error in camera_errors)
-        if save and items and not deformation_rows:
+        if self.video_backend == "hevc_nvenc":
+            for name, count in (camera_input_dropped or {}).items():
+                if count:
+                    errors.append((None, f"{name} raw camera input lost/rejected {count} frame(s)"))
+        if save and items and self.record_tactile and not deformation_rows:
             errors.append((None, "SharpA deformation stream is empty"))
         if save and items:
             with self._camera_lock:
@@ -705,9 +894,15 @@ class EpisodeWriterCompat:
                 for index, message in errors
             ],
             "warnings": reported,
+            "boundary_frames": dict(boundary_frames or {}),
             "frame_count": len(items),
             "timeline_rows": len(self._raw_rows),
             "camera_frames": self.camera_frame_counts(),
+            "raw_messages": raw_status,
+            "tactile_enabled": self.record_tactile,
+            "sampling_work": dict(sampling_work or {}),
+            "video_encoding": self.video_status(),
+            "camera_input_dropped": dict(camera_input_dropped or {}),
             "dropped": (
                 int(dropped_frames)
                 + max(0, self._idx + 1 - len(items))
@@ -726,7 +921,7 @@ class EpisodeWriterCompat:
 
         if self.episode_dir is None or self.episode_id is None:
             raise RuntimeError("active writer has no episode directory")
-        payload = {"info": _default_info(self.frequency), "data": items}
+        payload = {"info": self._episode_info(), "data": items}
         try:
             self._write_raw_contract(self.episode_dir, items)
         except Exception as exc:
@@ -752,6 +947,14 @@ class EpisodeWriterCompat:
         self._write_manifest(complete, quality, "complete")
         (complete / "COMPLETE").touch()
         self.last_validation = validate_saved_episode(complete, self.frequency, quality)
+        # COMPLETE means the files were finalized. It must not make dropped,
+        # duplicated or low-rate sensor data pass the manifest's quality gate.
+        quality['files_ok'] = quality['ok']
+        quality['ok'] = bool(self.last_validation['ok'])
+        quality['capture_ok'] = quality['ok']
+        if not quality['ok']:
+            (complete / 'CAPTURE_QUALITY_FAILED').touch()
+        self._write_manifest(complete, quality, 'complete')
         self._write_checksums(complete)
         self.active = False
         self.episode_dir = complete
@@ -782,6 +985,15 @@ class EpisodeWriterCompat:
             if destination.exists():
                 raise RuntimeError(f"classified sample already exists: {destination}")
             source.rename(destination)
+        from .execution_audit import write_termination
+        termination_path = destination / 'termination.json'
+        previous = json.loads(termination_path.read_text()) if termination_path.exists() else {}
+        # Classification can happen much later than the physical end of an episode.
+        outcome = 'success' if category == 'success' else 'failure'
+        if previous.get('outcome') != outcome:
+            previous = dict(previous, outcome=outcome, annotation_source='recording_classification',
+                annotated_unix_ns=time.time_ns(), previous_annotation=previous)
+            write_termination(destination, previous)
         manifest_path = destination / "manifest.json"
         if manifest_path.is_file():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -830,6 +1042,8 @@ class EpisodeWriterCompat:
         return resolved
 
     def _close_deformation_stream(self, save: bool) -> str | None:
+        if not self.record_tactile:
+            return None
         with self._deformation_lock:
             handle = self._deformation_handle
             self._deformation_handle = None
@@ -907,7 +1121,7 @@ class EpisodeWriterCompat:
                             f"{name} MP4 frame mismatch: "
                             f"video={probe['frame_count']}, index={expected_frames}"
                         )
-                    if probe["codec_name"] != "mjpeg":
+                    if probe["codec_name"] != self.video_codec:
                         errors.append(f"{name} MP4 codec mismatch: {probe['codec_name']}")
                 except Exception as exc:
                     errors.append(f"{name} MP4 validation failed: {exc}")
@@ -922,7 +1136,8 @@ class EpisodeWriterCompat:
             raise RuntimeError(f"ffprobe not found: {self.ffprobe}")
         result = subprocess.run(
             [
-                executable, "-v", "error", "-select_streams", "v:0", "-count_frames",
+                executable, "-v", "error", "-err_detect", "explode",
+                "-select_streams", "v:0", "-count_frames",
                 "-show_entries", "stream=codec_name,width,height,avg_frame_rate,nb_frames,nb_read_frames",
                 "-of", "json", str(path),
             ],
@@ -930,6 +1145,8 @@ class EpisodeWriterCompat:
             capture_output=True,
             text=True,
         )
+        if result.stderr.strip():
+            raise RuntimeError("video decode errors: " + result.stderr[-2000:])
         streams = json.loads(result.stdout).get("streams", [])
         if len(streams) != 1:
             raise RuntimeError(f"expected one video stream, got {len(streams)}")
@@ -970,15 +1187,24 @@ class EpisodeWriterCompat:
         time_unix_ns = np.asarray([x["time_unix_ns"] for x in raw_rows], dtype=np.int64)
         np.savez_compressed(directory / "timeline" / "clock.npz",
                             time_unix_ns=time_unix_ns,
+                            sampled_unix_ns=np.asarray([x.get("sampled_unix_ns", x["time_unix_ns"])
+                                                        for x in raw_rows], dtype=np.int64),
                             elapsed_ns=time_unix_ns - time_unix_ns[0],
-                            sample_rate_hz=np.asarray(self.frequency, dtype=np.float64))
+                            sample_rate_hz=np.asarray(self.frequency, dtype=np.float64),
+                            **({"is_hil": np.asarray([x["is_hil"] for x in raw_rows], dtype=bool)}
+                               if "is_hil" in raw_rows[0] else {}))
         source_names = np.asarray(raw_rows[0]["source_names"])
         source_valid = np.asarray([x["source_valid"] for x in raw_rows], dtype=bool)
-        source_age_ms = np.asarray([x["source_age_ms"] for x in raw_rows], dtype=np.float32)
+        receive_age_ms = np.asarray([x["source_age_ms"] for x in raw_rows], dtype=np.float32)
         source_timestamp_ns = np.asarray([x["source_timestamp_ns"] for x in raw_rows], dtype=np.int64)
+        source_age_ms = ((time_unix_ns[:, None]-source_timestamp_ns)/1e6).astype(np.float32)
+        source_age_ms[source_timestamp_ns <= 0] = np.nan
         np.savez_compressed(directory / "timeline" / "source_quality.npz",
-                            source_names=source_names, valid=source_valid, age_ms=source_age_ms,
-                            source_timestamp_ns=source_timestamp_ns)
+                            source_names=source_names, valid=source_valid, age_ms=receive_age_ms,
+                            receive_age_ms=receive_age_ms, source_age_ms=source_age_ms,
+                            source_timestamp_ns=source_timestamp_ns,
+                            enabled=np.asarray([True, True, True, True,
+                                                self.record_tactile, self.record_tactile]))
         arm_q = np.asarray([x["ur_q"] for x in raw_rows], dtype=np.float32)
         wrist = np.asarray([x["ur_wrist"] for x in raw_rows], dtype=np.float32)
         tcp = np.asarray([x["ur_tcp"] for x in raw_rows], dtype=np.float32)
@@ -990,18 +1216,23 @@ class EpisodeWriterCompat:
         hand_q_cmd_valid = np.asarray([x["hand_q_cmd_valid"] for x in raw_rows], dtype=bool)
         hand_q_cmd_timestamp_ns = np.asarray([x["hand_q_cmd_timestamp_ns"] for x in raw_rows], dtype=np.int64)
         hand_q_cmd_source = np.asarray([x["hand_q_cmd_source"] for x in raw_rows], dtype=np.uint8)
+        hand_q_cmd_invalid_reason = np.asarray(
+            [x.get("hand_q_cmd_invalid_reason", "") for x in raw_rows], dtype="U32")
         hand_tau = np.asarray([x["hand_tau"] for x in raw_rows], dtype=np.float32)
         np.savez_compressed(directory / "sharpa" / "joints_44.npz", q=hand_q,
                             q_cmd=hand_q_cmd, q_cmd_valid=hand_q_cmd_valid,
                             q_cmd_timestamp_ns=hand_q_cmd_timestamp_ns,
                             q_cmd_source=hand_q_cmd_source, tau=hand_tau,
+                            q_cmd_invalid_reason=hand_q_cmd_invalid_reason,
                             q_timestamp_ns=source_timestamp_ns[:,2], tau_timestamp_ns=source_timestamp_ns[:,3],
                             q_valid=source_valid[:,2], tau_valid=source_valid[:,3])
-        wrench = np.asarray([x["wrench"] for x in raw_rows], dtype=np.float32)
-        wrench_valid = np.asarray([x["wrench_valid"] for x in raw_rows], dtype=bool)
-        np.savez_compressed(directory / "sharpa" / "tactile" / "force6d.npz",
-                            wrench=wrench, timestamp_ns=source_timestamp_ns[:,4],
-                            valid=wrench_valid)
+        if self.record_tactile:
+            wrench = np.asarray([x["wrench"] for x in raw_rows], dtype=np.float32)
+            wrench_valid = np.asarray([x["wrench_valid"] for x in raw_rows], dtype=bool)
+            np.savez_compressed(directory / "sharpa" / "tactile" / "force6d.npz",
+                                wrench=wrench, force=wrench[..., :3], torque=wrench[..., 3:],
+                                timestamp_ns=source_timestamp_ns[:,4],
+                                valid=wrench_valid)
         with self._camera_lock:
             camera_rows = {name:list(self._camera_rows[name]) for name in CAMERA_NAMES}
             camera_probe = {name:dict(self._camera_probe.get(name,{})) for name in CAMERA_NAMES}
@@ -1031,9 +1262,16 @@ class EpisodeWriterCompat:
             video_path = camera_dir / "rgb.mp4"
             meta = {
                 "owner": "recording_node",
-                "source_encoding": "jpeg",
+                "source_encoding": self.source_encoding,
                 "container": "mp4",
-                "video_codec": "mjpeg",
+                "video_codec": self.video_codec,
+                "encoder": self.video_backend,
+                "hardware_encode": self.video_backend == "hevc_nvenc",
+                "gop": 2 if self.video_backend == "hevc_nvenc" else 1,
+                "b_frames": 0,
+                "bitrate_mbps": self.video_bitrates[camera_name] if self.video_backend == "hevc_nvenc" else None,
+                "byte_count_scope": "input_payload_bytes",
+
                 "ffmpeg": self.ffmpeg,
                 "path": "rgb.mp4",
                 "index_path": "index.npz",
@@ -1050,33 +1288,43 @@ class EpisodeWriterCompat:
                 "index_file": f"cameras/{camera_name}/index.npz",
                 "meta_file": f"cameras/{camera_name}/rgb_meta.json",
             }
-        with self._deformation_lock:
-            deformation_rows = list(self._deformation_rows)
-        deformation_times = np.asarray(
-            [row["time_unix_ns"] for row in deformation_rows],
-            dtype=np.int64,
-        )
-        deformation_timeline_rows = np.asarray([row["timeline_row"] for row in deformation_rows], dtype=np.int32)
-        deformation_raw_indices = np.asarray([row["raw_frame_index"] for row in deformation_rows], dtype=np.int32)
-        deformation_timestamps = np.asarray([row["source_timestamp_ns"] for row in deformation_rows], dtype=np.int64)
-        deformation_valid = np.asarray([row["valid"] for row in deformation_rows], dtype=bool).reshape(-1, 10)
-        np.savez_compressed(directory / "sharpa" / "tactile" / "deform_index.npz",
-                            time_unix_ns=deformation_times,
-                            elapsed_ns=deformation_times - self._started_unix_ns,
-                            timeline_row=deformation_timeline_rows,
-                            raw_frame_index=deformation_raw_indices,
-                            source_timestamp_ns=deformation_timestamps,
-                            sensor_time=np.repeat((deformation_timestamps.astype(np.float64) / 1e9)[:,None], 10, axis=1),
-                            valid=deformation_valid)
+        if self.record_tactile:
+            with self._deformation_lock:
+                deformation_rows = list(self._deformation_rows)
+            deformation_times = np.asarray(
+                [row["time_unix_ns"] for row in deformation_rows],
+                dtype=np.int64,
+            )
+            deformation_timeline_rows = np.asarray([row["timeline_row"] for row in deformation_rows], dtype=np.int32)
+            deformation_raw_indices = np.asarray([row["raw_frame_index"] for row in deformation_rows], dtype=np.int32)
+            deformation_timestamps = np.asarray([row["source_timestamp_ns"] for row in deformation_rows], dtype=np.int64)
+            deformation_valid = np.asarray([row["valid"] for row in deformation_rows], dtype=bool).reshape(-1, 10)
+            np.savez_compressed(directory / "sharpa" / "tactile" / "deform_index.npz",
+                                time_unix_ns=deformation_times,
+                                elapsed_ns=deformation_times - self._started_unix_ns,
+                                timeline_row=deformation_timeline_rows,
+                                raw_frame_index=deformation_raw_indices,
+                                source_timestamp_ns=deformation_timestamps,
+                                sensor_time=np.repeat((deformation_timestamps.astype(np.float64) / 1e9)[:,None], 10, axis=1),
+                                valid=deformation_valid)
         schema = {
             "schema": "ur_sharpa_sample.v1", "sample_rate_hz": self.frequency,
             "wrist_pose9": "[x,y,z,r00,r10,r20,r01,r11,r21] canonical root-from-wrist",
             "raw_tcp_pose6": "[x,y,z,rx,ry,rz] UR RTDE base TCP",
-            "hand_action": "last fresh full 44D Manus teleop target received by sharpa_node",
-            "hand_action_source": "HandCommand.SOURCE_*; teleop recording requires SOURCE_VIVE (Manus)",
+            "hand_action": "last fresh full 44D target successfully dispatched by sharpa_node",
+            "hand_action_source": "HandCommand.SOURCE_*; teleop requires SOURCE_VIVE (AE01); rollout requires SOURCE_ACTOR",
             "camera_views": list(CAMERA_NAMES),
             "cameras": camera_schema,
             "tactile_finger_order": ["pinky", "ring", "middle", "index", "thumb"],
+            "tactile_wrench": {
+                "enabled": self.record_tactile, "file": "sharpa/tactile/force6d.npz",
+                "wrench_shape": ["T", 2, 5, 6], "force_shape": ["T", 2, 5, 3],
+                "torque_shape": ["T", 2, 5, 3], "hand_order": ["left", "right"],
+                "axes": ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"],
+                "force_unit": "N", "torque_unit": "N*m", "frame": "fingertip-local",
+                "invalid": "zero placeholder; read valid[T,2,5]",
+                "timestamp_ns": "original /sharpa/wrench publication timestamp; aligned to timeline rows",
+            },
             "tactile_deform": {
                 "data_file": "sharpa/tactile/deform_u8.zst",
                 "index_file": "sharpa/tactile/deform_index.npz",
@@ -1089,13 +1337,28 @@ class EpisodeWriterCompat:
                 "compression": "zstd",
             },
         }
+        schema["tactile_enabled"] = self.record_tactile
+        schema["timeline_clock"] = {
+            "time_unix_ns": "sampling target time; aligned mode uses a fixed-rate grid",
+            "sampled_unix_ns": "actual row assembly time, stored separately from source timestamps",
+        }
+        if "is_hil" in raw_rows[0]:
+            schema["is_hil"] = "metadata.is_hil and timeline/clock.npz is_hil[T]: HIL flag of paired successfully dispatched hand command; invalid rows are false"
+            schema["hand_action"] = "last full 44D Actor target successfully dispatched by sharpa_node"
+            schema["hand_action_source"] = "HandCommand.SOURCE_ACTOR; policy and HIL share this outlet"
+        if not self.record_tactile:
+            schema["tactile_deform"] = {"enabled": False}
         (directory / "schema.json").write_text(json.dumps(schema, indent=2), encoding="utf-8")
 
     @staticmethod
     def _write_checksums(directory):
         rows = []
         for path in sorted(p for p in directory.rglob("*") if p.is_file() and p.name != "checksums.sha256"):
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            checksum = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    checksum.update(chunk)
+            digest = checksum.hexdigest()
             rows.append(f"{digest}  {path.relative_to(directory)}")
         (directory / "checksums.sha256").write_text("\n".join(rows) + "\n", encoding="utf-8")
 
@@ -1103,6 +1366,9 @@ class EpisodeWriterCompat:
         self.stop(save=False)
 
     def close(self) -> None:
+        if self.message_journal is not None and not self.message_journal.status()["closed"]:
+            if not self.message_journal.close(30):
+                raise RuntimeError("raw message journal is still draining")
         self._stop = True
         self._drain(2)
         self._close_deformation_stream(False)

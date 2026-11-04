@@ -27,6 +27,9 @@ line instead of dying with an import traceback.
 
 from __future__ import annotations
 
+from .command_guards import HandCommandGuard, validate_firmware_device
+from .protection_config import setting
+
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -293,8 +296,12 @@ def format_ur_pair_diagnostics(snapshot: UrPairSnapshot) -> str:
     )
 
 
+_JPEG_ENCODER_BACKEND = "not_initialized"
+
+
 def _encode_jpeg(bgr: np.ndarray, quality: int) -> bytes:
-    """BGR uint8 HxWx3 -> JPEG bytes without holding Python's GIL."""
+    """CPU JPEG encoding (OpenCV when available, otherwise Pillow)."""
+    global _JPEG_ENCODER_BACKEND
     try:
         import cv2
     except ImportError:
@@ -305,10 +312,12 @@ def _encode_jpeg(bgr: np.ndarray, quality: int) -> bytes:
                 "JPEG encoding needs Pillow or opencv-python"
             ) from exc
         stream = BytesIO()
+        _JPEG_ENCODER_BACKEND = "pillow_cpu"
         Image.fromarray(np.ascontiguousarray(bgr[:, :, ::-1]), mode="RGB").save(
             stream, format="JPEG", quality=int(quality)
         )
         return stream.getvalue()
+    _JPEG_ENCODER_BACKEND = "opencv_cpu"
     ok, buffer = cv2.imencode(
         ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
     )
@@ -736,6 +745,8 @@ class UrRtdePair:
         *,
         left_enable: bool = True,
         right_enable: bool = True,
+        strict_targets: bool = False,
+        event_callback: Any = None,
     ) -> None:
         """One servoJ step per arm at joint targets already resolved upstream.
 
@@ -748,6 +759,13 @@ class UrRtdePair:
         against the last commanded target. Any servoJ failure triggers
         `safe_stop` first.
         """
+        def report(event, **fields):
+            if callable(event_callback):
+                try:
+                    event_callback(event, **fields)
+                except Exception:
+                    pass  # Recording must not alter a hardware outcome.
+
         enables = {"left": bool(left_enable), "right": bool(right_enable)}
         active = [side for side in SIDES if enables[side]]
         if not active:
@@ -777,9 +795,14 @@ class UrRtdePair:
                 "left": snapshot.left_joint.astype(np.float64),
                 "right": snapshot.right_joint.astype(np.float64),
             }
+            report('ur_guard_context', measured={side: measured[side].tolist() for side in active},
+                previous_targets={side: None if self.last_target_joint[side] is None else self.last_target_joint[side].tolist() for side in active},
+                strict_targets=strict_targets, enable_motion_limits=self.enable_motion_limits,
+                enable_joint_step_limit=self.enable_joint_step_limit,
+                max_abs_joint_rad=self.max_abs_joint_rad, max_joint_step_rad=self.max_joint_step_rad)
             for side in active:
                 target = targets[side]
-                if self.enable_motion_limits and np.any(np.abs(target) > self.max_abs_joint_rad):
+                if (self.enable_motion_limits or strict_targets) and np.any(np.abs(target) > self.max_abs_joint_rad):
                     raise HardwareCommandError(
                         f"{side} joint target exceeds absolute limit "
                         f"{self.max_abs_joint_rad:.3f} rad"
@@ -787,10 +810,10 @@ class UrRtdePair:
                 near = self.last_target_joint[side]
                 if near is None:
                     near = measured[side]
-                unwrapped = _unwrap_to_near(target, near)
+                unwrapped = target if strict_targets else _unwrap_to_near(target, near)
                 delta = unwrapped - near
                 if (
-                    self.enable_joint_step_limit
+                    (self.enable_joint_step_limit or strict_targets)
                     and np.any(np.abs(delta) > self.max_joint_step_rad + 1.0e-9)
                 ):
                     raise HardwareCommandError(
@@ -802,13 +825,25 @@ class UrRtdePair:
                 errors: list[tuple[str, Exception]] = []
 
                 def servo(side: str) -> None:
+                    started_ns = time.time_ns()
                     try:
-                        self.controllers[side].servoJ(
+                        report('ur_sdk_arm_command_started', side=side, target_rad=targets[side].tolist(),
+                               command_timestamp_ns=started_ns)
+                        accepted = self.controllers[side].servoJ(
                             targets[side].tolist(), self.servo_speed,
                             self.servo_acceleration, float(period_s),
                             self.servo_lookahead_s, self.servo_gain,
                         )
+                        if accepted is False:
+                            raise HardwareCommandError(
+                                f"{side} UR rejected servoJ; verify the RTDE control program is running"
+                            )
+                        report('ur_sdk_arm_command_completed', side=side, target_rad=targets[side].tolist(),
+                               success=True, command_timestamp_ns=started_ns, completed_timestamp_ns=time.time_ns())
                     except Exception as exc:
+                        report('ur_sdk_arm_command_completed', side=side, target_rad=targets[side].tolist(),
+                               success=False, error=str(exc), command_timestamp_ns=started_ns,
+                               completed_timestamp_ns=time.time_ns())
                         errors.append((side, exc))
 
                 threads = [threading.Thread(target=servo, args=(side,)) for side in active]
@@ -994,16 +1029,20 @@ class SharpADevicePair:
         self.current_coefficient = float(current_coefficient)
         self.enable_control = bool(enable_control)
         self.skip_tactile = bool(skip_tactile)
+        self.tactile_max_age_s = setting('tactile', 'max_age_s')
         self.max_hand_step_rad = float(max_hand_step_rad)
         self.max_abs_hand_rad = float(max_abs_hand_rad)
+        self._strict_guard = HandCommandGuard()
+        self._strict_session = None
         self.sdk: ModuleType | None = None
         self.manager: Any = None
         self.hands: dict[str, Any] = {}
         self.device_sn: dict[str, str] = {}
         self.connection_errors: dict[str, str] = {}
+        # Channel cache includes a separate monotonic receive time per modality.
         # channel id -> {"wrench": (6,), "deformation": (240,240)}, filled by
         # the SDK's tactile callback thread.
-        self._tactile: dict[str, dict[int, dict[str, np.ndarray]]] = {
+        self._tactile: dict[str, dict[int, dict[str, Any]]] = {
             "left": {},
             "right": {},
         }
@@ -1018,8 +1057,9 @@ class SharpADevicePair:
         connection succeeds.  Keep the working side available for telemetry,
         but retain a per-side diagnostic so the ROS gate cannot mistake a
         partial pair for healthy hardware.  Every new SDK connection enters
-        POSITION exactly once. ``reconnect_missing`` retries only the absent
-        side later; it never rewrites settings on a working hand.
+        POSITION before acquisition starts, reusing matching device settings.
+        ``reconnect_missing`` retries only the absent side later; it never
+        rewrites settings on a working hand.
         """
         ensure_optional_runtime_paths()
         self.sdk = load_sharpa_sdk(self.sdk_root)
@@ -1077,6 +1117,7 @@ class SharpADevicePair:
                 self.connection_errors.pop(side, None)
                 continue
             hand = self.hands.pop(side, None)
+            self._strict_session = None
             self.device_sn.pop(side, None)
             if hand is not None:
                 self._release_hand(hand)
@@ -1112,6 +1153,7 @@ class SharpADevicePair:
             self._connect_device(device, side=side)
 
     def _connect_device(self, device: Any, *, side: str) -> None:
+        self._strict_session = None
         assert self.sdk is not None
         assert self.manager is not None
         serial_number = str(device.sn)
@@ -1128,22 +1170,41 @@ class SharpADevicePair:
                 if self.skip_tactile
                 else self.manager.connect(serial_number)
             )
-            # POSITION is a connection invariant. The Wave setter is a trigger,
-            # so call it exactly once for this newly-created SDK connection and
-            # never as part of stop/reset/start state transitions.
-            stage = "set_control_mode(position)"
-            self._check_error(hand.set_control_mode(self.sdk.ControlMode.POSITION))
-            stage = "set_control_source(SDK)"
-            self._check_error(hand.set_control_source(self.sdk.ControlSource.SDK))
-            stage = "set_speed_coeff"
-            self._check_error(hand.set_speed_coeff(self.speed_coefficient))
-            stage = "set_current_coeff"
-            self._check_error(hand.set_current_coeff(self.current_coefficient))
+            # The mode setter toggles motor enable; a matching enabled device
+            # must not be retriggered after reconnecting or using Pilot.
+            stage = "get_control_mode"
+            mode = self._read_hand_setting(hand, "control_mode")
+            stage = "get_enable_state"
+            enabled = self._read_hand_setting(hand, "enable_state")
+            if mode != self.sdk.ControlMode.POSITION or not enabled:
+                stage = "set_control_mode(position)"
+                self._check_error(hand.set_control_mode(self.sdk.ControlMode.POSITION))
+                self._wait_hand_setting(hand, "control_mode", self.sdk.ControlMode.POSITION)
+                self._wait_hand_setting(hand, "enable_state", True)
+            # Follow the vendor initialization order: coefficients, then SDK
+            # source. Every write is conditional and must be read back before
+            # acquisition can start. SDK ACK alone does not prove readiness.
+            for setting, target in (
+                ("speed_coeff", self.speed_coefficient),
+                ("current_coeff", self.current_coefficient),
+                ("control_source", self.sdk.ControlSource.SDK),
+            ):
+                stage = "get_" + setting
+                current = self._read_hand_setting(hand, setting)
+                if not self._hand_setting_matches(current, target):
+                    stage = "set_" + setting
+                    self._check_error(getattr(hand, stage)(target))
+                    self._wait_hand_setting(hand, setting, target)
+            stage = "position readiness readback"
+            self._wait_hand_setting(hand, "control_mode", self.sdk.ControlMode.POSITION)
+            self._wait_hand_setting(hand, "enable_state", True)
             if not self.skip_tactile:
                 stage = "set_tactile_callback"
                 hand.set_tactile_callback(self._tactile_callback(side))
             stage = "start"
             if not hand.start():
+                if self.skip_tactile:
+                    raise HardwareConnectionError("hand failed to start with tactile disabled")
                 retry = getattr(hand, "retry_tactile_alternate_port", None)
                 if not callable(retry) or not bool(retry()):
                     raise HardwareConnectionError("hand failed to start")
@@ -1163,6 +1224,40 @@ class SharpADevicePair:
                 f"SharpA {side} {stage} failed "
                 f"(sn={serial_number}, ip={ip}): {exc}"
             )
+
+    def _read_hand_setting(self, hand: Any, setting: str) -> Any:
+        error, value = getattr(hand, "get_" + setting)()
+        self._check_error(error)
+        return value
+
+    @staticmethod
+    def _hand_setting_matches(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, float):
+            try:
+                value = float(actual)
+            except (TypeError, ValueError):
+                return False
+            return bool(np.isfinite(value) and np.isclose(value, expected, rtol=1e-5, atol=1e-6))
+        return actual == expected
+
+    def _wait_hand_setting(self, hand: Any, setting: str, expected: Any) -> None:
+        # Vendor enable transitions can take about 70 ms. Poll only readbacks;
+        # never resend a mode/source trigger while waiting for its result.
+        deadline = time.monotonic() + 0.5
+        actual = None
+        while True:
+            try:
+                actual = self._read_hand_setting(hand, setting)
+            except Exception as exc:
+                actual = str(exc)
+            else:
+                if self._hand_setting_matches(actual, expected):
+                    return
+            if time.monotonic() >= deadline:
+                raise HardwareConnectionError(
+                    f"{setting} readback did not settle: expected={expected}, actual={actual}"
+                )
+            time.sleep(0.05)
 
     @property
     def connection_error(self) -> str:
@@ -1288,21 +1383,34 @@ class SharpADevicePair:
             try:
                 channel = int(frames["channel"])
                 content = frames["content"]
-                stored: dict[str, np.ndarray] = {}
+                stored: dict[str, Any] = {}
                 wrench = content.get("F6")
                 if wrench is not None:
-                    array = np.asarray(wrench, dtype=np.float32).reshape(-1)
-                    if array.shape == (6,) and np.isfinite(array).all():
-                        stored["wrench"] = array.copy()
+                    try:
+                        array = np.asarray(wrench, dtype=np.float32).reshape(-1)
+                        if array.shape == (6,) and np.isfinite(array).all():
+                            stored["wrench"] = array.copy()
+                            stored["wrench_seen_s"] = time.monotonic()
+                    except (ValueError, TypeError, OverflowError):
+                        pass
                 deformation = content.get("DEFORM")
                 if deformation is not None:
-                    array = np.asarray(deformation, dtype=np.uint8).reshape(-1)
-                    if array.size == DEFORMATION_HEIGHT * DEFORMATION_WIDTH:
-                        stored["deformation"] = array.reshape(
-                            DEFORMATION_HEIGHT, DEFORMATION_WIDTH
-                        ).copy()
+                    try:
+                        array = np.asarray(deformation, dtype=np.uint8).reshape(-1)
+                        if array.size == DEFORMATION_HEIGHT * DEFORMATION_WIDTH:
+                            stored["deformation"] = array.reshape(
+                                DEFORMATION_HEIGHT, DEFORMATION_WIDTH
+                            ).copy()
+                            stored["deformation_seen_s"] = time.monotonic()
+                    except (ValueError, TypeError, OverflowError):
+                        pass
                 with self._tactile_lock:
-                    self._tactile[side][channel] = stored
+                    cached = self._tactile[side].setdefault(channel, {})
+                    for key, present in (("wrench", "F6" in content), ("deformation", "DEFORM" in content)):
+                        if present:
+                            cached.pop(key, None)
+                            cached.pop(key+"_seen_s", None)
+                    cached.update(stored)
             except Exception:
                 return
 
@@ -1341,7 +1449,7 @@ class SharpADevicePair:
         wrench = {side: np.zeros((f, 6), dtype=np.float32) for side in SIDES}
         deformation = {
             side: np.zeros(
-                (f, DEFORMATION_HEIGHT, DEFORMATION_WIDTH), dtype=np.uint8
+                (f, 0, 0) if self.skip_tactile else (f, DEFORMATION_HEIGHT, DEFORMATION_WIDTH), dtype=np.uint8
             )
             for side in SIDES
         }
@@ -1350,15 +1458,18 @@ class SharpADevicePair:
         with self._tactile_lock:
             tactile = {
                 side: {channel: dict(values) for channel, values in data.items()}
-                for side, data in self._tactile.items()
+                for side, data in ({} if self.skip_tactile else self._tactile).items()
             }
+        tactile_now = time.monotonic()
         for side in SIDES:
             for index, channel in enumerate(TACTILE_CHANNELS[side]):
-                values = tactile[side].get(channel, {})
-                if "wrench" in values:
+                values = tactile.get(side, {}).get(channel, {})
+                if (joint_valid[side] and "wrench" in values
+                        and 0 <= tactile_now-values.get("wrench_seen_s", -float('inf')) < self.tactile_max_age_s):
                     wrench[side][index] = values["wrench"]
                     wrench_valid[side][index] = True
-                if "deformation" in values:
+                if (joint_valid[side] and "deformation" in values
+                        and 0 <= tactile_now-values.get("deformation_seen_s", -float('inf')) < self.tactile_max_age_s):
                     deformation[side][index] = values["deformation"]
                     deformation_valid[side][index] = True
         return SharpASnapshot(
@@ -1390,6 +1501,8 @@ class SharpADevicePair:
         left_enable: bool = True,
         right_enable: bool = True,
         event_callback: Any = None,
+        strict_targets: bool = False,
+        policy_session_id: str = "",
     ) -> dict[str, np.ndarray]:
         """Set both hands' joint positions.
 
@@ -1435,28 +1548,56 @@ class SharpADevicePair:
             "right": current.right_joint.astype(np.float64),
         }
         with self._command_lock:
+            if strict_targets:
+                if not policy_session_id or set(active) != set(SIDES):
+                    raise HardwareCommandError('strict policy requires a session and both hands')
+                if not current.left_joint_valid or not current.right_joint_valid:
+                    raise HardwareCommandError('strict policy requires valid measured hands')
+                if self._strict_session != policy_session_id:
+                    for side in SIDES:
+                        validate_firmware_device(side, self.hands[side].get_device_info())
+                    self._strict_guard.reset()
+                    self._strict_session = policy_session_id
+                from .policy_inference import inference_json
+                report('sharpa_guard_context', **inference_json(dict(
+                    measured=np.concatenate((current_joint['left'], current_joint['right'])),
+                    previous_target=self._strict_guard.last_target, error_since=self._strict_guard.error_since,
+                    profile=self._strict_guard.profile, checked_monotonic_s=time.monotonic(),
+                    max_abs_hand_rad=self.max_abs_hand_rad, policy_session_id=policy_session_id)))
+                self._strict_guard.check(np.concatenate((current_joint['left'],current_joint['right'])),
+                    np.concatenate((targets['left'],targets['right'])),time.monotonic())
+            else:
+                self._strict_session = None
+                self._strict_guard.reset()
             for side in active:
                 if np.max(np.abs(targets[side])) > self.max_abs_hand_rad:
                     raise HardwareCommandError(
                         f"{side} hand target exceeds absolute limit "
                         f"{self.max_abs_hand_rad:.3f} rad"
                     )
-                delta = targets[side] - current_joint[side]
-                targets[side] = current_joint[side] + np.clip(
-                    delta, -self.max_hand_step_rad, self.max_hand_step_rad
-                )
+                if not strict_targets:
+                    delta = targets[side] - current_joint[side]
+                    targets[side] = current_joint[side] + np.clip(
+                        delta, -self.max_hand_step_rad, self.max_hand_step_rad
+                    )
             for side in active:
                 command_started_ns = time.monotonic_ns()
                 report(
                     "sharpa_sdk_hand_command_started",
                     side=side,
-                    interpolation=True,
+                    interpolation=True, target_rad=targets[side].tolist(),
                 )
-                error = self.hands[side].set_joint_position(targets[side].tolist(), True)
+                try:
+                    error = self.hands[side].set_joint_position(targets[side].tolist(), True)
+                except Exception as exc:
+                    report('sharpa_sdk_hand_command_completed', side=side,
+                           target_rad=targets[side].tolist(), success=False, error=str(exc))
+                    raise
                 report(
                     "sharpa_sdk_hand_command_completed",
                     side=side,
                     interpolation=True,
+                    target_rad=targets[side].tolist(),
                     duration_ms=(time.monotonic_ns() - command_started_ns)
                     / 1_000_000.0,
                     sdk_code=int(getattr(error, "code", -1)),
@@ -1468,6 +1609,8 @@ class SharpADevicePair:
                     raise HardwareCommandError(
                         f"SharpA {side} command failed: {getattr(error, 'message', '')}"
                     )
+            if strict_targets:
+                self._strict_guard.commit(np.concatenate((targets['left'],targets['right'])))
         # Return exactly what was handed to the SDK. The input can differ when
         # the driver slews a large teleop step, and recording must label the
         # action with the dispatched target rather than the pre-limit request.
@@ -1596,10 +1739,10 @@ class _ThreadedCamera:
     def __init__(
         self,
         jpeg_quality: int = 90,
-        raw_queue_size: int = 8,
+        raw_queue_size: int = 64,
         process_encode: bool = False,
         encode_workers: int = 1,
-        encoded_queue_size: int = 128,
+        encoded_queue_size: int = 256,
     ) -> None:
         self.jpeg_quality = int(jpeg_quality)
         self.raw_queue_size = int(raw_queue_size)
@@ -1613,9 +1756,10 @@ class _ThreadedCamera:
         if self.encoded_queue_size <= 0:
             raise ValueError("camera encoded queue size must be positive")
         self._latest: CameraSnapshot | None = None
+        self._latest_raw = None
         self._lock = threading.Lock()
         self._raw_ready = threading.Condition(self._lock)
-        self._raw_queue: deque[tuple[int, int, np.ndarray]] = deque()
+        self._raw_queue: deque[tuple[int, int, np.ndarray, int]] = deque()
         self._encoded_pending: dict[int, CameraSnapshot] = {}
         self._encoded_ready: deque[CameraSnapshot] = deque()
         self._dropped_sequences: set[int] = set()
@@ -1631,9 +1775,99 @@ class _ThreadedCamera:
         self.encoded_count = 0
         self.dropped_raw_count = 0
         self.dropped_encoded_count = 0
+        self.capture_error_count = 0
+        self.empty_capture_count = 0
+        self.encode_error_count = 0
+        self._timings = {}
+        self._last_capture_started_ns = 0
+        self._raw_queue_peak = 0
+        self._encoded_queue_peak = 0
+        self.raw_recording = False
+        self._recording_frames = deque()
+        self.recording_raw_drop_count = 0
+        self.recording_raw_peak = 0
+        self.preview_skipped_count = 0
+        self._preview_period_ns = 100_000_000
+        self._preview_enqueued_ns = 0
+        # Drained once per host diagnostic sample, never written by capture threads.
+        self._frame_timing_events = deque(maxlen=512)
+        self._frame_timing_dropped_count = 0
+
+    def _record_frame_timing_locked(self, stage, timestamp, **fields):
+        if len(self._frame_timing_events) == self._frame_timing_events.maxlen:
+            self._frame_timing_dropped_count += 1
+        self._frame_timing_events.append(dict(
+            stage=stage, source_timestamp_ns=int(timestamp),
+            at_ns=time.time_ns(), monotonic_ns=time.monotonic_ns(), **fields))
+
+    def record_raw_publish(self, timestamp, published_at_ns, published_monotonic_ns, pack_write_ms):
+        """Called after the raw ring write returns; records no image payload."""
+        with self._lock:
+            if len(self._frame_timing_events) == self._frame_timing_events.maxlen:
+                self._frame_timing_dropped_count += 1
+            self._frame_timing_events.append(dict(
+                stage='raw_published', source_timestamp_ns=int(timestamp),
+                at_ns=int(published_at_ns), monotonic_ns=int(published_monotonic_ns),
+                pack_write_ms=float(pack_write_ms)))
+
+    def configure_raw_recording(self, preview_fps=10.0):
+        if self._capture_thread is not None:
+            raise RuntimeError("configure raw recording before starting camera")
+        if self.raw_queue_size <= 0:
+            raise ValueError("raw recording queue must have positive bounded capacity")
+        self.raw_recording = True
+        self.encode_workers = 1
+        self.process_encode = False
+        self._preview_period_ns = int(1e9 / max(0.1, float(preview_fps)))
+
+    def read_raw_latest(self):
+        """Newest captured BGR frame, independent of JPEG and recording consumers."""
+        with self._lock:
+            return self._latest_raw
+
+    def read_raw_pending(self):
+        with self._lock:
+            result = list(self._recording_frames)
+            self._recording_frames.clear()
+            return result
+
+    def _accept_raw_capture(self, raw, timestamp, started, ended):
+        with self._raw_ready:
+            self._record_frame_timing_locked('capture_ready', timestamp,
+                grab_started_monotonic_ns=int(started), grab_finished_monotonic_ns=int(ended))
+            self._latest_raw = (timestamp, raw)
+            self._note_timing_locked("grab_ms", (ended - started) / 1e6)
+            if self._last_capture_started_ns:
+                self._note_timing_locked("capture_interval_ms", (started-self._last_capture_started_ns)/1e6)
+            self._last_capture_started_ns = started
+            if len(self._recording_frames) >= self.raw_queue_size:
+                self._recording_frames.popleft()
+                self.recording_raw_drop_count += 1
+            self._recording_frames.append((timestamp, raw))
+            self.recording_raw_peak = max(self.recording_raw_peak, len(self._recording_frames))
+            self.capture_count += 1
+            # Preview is latest-only and sampled BEFORE JPEG encoding. Its
+            # intentional skips never discard frames from the recording queue.
+            if started - self._preview_enqueued_ns >= self._preview_period_ns:
+                self.preview_skipped_count += len(self._raw_queue)
+                self._raw_queue.clear()
+                self._raw_queue.append((0, timestamp, raw, time.monotonic_ns()))
+                self._preview_enqueued_ns = started
+                self._raw_ready.notify()
+            else:
+                self.preview_skipped_count += 1
+        self.last_capture_error = ""
 
     def _grab_rgb(self) -> np.ndarray | None:  # pragma: no cover - hardware
         raise NotImplementedError
+
+    def _grab_frame(self):
+        """Keep capture timestamps together, including across a process boundary."""
+        started = time.monotonic_ns()
+        bgr = self._grab_rgb()
+        ended = time.monotonic_ns()
+        timestamp = self._sample_timestamp_ns() if bgr is not None else 0
+        return bgr, timestamp, started, ended
 
     def start(self) -> None:
         if self._capture_thread is not None and self._capture_thread.is_alive():
@@ -1667,28 +1901,40 @@ class _ThreadedCamera:
     def _capture_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                bgr = self._grab_rgb()
+                bgr, sampled_at_ns, grab_started_ns, grab_ended_ns = self._grab_frame()
                 if bgr is None:
+                    self.empty_capture_count += 1
                     self._stop.wait(0.001)
                     continue
-                sampled_at_ns = self._sample_timestamp_ns()
                 raw = np.asarray(bgr, dtype=np.uint8).copy()
+                if self.raw_recording:
+                    self._accept_raw_capture(raw, sampled_at_ns, grab_started_ns, grab_ended_ns)
+                    continue
                 with self._raw_ready:
+                    self._record_frame_timing_locked('capture_ready', sampled_at_ns,
+                        grab_started_monotonic_ns=grab_started_ns, grab_finished_monotonic_ns=grab_ended_ns)
+                    self._latest_raw = (sampled_at_ns, raw)
+                    self._note_timing_locked("grab_ms", (grab_ended_ns - grab_started_ns) / 1e6)
+                    if self._last_capture_started_ns:
+                        self._note_timing_locked("capture_interval_ms", (grab_started_ns - self._last_capture_started_ns) / 1e6)
+                    self._last_capture_started_ns = grab_started_ns
                     sequence = self._next_capture_sequence
                     self._next_capture_sequence += 1
                     if (
                         self.raw_queue_size > 0
                         and len(self._raw_queue) >= self.raw_queue_size
                     ):
-                        dropped_sequence, _, _ = self._raw_queue.popleft()
+                        dropped_sequence, _, _, _ = self._raw_queue.popleft()
                         self._dropped_sequences.add(dropped_sequence)
                         self.dropped_raw_count += 1
                         self._publish_encoded_locked()
-                    self._raw_queue.append((sequence, sampled_at_ns, raw))
+                    self._raw_queue.append((sequence, sampled_at_ns, raw, time.monotonic_ns()))
+                    self._raw_queue_peak = max(self._raw_queue_peak, len(self._raw_queue))
                     self.capture_count += 1
                     self._raw_ready.notify()
                 self.last_capture_error = ""
             except Exception as exc:
+                self.capture_error_count += 1
                 self.last_capture_error = str(exc)
                 # A transient grab failure must not kill the thread; back off
                 # briefly so a permanently dead camera does not spin a core.
@@ -1706,7 +1952,9 @@ class _ThreadedCamera:
                     return
                 if not self._raw_queue:
                     continue
-                sequence, timestamp_ns, bgr = self._raw_queue.popleft()
+                sequence, timestamp_ns, bgr, enqueued_ns = self._raw_queue.popleft()
+                encode_started_ns = time.monotonic_ns()
+                self._note_timing_locked("raw_queue_wait_ms", (encode_started_ns - enqueued_ns) / 1e6)
             if bgr is None:
                 continue
             try:
@@ -1721,19 +1969,70 @@ class _ThreadedCamera:
                     jpeg=jpeg,
                 )
                 with self._lock:
+                    self._note_timing_locked("encode_ms", (time.monotonic_ns() - encode_started_ns) / 1e6)
                     # Parallel encoders commonly complete adjacent frames in a
                     # burst or in reverse order. Keep every result until all
                     # earlier capture sequences have completed (or were
                     # explicitly dropped), then publish them in capture order.
-                    self._encoded_pending[sequence] = snapshot
                     self.encoded_count += 1
-                    self._publish_encoded_locked()
+                    if self.raw_recording:
+                        self._latest = snapshot
+                        self._encoded_ready.clear()
+                        self._encoded_ready.append(snapshot)
+                    else:
+                        self._encoded_pending[sequence] = snapshot
+                        self._publish_encoded_locked()
                 self.last_encode_error = ""
             except Exception as exc:
+                self.encode_error_count += 1
                 self.last_encode_error = str(exc)
                 with self._lock:
-                    self._dropped_sequences.add(sequence)
-                    self._publish_encoded_locked()
+                    if not self.raw_recording:
+                        self._dropped_sequences.add(sequence)
+                        self._publish_encoded_locked()
+
+    def _note_timing_locked(self, name, value):
+        row = self._timings.setdefault(name, {"count": 0, "sum_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0})
+        row["count"] += 1
+        row["sum_ms"] += value
+        row["last_ms"] = value
+        row["max_ms"] = max(row["max_ms"], value)
+
+    def diagnostics(self, *, include_frame_timings=False) -> dict:
+        """Cumulative application counters, not a hardware frame counter."""
+        with self._lock:
+            result = {
+                "capture_count": self.capture_count,
+                "encoded_count": self.encoded_count,
+                "dropped_raw_count": self.dropped_raw_count,
+                "dropped_encoded_count": self.dropped_encoded_count,
+                "capture_error_count": self.capture_error_count,
+                "empty_capture_count": self.empty_capture_count,
+                "encode_error_count": self.encode_error_count,
+                "raw_queue_depth": len(self._raw_queue),
+                "encoded_queue_depth": len(self._encoded_ready),
+                "encode_pending_depth": len(self._encoded_pending),
+                "last_capture_error": self.last_capture_error,
+                "last_encode_error": self.last_encode_error,
+                "jpeg_encoder": "cpu_process" if self.process_encode else _JPEG_ENCODER_BACKEND,
+                "hardware_encode": False,  # This driver only encodes the JPEG preview.
+                "recording_output": "bgr8_v1" if self.raw_recording else "jpeg",
+                "recording_raw_queue_depth": len(self._recording_frames),
+                "recording_raw_queue_peak": self.recording_raw_peak,
+                "recording_raw_drop_count": self.recording_raw_drop_count,
+                "preview_skipped_count": self.preview_skipped_count,
+                "encode_workers": self.encode_workers,
+                "raw_queue_capacity": self.raw_queue_size,
+                "encoded_queue_capacity": self.encoded_queue_size,
+                "raw_queue_peak": self._raw_queue_peak,
+                "encoded_queue_peak": self._encoded_queue_peak,
+                "timings": {name: dict(row) for name, row in self._timings.items()},
+                "frame_timing_dropped_count": self._frame_timing_dropped_count,
+            }
+            if include_frame_timings:
+                result['frame_timing_events'] = list(self._frame_timing_events)
+                self._frame_timing_events.clear()
+            return result
 
     def _publish_encoded_locked(self) -> None:
         while True:
@@ -1749,6 +2048,7 @@ class _ThreadedCamera:
                 self._encoded_ready.popleft()
                 self.dropped_encoded_count += 1
             self._encoded_ready.append(snapshot)
+            self._encoded_queue_peak = max(self._encoded_queue_peak, len(self._encoded_ready))
             self._latest = snapshot
             self._next_output_sequence += 1
 
@@ -1779,10 +2079,12 @@ class _ThreadedCamera:
             self._encode_executor.shutdown(wait=False, cancel_futures=True)
         with self._lock:
             self._raw_queue.clear()
+            self._recording_frames.clear()
             self._encoded_pending.clear()
             self._encoded_ready.clear()
             self._dropped_sequences.clear()
             self._latest = None
+            self._latest_raw = None
             self._next_capture_sequence = 0
             self._next_output_sequence = 0
         self._capture_thread = None
@@ -1808,11 +2110,14 @@ class ZedEgoCamera(_ThreadedCamera):
         frequency_hz: int = 30,
         serial_number: int | None = None,
         jpeg_quality: int = 90,
+        raw_queue_size: int = 64,
+        encoded_queue_size: int = 256,
     ) -> None:
         # HD720 JPEG encoding was the Ego bottleneck (~22 delivered Hz while
         # capture remained ~28-30 Hz). Two ordered latest-frame workers keep
         # encoding capacity above capture rate without changing wrist cameras.
-        super().__init__(jpeg_quality=jpeg_quality, encode_workers=2)
+        super().__init__(jpeg_quality=jpeg_quality, encode_workers=2,
+                         raw_queue_size=raw_queue_size, encoded_queue_size=encoded_queue_size)
         self.resolution = str(resolution)
         self.frequency_hz = int(frequency_hz)
         self.serial_number = serial_number
@@ -1874,7 +2179,9 @@ class ZedEgoCamera(_ThreadedCamera):
     def _grab_rgb(self) -> np.ndarray | None:
         if self.camera.grab(self.runtime) != self.sl.ERROR_CODE.SUCCESS:
             return None
-        self.camera.retrieve_image(self.image, self.sl.VIEW.LEFT)
+        result = self.camera.retrieve_image(self.image, self.sl.VIEW.LEFT)
+        if result != self.sl.ERROR_CODE.SUCCESS:
+            raise HardwareConnectionError(f"ZED retrieve_image failed: {result}")
         bgra = self.image.get_data()
         return np.ascontiguousarray(bgra[:, :, :3])
 
@@ -1923,8 +2230,11 @@ class RealSenseWristCamera(_ThreadedCamera):
         jpeg_quality: int = 90,
         label: str = "wrist",
         frame_timeout_ms: int = 5000,
+        raw_queue_size: int = 64,
+        encoded_queue_size: int = 256,
     ) -> None:
-        super().__init__(jpeg_quality=jpeg_quality)
+        super().__init__(jpeg_quality=jpeg_quality, raw_queue_size=raw_queue_size,
+                         encoded_queue_size=encoded_queue_size)
         self.serial_number = serial_number
         self.height = int(height)
         self.width = int(width)

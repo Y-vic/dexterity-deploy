@@ -6,7 +6,6 @@ the hidden status node; only validated, completed samples can be uploaded.
 
 from __future__ import annotations
 
-from collections import deque
 import hashlib
 import json
 import re
@@ -14,8 +13,14 @@ import shlex
 import subprocess
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from ur_common.camera_preview import CameraPreview
+from ur_common.reference_http import ReferenceHTTP
+from ur_common.workbench import WorkbenchHTTP, workbench_snapshot
+from ur_common.recording_config import normalize_recording_root
 
 try:
     import rclpy
@@ -40,7 +45,7 @@ DEFAULT_REMOTE_DATA_PATH = (
 )
 
 
-class MonitorController:
+class MonitorController(CameraPreview):
     RECORDING_NAME = re.compile(
         r"\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{6}"
     )
@@ -53,22 +58,14 @@ class MonitorController:
         self.publish_bias = publish_bias
         self.publish_config = publish_config
         self.publish_label = publish_label
-        self.status_timeout_s = float(status_timeout_s)
+        super().__init__(status_timeout_s)
         self.status = {}
         self.upstream = {}
         self._upstream_received = {}
         self._status_received = 0.0
-        self.cameras = {}
-        self._camera_received = {}
-        self._camera_timestamps = {}
-        self._camera_samples = {
-            name: deque(maxlen=120)
-            for name in ("ego", "left_wrist", "right_wrist")
-        }
         self._uploading = False
+        self._upload_requested_path = None
         self.message = ""
-        self._lock = threading.RLock()
-        self._camera_condition = threading.Condition(self._lock)
 
     @staticmethod
     def _recording_counts(recording_root):
@@ -130,34 +127,6 @@ class MonitorController:
                     "recording_counts": self._recording_counts(self.recording_root),
                     "message": self.message}
 
-    def camera_frame(self, name):
-        if name not in ("ego", "left_wrist", "right_wrist"):
-            return None
-        with self._lock:
-            received = self._camera_received.get(name, 0.0)
-            if not self.cameras.get(name) or time.monotonic() - received > self.status_timeout_s:
-                return None
-            return self.cameras[name], self._camera_timestamps.get(name, 0)
-
-    def wait_camera_frame(self, name, after_timestamp=0, timeout=1.0):
-        if name not in ("ego", "left_wrist", "right_wrist"):
-            return None
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        with self._camera_condition:
-            while True:
-                timestamp = self._camera_timestamps.get(name, 0)
-                received = self._camera_received.get(name, 0.0)
-                if (
-                    timestamp != int(after_timestamp)
-                    and self.cameras.get(name)
-                    and time.monotonic() - received <= self.status_timeout_s
-                ):
-                    return self.cameras[name], timestamp
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    return None
-                self._camera_condition.wait(remaining)
-
     def update_status(self, value):
         with self._lock:
             self.status = dict(value)
@@ -166,45 +135,33 @@ class MonitorController:
     def update_upstream(self, key, value, received=None):
         with self._lock:
             self.upstream[key] = value
+            if key == "record_status" and isinstance(value, dict) and value.get("recording_root"):
+                self.recording_root = value["recording_root"]
             self._upstream_received[key] = time.monotonic() if received is None else float(received)
-
-    def update_cameras(self, value, timestamps=None, received=None):
-        with self._camera_condition:
-            now = time.monotonic() if received is None else float(received)
-            timestamps = timestamps or {}
-            updated = False
-            for key in ("ego", "left_wrist", "right_wrist"):
-                data = value.get(key, b"")
-                if not data:
-                    continue
-                source_timestamp = int(timestamps.get(key, 0))
-                if source_timestamp <= 0:
-                    source_timestamp = time.time_ns()
-                if source_timestamp == self._camera_timestamps.get(key):
-                    continue
-                self.cameras[key] = bytes(data)
-                self._camera_timestamps[key] = source_timestamp
-                self._camera_received[key] = now
-                self._camera_samples[key].append(now)
-                updated = True
-            if updated:
-                self._camera_condition.notify_all()
 
     def action(self, body):
         action = str(body.get("action", ""))
         accepted = True
         with self._lock:
+            command_id = None
+            if action in {"mark_success", "mark_fail", "drop_sample", "upload"}:
+                recorder = self.upstream.get("record_status") or {}
+                if (recorder.get("recording") or recorder.get("saving")
+                        or (body.get("saved_path") and body["saved_path"] != recorder.get("saved_path"))):
+                    return {"accepted": False, "message": "样本已变化或正在录制保存，请刷新后重试"}
             if action == "set_paths":
-                if int(self.status.get("record_state", 0)) == 1:
+                recorder = self.upstream.get("record_status") or {}
+                if int(self.status.get("record_state", 0)) == 1 or recorder.get("recording") or recorder.get("saving"):
                     self.message = "paths cannot change while recording"
                     accepted = False
                     result = self.snapshot(); result["accepted"] = accepted
                     return result
-                self.recording_root = str(Path(str(body.get("recording_root", self.recording_root))).expanduser())
+                root = str(normalize_recording_root(body.get("recording_root", self.recording_root)))
                 self.upload_path = str(body.get("upload_path", self.upload_path)).strip()
                 if self.publish_config:
-                    self.publish_config({"recording_root": self.recording_root})
-                self.message = "paths updated"
+                    command_id = uuid.uuid4().hex
+                    self.publish_config({"id": command_id, "recording_root": root})
+                self.message = "目录修改请求已提交，等待数采确认"
             elif action == "save_bias":
                 if self.publish_bias: self.publish_bias("save_current")
                 self.message = "bias save requested"
@@ -214,6 +171,7 @@ class MonitorController:
                     accepted = False
                 else:
                     self._uploading = True
+                    self._upload_requested_path = body.get("saved_path")
                     self.message = "upload in progress"
                     threading.Thread(target=self._upload_background, daemon=True).start()
             elif action in {"mark_success", "mark_fail", "drop_sample"}:
@@ -228,19 +186,27 @@ class MonitorController:
                     accepted = False
                 else:
                     if self.publish_label:
-                        self.publish_label(category)
+                        self.publish_label(json.dumps({"category": category, "saved_path": body["saved_path"]})
+                                           if body.get("saved_path") else category)
                     self.message = (
                         "sample permanent deletion requested"
                         if category == "drop"
                         else f"sample {category} classification requested"
                     )
-            elif action in {"start_ur", "run_ur", "reset_ur", "start_sharpa", "reset_both", "start_record", "stop_record", "discard_record", "pause", "stop"}:
-                if self.publish_command: self.publish_command(action)
+            elif action in {"start_teleop_record", "start_ur", "run_ur", "reset_ur", "start_sharpa", "reset_both", "start_record", "stop_record", "discard_record", "pause", "stop"}:
+                command = (
+                    json.dumps({"action": action, "reset_target": body.get("reset_target")},
+                               ensure_ascii=False, separators=(",", ":"))
+                    if action == "reset_both" and "reset_target" in body else action
+                )
+                if self.publish_command: self.publish_command(command)
                 self.message = f"{action} requested"
             else:
                 self.message = f"unknown action: {action}"
                 accepted = False
             result = self.snapshot(); result["accepted"] = accepted
+            if command_id:
+                result["command_id"] = command_id
             return result
 
     def _upload_latest(self):
@@ -260,6 +226,9 @@ class MonitorController:
                 ):
                     samples.append((path.stat().st_mtime_ns, category, path))
         samples = [(category, path) for _, category, path in sorted(samples, reverse=True)]
+        if self._upload_requested_path:
+            selected = Path(self._upload_requested_path).resolve()
+            samples = [(category, path) for category, path in samples if path.resolve() == selected]
         if not samples: return "upload failed: no completed sample"
         category, sample = samples[0]; manifest = sample / "manifest.json"
         try:
@@ -311,9 +280,13 @@ class MonitorController:
 
 class _Handler(BaseHTTPRequestHandler):
     controller = None
+    reference_http = None
+    workbench_http = None
     def log_message(self, *_args): pass
     def do_GET(self):
-        if self.path == "/" or self.path.startswith("/index"):
+        if self.workbench_http is not None and self.workbench_http.handle(self): return
+        if self.reference_http is not None and self.reference_http.handle(self): return
+        if self.path == "/legacy" or self.path == "/" or self.path.startswith("/index"):
             data = HTML.encode(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data); return
         if self.path.startswith("/api/status"): self._json(self.controller.snapshot()); return
         if self.path.startswith("/api/camera-stream/"):
@@ -352,6 +325,8 @@ class _Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
     def do_POST(self):
+        if self.workbench_http is not None and self.workbench_http.handle(self): return
+        if self.reference_http is not None and self.reference_http.handle(self): return
         if not self.path.startswith("/api/action"): self.send_error(404); return
         try:
             n = int(self.headers.get("content-length", "0")); self._json(self.controller.action(json.loads(self.rfile.read(n) or b"{}")))
@@ -367,6 +342,7 @@ if ROS_AVAILABLE:
             for name, default in (("port", 8080), ("recording_root", "/media/yns/T9/0824_yns_unscrew_cap"), ("upload_host", "BAAI"), ("upload_path", DEFAULT_REMOTE_DATA_PATH), ("status_timeout_s", 2.0)):
                 self.declare_parameter(name, default)
             self.declare_parameter("shared_memory_prefix", "ur_sharpa_camera_v1")
+            self.declare_parameter("reference_dataset_root", "/home/yns/data/0916_ppp")
             qos = QoSProfile(depth=10); camera_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST, reliability=ReliabilityPolicy.BEST_EFFORT)
             self.controller = MonitorController(self.get_parameter("recording_root").value, self.get_parameter("upload_host").value, self.get_parameter("upload_path").value, status_timeout_s=self.get_parameter("status_timeout_s").value)
             self.command_pub = self.create_publisher(String, "/control/ui_command", qos); self.bias_pub = self.create_publisher(String, "/control/bias_request", qos); self.config_pub = self.create_publisher(String, "/control/record_config", qos); self.label_pub = self.create_publisher(String, "/control/record_label", qos)
@@ -374,9 +350,12 @@ if ROS_AVAILABLE:
             self.create_subscription(ControlStatus, "/control/status", self._status, qos); self.create_subscription(CameraSet, "/camera/set", self._camera, camera_qos)
             self.camera_reader = SharedCameraReader(str(self.get_parameter("shared_memory_prefix").value)); self._shared_camera_seen = False; self.create_timer(1.0 / 60.0, self._poll_shared_cameras)
             self.create_subscription(UrStateFrame, "/ur/state", self._ur, qos); self.create_subscription(HandStateFrame, "/sharpa/state", self._sharpa, qos)
-            for topic, key in (("/control/bias_status", "bias_status"), ("/control/record_status", "record_status"), ("/teleop/vive_status", "vive_status"), ("/teleop/manus_status", "manus_status")):
+            for topic, key in (("/control/bias_status", "bias_status"), ("/control/record_status", "record_status"), ("/teleop/vive_status", "vive_status"), ("/teleop/glove_status", "glove_status")):
                 self.create_subscription(String, topic, self._upstream(key), qos)
             self.http = ThreadingHTTPServer(("0.0.0.0", int(self.get_parameter("port").value)), _Handler); self.http.daemon_threads = True; _Handler.controller = self.controller
+            _Handler.reference_http = ReferenceHTTP(self.controller, str(self.get_parameter("reference_dataset_root").value))
+            _Handler.workbench_http = WorkbenchHTTP(
+                lambda: workbench_snapshot(self.controller.snapshot()), self.controller.action, self.controller)
             self.http_thread = threading.Thread(target=self.http.serve_forever, daemon=True); self.http_thread.start()
         def _publish(self, pub, value): msg = String(); msg.data = str(value); pub.publish(msg)
         def _status(self, msg):

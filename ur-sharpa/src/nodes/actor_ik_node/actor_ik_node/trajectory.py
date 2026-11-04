@@ -23,6 +23,15 @@ DEFAULT_MAX_TOTAL_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_EXTERNAL_EVENT_QUEUE_CAPACITY = 64
 
 
+def _json_default(value: Any) -> Any:
+    """Preserve numeric ROS/NumPy values in the existing JSON list schema."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def build_trajectory_payload(
     action: Any,
     plan: Any,
@@ -497,10 +506,10 @@ class ExecutionTraceWriter:
 
     @staticmethod
     def _write_json_at(path: Path, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, default=_json_default, ensure_ascii=False, separators=(",", ":"))
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         with temporary.open("w", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.write("\n")
+            stream.write(encoded + "\n")
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(path)
@@ -511,9 +520,11 @@ class ExecutionTraceWriter:
 
     @staticmethod
     def _append_jsonl_at(path: Path, payload: dict[str, Any]) -> None:
+        # Serialize before opening the journal so rejected values cannot leave
+        # a partial record in front of the following protection event.
+        encoded = json.dumps(payload, default=_json_default, ensure_ascii=False, separators=(",", ":"))
         with path.open("a", encoding="utf-8") as stream:
-            json.dump(payload, stream, ensure_ascii=False, separators=(",", ":"))
-            stream.write("\n")
+            stream.write(encoded + "\n")
             stream.flush()
 
 

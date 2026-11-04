@@ -92,6 +92,17 @@ TRAIN_FPS = 30.0
 # finite, plausible trajectories. It can only be settled on hardware, in
 # preview, by watching whether the left arm's translation direction matches
 # intent. Default 0/0 reproduces what the checkpoint was actually trained on.
+#
+# SETTLED for the ur_unscrew_cap corpus (checked 2026-09-15). That corpus is NOT
+# converted T-Rex data: its meta/info.json records
+#
+#     robot_type                    = ur_sharpa
+#     wrist_source                  = ur/physical_12.npz:canonical_wrist_pose9
+#     wrist_transform_at_conversion = none
+#
+# so the poses were recorded on this robot, in this robot's own tool frame, with
+# no alignment step to disagree about. 0/0 is right by construction there, and the
+# risk above applies only to a checkpoint trained on the converted Vega corpus.
 TOOL_ROLL_DEG = {"left": 0.0, "right": 0.0}
 
 

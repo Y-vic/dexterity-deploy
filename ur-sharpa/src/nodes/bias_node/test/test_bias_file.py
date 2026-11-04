@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from bias_node.bias_node import BiasNode
+from bias_node.bias_node import BiasNode, BiasRun
 
 
 def _node_with_path(path):
@@ -62,3 +62,23 @@ def test_save_current_bias_includes_both_hands(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     np.testing.assert_array_equal(payload["left_hand_joint"], hand[:22])
     np.testing.assert_array_equal(payload["right_hand_joint"], hand[22:])
+
+
+def test_episode_reset_plan_uses_selected_target_without_loading_bias(tmp_path):
+    node = _node_with_path(tmp_path / "nonexistent.json")
+    node.ur_steps = 2
+    node.sharpa_steps = 2
+    node.kinematics = SimpleNamespace(reset=lambda **_kwargs: None)
+    node._measured_arm_joints = lambda: {"left": np.zeros(6), "right": np.zeros(6)}
+    node._measured_hand_joints = lambda: np.zeros(44)
+    node._load_bias_targets_locked = lambda: pytest.fail("Bias arm target was loaded")
+    node._load_hand_bias_target_locked = lambda: pytest.fail("Bias hand target was loaded")
+    target = {
+        "source": "episode", "episode": "/data/success/one",
+        "left_joint": [0.1] * 6, "right_joint": [-0.2] * 6,
+        "left_hand_joint": [0.3] * 22, "right_hand_joint": [-0.4] * 22,
+    }
+    run = BiasRun(request="home_both", action_id="test", started_at=0, target=target)
+    node._build_plans_locked(run)
+    np.testing.assert_allclose(run.arm_plan[-1], [0.1] * 6 + [-0.2] * 6)
+    np.testing.assert_allclose(run.hand_plan[-1], [0.3] * 22 + [-0.4] * 22)

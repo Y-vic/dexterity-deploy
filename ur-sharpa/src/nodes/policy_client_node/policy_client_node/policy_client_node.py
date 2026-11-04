@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Mapping
 
 import numpy as np
@@ -203,6 +203,24 @@ def completion_belongs_to_session(message: Any, session_id: str) -> bool:
     return bool(session_id) and str(message.session_id) == str(session_id)
 
 
+def action_period_deadline(published_at: float, frequency_hz: float) -> float:
+    """Earliest time a published action's final native step is complete.
+
+    Hardware ACKs only confirm that ``servoJ``/the hand command was accepted;
+    they arrive in a few milliseconds even though the command owns a full
+    ``1 / frequency_hz`` motion period.  Sampling the next observation at ACK
+    time therefore observes a step that is still moving and turns a nominally
+    synchronous one-step rollout into a delayed feedback loop.
+    """
+    published = float(published_at)
+    frequency = float(frequency_hz)
+    if not np.isfinite(published):
+        raise ValueError("published_at must be finite")
+    if not np.isfinite(frequency) or frequency <= 0.0:
+        raise ValueError("frequency_hz must be finite and positive")
+    return published + 1.0 / frequency
+
+
 def deployment_ready(
     ur_state: int,
     sharpa_state: int,
@@ -292,15 +310,16 @@ def summarize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
 
 def main(args=None) -> None:
     import json
+    import time
+    import uuid
     import rclpy
     from rclpy._rclpy_pybind11 import RCLError
     from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
     from rclpy.executors import MultiThreadedExecutor
     from rclpy.node import Node
-    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, Bool
+    from rclpy.qos import DurabilityPolicy, QoSProfile
     from ur_msgs.msg import (
-        CameraSet,
         ControlStatus,
         DeformationFrame,
         ExecutableAction,
@@ -312,6 +331,8 @@ def main(args=None) -> None:
     )
     from sharpa_interface.server.client import ServerClient, ServerConfig
     from sharpa_interface.sharpa import CANONICAL_EEF_FRAME
+    from ur_common.protection_config import setting
+    from ur_common.policy_inference import inference_json
     from ur_common.execution_log import execution_event_json
     from ur_common.observation_collector import ObservationCollector
     from ur_common.policy_observation import ObservationNotReady
@@ -325,6 +346,27 @@ def main(args=None) -> None:
             self.declare_parameter("ssh_host", "BAAI")
             self.declare_parameter("ssh_remote_host", "127.0.0.1")
             self.declare_parameter("ssh_remote_port", 5500)
+            from concurrent.futures import ThreadPoolExecutor
+            from ur_common.camera_transport import SharedCameraReader
+            from ur_common.raw_camera import RAW_ENCODING
+            from ur_common.remote_observation import RemoteCameraEncoder
+            self.declare_parameter("camera_shm_prefix", "ur_sharpa_camera_v1")
+            self.declare_parameter("enable_hil", False)
+            self._hil = {}
+            self._policy_recording = False
+            self._execution_dry_run = False
+            self._recording_status_seen = 0.0
+            self._recording_epoch_floor = 0
+            self._recording_rollout_id = ''
+            self._retired_recording_ids = set()
+            self._epoch = 0
+            self._inference_future = None
+            self._service_future = None
+            self._rpc_faulted = False
+            self._inference_context = None
+            self._inference_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='remote-inference')
+            self._raw_reader = SharedCameraReader(prefix=str(self.get_parameter('camera_shm_prefix').value)+'_raw',encoding=RAW_ENCODING)
+            self._camera_encoder = RemoteCameraEncoder()
             self._base_session_id = str(self.get_parameter("session_id").value)
             self._core = PolicyClientCore(self._base_session_id)
             self._fallback_prompt = str(self.get_parameter("prompt").value)
@@ -361,12 +403,19 @@ def main(args=None) -> None:
             self._last_error = ""
             self._request_metrics = PolicyRequestMetrics()
             self._last_waiting_reason = ""
+            # One-step actions are not physically complete when the hardware
+            # ACK arrives: the ACK only says the asynchronous command was
+            # accepted.  Track the end of the native action period so the next
+            # observation is sampled after the step, not while it is moving.
+            self._action_period_deadlines = {}
+            self._next_observation_not_before = 0.0
             self._observations = ObservationCollector()
             self._observation_group = MutuallyExclusiveCallbackGroup()
             self._status = self.create_publisher(String, "/policy/status", 10)
             self._execution_event_pub = self.create_publisher(
                 String, "/deploy/execution_event", 100
             )
+            self._inference_pub = self.create_publisher(String, "/policy/inference", 256)
             self._action_pub = self.create_publisher(ExecutableAction, "/policy/executable_action", 10)
             self.create_subscription(String, "/policy/action_result_json", self._action, 10)
             self.create_subscription(String, "/policy/execution_done_json", self._done, 10)
@@ -393,18 +442,6 @@ def main(args=None) -> None:
                 10,
                 callback_group=self._observation_group,
             )
-            camera_qos = QoSProfile(
-                depth=1,
-                history=HistoryPolicy.KEEP_LAST,
-                reliability=ReliabilityPolicy.BEST_EFFORT,
-            )
-            self.create_subscription(
-                CameraSet,
-                "/camera/set",
-                self._camera,
-                camera_qos,
-                callback_group=self._observation_group,
-            )
             self.create_subscription(
                 TauFrame,
                 "/sharpa/tau",
@@ -427,6 +464,10 @@ def main(args=None) -> None:
                 callback_group=self._observation_group,
             )
             self._timer = self.create_timer(0.1, self._tick)
+            self.create_timer(1/30, self._raw_cameras, callback_group=self._observation_group)
+            self.create_subscription(String, '/hil/state', self._hil_status, 10)
+            self.create_subscription(Bool, '/control/policy_recording', self._policy_recording_status,
+                                     QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
             self._status_timer = self.create_timer(1.0, lambda: self._publish({}))
 
         def _execution_event(self, event, **fields):
@@ -439,7 +480,28 @@ def main(args=None) -> None:
             except Exception as exc:
                 self.get_logger().warning(f"failed to publish execution event: {exc}")
 
+        def _inference_event(self, event, **fields):
+            if self._inference_context is None:
+                return
+            payload = dict(self._inference_context, event=event, **fields)
+            if event != 'requested':
+                payload['completed_unix_ns'] = time.time_ns()
+            self._inference_pub.publish(String(data=json.dumps(inference_json(payload))))
+            if event != 'requested':
+                self._inference_context = None
+
+        def _invalidate_request(self, reason):
+            self._epoch += 1
+            if self._inference_future is not None:
+                self._inference_event('cancelled', error=reason)
+                # A stateful server may already have advanced its metadata or
+                # history. Resume only after resetting once the active chunk ends.
+                self._rollout_reset_pending = True
+                self._control_ready = False
+
         def _publish(self, payload):
+            payload = dict(payload, hil=self._hil, rollout_recording=self._hil.get("rollout_recording", {}),
+                           learning_command=self._hil.get("learning_command", {}))
             if payload.get("phase"):
                 self._phase = str(payload["phase"])
             if "reason" in payload:
@@ -494,37 +556,6 @@ def main(args=None) -> None:
                 left_valid=message.left_valid,
                 right_valid=message.right_valid,
             )
-
-        def _camera(self, message):
-            frames = (
-                (
-                    "ego_cam",
-                    message.ego,
-                    message.ego_timestamp_ns,
-                    message.ego_valid,
-                ),
-                (
-                    "left_wrist_cam",
-                    message.left_wrist,
-                    message.left_wrist_timestamp_ns,
-                    message.left_wrist_valid,
-                ),
-                (
-                    "right_wrist_cam",
-                    message.right_wrist,
-                    message.right_wrist_timestamp_ns,
-                    message.right_wrist_valid,
-                ),
-            )
-            for name, data, timestamp_ns, valid in frames:
-                self._collect(
-                    name,
-                    self._observations.push_camera,
-                    name,
-                    timestamp_ns=timestamp_ns,
-                    data=data,
-                    valid=valid,
-                )
 
         def _tau(self, message):
             self._collect(
@@ -608,6 +639,7 @@ def main(args=None) -> None:
                     log_tail=str(payload.get("log_tail") or "")[-12000:],
                     success=phase != "fault",
                 )
+                self._invalidate_request("model changed")
                 self._client.close()
                 self._server_config = replace(
                     self._server_config,
@@ -622,6 +654,7 @@ def main(args=None) -> None:
                 self._model_identity_error = ""
                 self._active_prompt = ""
                 self._started = False
+                self._rpc_faulted = False
                 self._busy = False
                 self._pending = None
                 self._core = PolicyClientCore(self._base_session_id)
@@ -635,7 +668,35 @@ def main(args=None) -> None:
             except Exception as exc:
                 self._publish({"phase": "fault", "error": str(exc)})
 
+        def _policy_recording_status(self, message):
+            if bool(message.data) != self._policy_recording:
+                self._invalidate_request('recording mode changed')
+            self._policy_recording = bool(message.data)
+
+        def _recording_ready(self):
+            recording = self._hil.get('rollout_recording', {})
+            required = not self._execution_dry_run and (
+                self._policy_recording or self._execution_provider == 'hil' or recording.get('required'))
+            if not required:
+                return True
+            rollout_id = str(recording.get('rollout_id') or '')
+            return bool(
+                recording.get('requested') and recording.get('recording') and rollout_id
+                and rollout_id not in self._retired_recording_ids
+                and int(self._hil.get('control_timestamp_ns') or 0) >= self._recording_epoch_floor
+                and time.monotonic() - self._recording_status_seen < setting('recording', 'heartbeat_timeout_s'))
+
         def _control_status(self, message):
+            machine_ready = deployment_ready(
+                message.ur_state, message.sharpa_state, message.active_source,
+                message.execution_paused, message.execution_dry_run)
+            self._execution_dry_run = bool(message.execution_dry_run)
+            if machine_ready and not self._machine_control_ready:
+                self._recording_epoch_floor = int(message.timestamp_ns)
+            elif self._machine_control_ready and not machine_ready:
+                if self._recording_rollout_id:
+                    self._retired_recording_ids.add(self._recording_rollout_id)
+                self._recording_rollout_id = ''
             actor_gate_running = bool(
                 int(message.active_source) == 3
                 and (
@@ -645,8 +706,11 @@ def main(args=None) -> None:
                         and int(message.sharpa_state) == 1
                     )
                 )
-                and self._execution_provider == "policy"
+                and (self._execution_provider in {"policy", "hil"} and not self._hil.get("active"))
             )
+            if actor_gate_running != self._actor_gate_running or bool(message.execution_paused) != getattr(self, '_paused', False):
+                self._invalidate_request('Actor control changed')
+            self._paused = bool(message.execution_paused)
             rollout_started = actor_gate_running and not self._actor_gate_running
             self._actor_gate_running = actor_gate_running
             recovered = self._core.update_actor_gate(actor_gate_running)
@@ -659,10 +723,11 @@ def main(args=None) -> None:
             )
             self._control_ready = bool(
                 self._machine_control_ready
-                and self._execution_provider == "policy"
+                and (self._execution_provider in {"policy", "hil"} and not self._hil.get("active"))
                 and not self._rollout_reset_pending
             )
             if rollout_started:
+                self._rpc_faulted = False
                 self._rollout_reset_pending = True
                 self._control_ready = False
                 self._publish(
@@ -675,7 +740,7 @@ def main(args=None) -> None:
                 reason = "new rollout: resetting server history"
             elif self._control_ready:
                 reason = ""
-            elif self._execution_provider != "policy":
+            elif (self._execution_provider not in {"policy", "hil"} or self._hil.get("active")):
                 reason = "policy disabled: replay provider selected"
             elif message.execution_paused:
                 reason = "policy paused: waiting for continue"
@@ -689,13 +754,16 @@ def main(args=None) -> None:
 
         def _provider_status(self, message):
             provider = str(message.data).strip().lower()
-            if provider not in {"policy", "replay"}:
+            if provider not in {"policy", "replay", "hil"}:
                 return
+            if provider != self._execution_provider:
+                self._invalidate_request('execution provider changed')
             self._execution_provider = provider
             self._control_ready = bool(
-                self._machine_control_ready and provider == "policy"
+                self._machine_control_ready and (provider in {"policy", "hil"} and not self._hil.get("active"))
+                and not self._rollout_reset_pending
             )
-            if provider != "policy":
+            if (provider not in {"policy", "hil"} or self._hil.get("active")):
                 self._publish(
                     {"phase": "waiting", "reason": "policy disabled: replay provider selected"}
                 )
@@ -758,7 +826,30 @@ def main(args=None) -> None:
                 request_id=int(pending.request_id),
                 success=True,
             )
-            self._infer_observation(payload)
+            self._request_epoch = self._epoch
+            self._recording_rollout_id = str(self._hil.get('rollout_recording', {}).get('rollout_id') or '')
+            self._inference_context = dict(
+                schema='ur_sharpa_policy_inference.v1', request_id=uuid.uuid4().hex,
+                session_id=self._core.session_id, policy_request_id=int(pending.request_id),
+                model_generation=self._model_generation,
+                rollout_id=str(self._hil.get('rollout_recording', {}).get('rollout_id') or ''),
+                submitted_unix_ns=time.time_ns(),
+                metadata_format=deepcopy(self._metadata['metadata_format']),
+                execution_feedback=deepcopy(pending.feedback))
+            self._inference_event('requested')
+            self._execution_event('model_inference_started',
+                session_id=self._core.session_id, request_id=int(pending.request_id),
+                model_generation=int(self._model_generation), model_port=int(self._model_port))
+            try:
+                self._inference_future = self._inference_pool.submit(
+                    self._client.infer_action, payload,
+                    expected_session_id=self._core.session_id,
+                    expected_request_id=pending.request_id)
+            except Exception as exc:
+                self._inference_event('failed', error=str(exc))
+                self._core.cancel_request()
+                self._busy = False
+                raise
 
         def _reset_rollout(self):
             self._rollout_generation += 1
@@ -766,75 +857,132 @@ def main(args=None) -> None:
                 f"{self._base_session_id}-m{self._model_generation}"
                 f"-r{self._rollout_generation}"
             )
-            reset = self._client.reset(session_id, request_id=0)
-            self._metadata = activate_reset_metadata(self._metadata, reset)
+            self._service_context = ('reset', self._client, self._epoch, session_id)
+            self._service_future = self._inference_pool.submit(self._client.reset, session_id, request_id=0)
+
+        def _finish_service(self):
+            future, self._service_future = self._service_future, None
+            kind, client, epoch, session_id = self._service_context
+            if client is not self._client:
+                return
+            if kind == 'reset' and epoch != self._epoch:
+                # Stop/pause/provider changes while reset was outstanding.
+                self._rollout_reset_pending = True
+                return
+            result = future.result()
+            if kind == 'connect':
+                self._metadata = result
+                validate_server_eef_contract(self._metadata)
+                identity_error = metadata_identity_error(
+                    self._metadata, expected_model=self._expected_model,
+                    expected_task_id=self._expected_task_id, expected_run_id=self._expected_run_id,
+                    expected_prompt=self._expected_prompt)
+                if identity_error:
+                    self._model_identity_ok = False
+                    self._model_identity_error = identity_error
+                    self._model_available = False
+                    self._client.close()
+                    self._publish({'phase': 'fault', 'reason': '', 'error': identity_error})
+                    return
+                self._model_identity_ok = True
+                self._model_identity_error = ''
+                self._active_prompt = self._expected_prompt or str(result.get('prompt') or '') or self._fallback_prompt
+                self._started = True
+                self._rollout_reset_pending = True
+                self._control_ready = False
+                self._publish({'phase': 'connected', 'reason': '', 'error': ''})
+                return
+            self._metadata = activate_reset_metadata(self._metadata, result)
             self._core = PolicyClientCore(session_id)
+            self._core.update_actor_gate(self._actor_gate_running)
             self._pending = None
             self._busy = False
+            self._action_period_deadlines.clear()
+            self._next_observation_not_before = 0.0
             self._request_metrics.reset()
             self._rollout_reset_pending = False
             self._control_ready = bool(
                 self._machine_control_ready
-                and self._execution_provider == "policy"
-            )
-            self._execution_event(
-                "rollout_reset",
-                session_id=session_id,
-                request_id=0,
-                model_generation=int(self._model_generation),
-                rollout_generation=int(self._rollout_generation),
-            )
-            self._publish(
-                {
-                    "phase": "ready",
-                    "reason": "",
-                    "error": "",
-                    "rollout_generation": self._rollout_generation,
-                }
-            )
+                and (self._execution_provider in {'policy', 'hil'} and not self._hil.get('active')))
+            self._execution_event('rollout_reset', session_id=session_id, request_id=0,
+                model_generation=int(self._model_generation), rollout_generation=int(self._rollout_generation))
+            self._publish({'phase': 'ready', 'reason': '', 'error': '',
+                'rollout_generation': self._rollout_generation})
+
+        def _raw_cameras(self):
+            try:
+                for name, stamp, data in self._camera_encoder.encode(self._raw_reader.read()):
+                    self._collect(name, self._observations.push_camera, name,
+                                  timestamp_ns=stamp, data=data, valid=True)
+                if self._camera_encoder.errors != getattr(self, '_camera_errors', {}):
+                    self._camera_errors = dict(self._camera_encoder.errors)
+                    if self._camera_errors:
+                        self.get_logger().warning('policy raw cameras rejected: ' + str(self._camera_errors))
+            except Exception as exc:
+                self.get_logger().warning('policy raw camera: ' + str(exc))
+
+        def _hil_status(self, message):
+            try:
+                value = json.loads(message.data)
+                if not isinstance(value, dict):
+                    return
+                changed = bool(value.get('active')) != bool(self._hil.get('active'))
+                self._hil = value
+                self._recording_status_seen = time.monotonic()
+                if changed:
+                    self._invalidate_request('human takeover changed')
+                    self._control_ready = False
+                    self._rollout_reset_pending = not value.get('active')
+                    self._core = PolicyClientCore(self._base_session_id)
+                    self._actor_gate_running = False
+            except (ValueError, TypeError):
+                pass
 
         def _tick(self):
-            if self._busy: return
+            if self._service_future is not None:
+                if not self._service_future.done():
+                    return
+                try:
+                    self._finish_service()
+                except Exception as exc:
+                    self._rpc_faulted = True
+                    self._publish({'phase': 'fault', 'error': str(exc)})
+                return
+            if self._inference_future is not None:
+                if not self._inference_future.done(): return
+                future, self._inference_future = self._inference_future, None
+                if self._request_epoch != self._epoch or not self._control_ready:
+                    self._inference_event('cancelled', error='control state changed during inference')
+                    self._busy = False
+                    self._pending = None
+                    if self._core.inference_pending:
+                        self._core.cancel_request()
+                    return
+                self._inference_result = future
+                self._infer_observation(None)
+                return
+            if self._busy or self._rpc_faulted: return
             try:
-                if self._execution_provider != "policy": return
+                if (self._execution_provider not in {"policy", "hil"} or self._hil.get("active")): return
                 if not self._model_available: return
                 if not self._started:
-                    self._metadata = self._client.connect()
-                    validate_server_eef_contract(self._metadata)
-                    identity_error = metadata_identity_error(
-                        self._metadata,
-                        expected_model=self._expected_model,
-                        expected_task_id=self._expected_task_id,
-                        expected_run_id=self._expected_run_id,
-                        expected_prompt=self._expected_prompt,
-                    )
-                    if identity_error:
-                        self._model_identity_ok = False
-                        self._model_identity_error = identity_error
-                        self._model_available = False
-                        self._client.close()
-                        self._publish({"phase": "fault", "reason": "", "error": identity_error})
-                        return
-                    self._model_identity_ok = True
-                    self._model_identity_error = ""
-                    self._active_prompt = (
-                        self._expected_prompt
-                        or str(self._metadata.get("prompt") or "")
-                        or self._fallback_prompt
-                    )
-                    reset = self._client.reset(self._core.session_id, request_id=0)
-                    self._metadata = activate_reset_metadata(self._metadata, reset)
-                    self._core.reset(); self._started = True
-                    self._reason = ""
-                    self._last_error = ""
-                    self._publish({"phase": "connected", "metadata_format_id": self._metadata["metadata_format"]["format_id"]}); return
+                    self._service_context = ('connect', self._client, self._epoch, self._core.session_id)
+                    self._service_future = self._inference_pool.submit(self._client.connect)
+                    return
                 if self._rollout_reset_pending:
+                    if not self._actor_gate_running or not self._machine_control_ready or self._core.executing:
+                        return
                     self._reset_rollout()
                     return
                 if not self._core.ready: return
                 if not self._control_ready: return
+                if not self._recording_ready():
+                    self._publish({'phase': 'waiting', 'reason': 'waiting for rollout recording acknowledgement'})
+                    return
+                if time.monotonic() < self._next_observation_not_before: return
                 self._request_observation(self._core.begin())
             except Exception as exc:
+                self._rpc_faulted = True
                 self._execution_event(
                     "policy_tick_failed",
                     request_id=(
@@ -849,7 +997,7 @@ def main(args=None) -> None:
 
         def _infer_observation(self, payload):
             try:
-                if not self._control_ready or self._execution_provider != "policy":
+                if not self._control_ready or (self._execution_provider not in {"policy", "hil"} or self._hil.get("active")):
                     self._execution_event(
                         "inference_cancelled_before_request",
                         session_id=self._core.session_id,
@@ -858,14 +1006,8 @@ def main(args=None) -> None:
                         error="control state changed before inference",
                     )
                     self._core.cancel_request(); self._publish({"phase": "waiting", "reason": "control state changed before inference"}); return
-                self._execution_event(
-                    "model_inference_started",
-                    session_id=self._core.session_id,
-                    request_id=int(self._pending.request_id),
-                    model_generation=int(self._model_generation),
-                    model_port=int(self._model_port),
-                )
-                action, latency = self._client.infer_action(payload, expected_session_id=self._core.session_id, expected_request_id=self._pending.request_id)
+                action, latency = self._inference_result.result()
+                self._inference_event('completed', result=asdict(action), latency_s=float(latency))
                 self._execution_event(
                     "model_inference_completed",
                     session_id=self._core.session_id,
@@ -885,6 +1027,14 @@ def main(args=None) -> None:
                 left, right = values["hand_joint"]["left"], values["hand_joint"]["right"]
                 if left is not None and right is not None: message.hand_joint = np.concatenate((left, right), axis=-1).reshape(-1).tolist()
                 self._action_pub.publish(message)
+                action_key = (
+                    str(message.session_id),
+                    str(message.action_id),
+                    int(message.revision),
+                )
+                self._action_period_deadlines[action_key] = action_period_deadline(
+                    time.monotonic(), float(message.frequency_hz)
+                )
                 self._execution_event(
                     "policy_action_published",
                     session_id=str(message.session_id),
@@ -898,6 +1048,8 @@ def main(args=None) -> None:
                 )
                 self._publish({"phase": "executing", "action_id": message.action_id, "latency_s": latency, "reason": "", "error": ""})
             except Exception as exc:
+                self._rpc_faulted = True
+                self._inference_event('failed', error=str(exc))
                 self._execution_event(
                     "policy_inference_pipeline_failed",
                     session_id=self._core.session_id,
@@ -960,12 +1112,36 @@ def main(args=None) -> None:
             execute_fetch = bool(getattr(message, "execute_fetch", False))
             execute_done = bool(message.execute_done)
             if execute_done:
+                action_key = (
+                    str(message.session_id),
+                    str(message.action_id),
+                    int(message.revision),
+                )
+                period_deadline = self._action_period_deadlines.pop(action_key, None)
+                if bool(message.success) and period_deadline is not None:
+                    self._next_observation_not_before = max(
+                        self._next_observation_not_before,
+                        float(period_deadline),
+                    )
+                    self._execution_event(
+                        "action_period_gate_armed",
+                        session_id=str(message.session_id),
+                        request_id=int(message.request_id),
+                        action_id=str(message.action_id),
+                        revision=int(message.revision),
+                        wait_remaining_ms=max(
+                            0.0,
+                            (float(period_deadline) - time.monotonic()) * 1000.0,
+                        ),
+                    )
                 self._done(String(data=json.dumps({"schema": "sharpa_execution_done.v1", "session_id": message.session_id, "request_id": int(message.request_id), "action_id": message.action_id, "revision": int(message.revision), "execute_start": int(message.execute_start), "execute_length": int(message.execute_length), "executed_steps": int(message.executed_steps), "success": bool(message.success), "done": True, "error": message.error or None})))
             if execute_fetch and not execute_done:
                 try:
                     if not bool(message.success):
                         raise RuntimeError("execute_fetch requires successful progress")
-                    if not self._control_ready or self._execution_provider != "policy":
+                    if not self._control_ready or (self._execution_provider not in {"policy", "hil"} or self._hil.get("active")):
+                        return
+                    if not self._recording_ready():
                         return
                     pending = self._core.prefetch(message)
                     self._request_observation(pending)
@@ -990,7 +1166,10 @@ def main(args=None) -> None:
         pass
     finally:
         executor.shutdown()
-        node.destroy_node()
+        node._invalidate_request('policy client shutdown')
         node._client.close()
+        node.destroy_node()
+        node._inference_pool.shutdown(wait=False, cancel_futures=True)
+        node._raw_reader.close()
         if rclpy.ok():
             rclpy.shutdown()

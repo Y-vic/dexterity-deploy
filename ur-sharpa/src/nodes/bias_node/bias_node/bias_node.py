@@ -27,6 +27,7 @@ stray environment variable cannot silently arm a gate here.
 
 from __future__ import annotations
 
+from ur_common.protection_config import setting
 import json
 import os
 import threading
@@ -48,6 +49,7 @@ from ur_msgs.msg import ControlStatus, HandStateFrame
 
 from ur_common.kinematics import UrCommonKinematics
 from ur_common.safety import SafetyConfig
+from ur_common.reset_target import validate_target
 
 from .home_pose import HomePoseError, both_home_joints
 from .trajectory import (
@@ -84,6 +86,7 @@ class BiasRun:
     request: str
     action_id: str
     started_at: float
+    target: dict | None = None
     started_wall_ns: int = field(default_factory=time.time_ns)
     arm_plan: np.ndarray | None = None      # (steps, 12): left 6 then right 6
     arm_target: dict = field(default_factory=dict)
@@ -133,16 +136,16 @@ class BiasNode(Node):
         # ---- trajectory shape: v3 initialize_joints defaults ----
         self.declare_parameter("ur_steps", UR_HOME_STEPS)
         self.declare_parameter("ur_step_delay_s", UR_HOME_STEP_DELAY_S)
-        self.declare_parameter("ur_tolerance_rad", UR_HOME_TOLERANCE_RAD)
+        self.declare_parameter("ur_tolerance_rad", setting("reset", "ur_tolerance_rad"))
         self.declare_parameter("sharpa_steps", SHARPA_HOME_STEPS)
         self.declare_parameter("sharpa_step_delay_s", SHARPA_HOME_STEP_DELAY_S)
-        self.declare_parameter("sharpa_tolerance_rad", SHARPA_HOME_TOLERANCE_RAD)
+        self.declare_parameter("sharpa_tolerance_rad", setting("reset", "sharpa_tolerance_rad"))
         # Grace period after the last step before the arrival check gives up.
         # Expires -> FAILURE, never success. See module docstring.
-        self.declare_parameter("arrival_timeout_s", 3.0)
-        self.declare_parameter("prepare_timeout_s", 5.0)
-        self.declare_parameter("command_ack_timeout_s", 1.0)
-        self.declare_parameter("state_timeout_s", 0.5)
+        self.declare_parameter("arrival_timeout_s", setting("reset", "arrival_timeout_s"))
+        self.declare_parameter("prepare_timeout_s", setting("reset", "prepare_timeout_s"))
+        self.declare_parameter("command_ack_timeout_s", setting("reset", "command_ack_timeout_s"))
+        self.declare_parameter("state_timeout_s", setting("reset", "state_timeout_s"))
         self.declare_parameter("status_rate_hz", 5.0)
         self.declare_parameter("bias_file", "~/.config/ur_sharpa/teleop_bias.json")
 
@@ -343,9 +346,11 @@ class BiasNode(Node):
         self.handle_request(
             str(payload.get("request", "")).strip(),
             action_id=str(payload.get("action_id", "")).strip() or None,
+            target=payload.get("target"),
         )
 
-    def handle_request(self, request: str, action_id: str | None = None) -> bool:
+    def handle_request(self, request: str, action_id: str | None = None,
+                       target: dict | None = None) -> bool:
         """Start a homing run. Returns False and reports why when refused."""
         with self._lock:
             self._counts["requests"] += 1
@@ -367,6 +372,16 @@ class BiasNode(Node):
                                     f"expected one of {'/'.join(VALID_REQUESTS)}")
                 self.publish_status()
                 return False
+            if target is not None:
+                try:
+                    if request != REQUEST_HOME_BOTH:
+                        raise ValueError("episode target requires home_both")
+                    target = validate_target(target)
+                except (TypeError, ValueError) as exc:
+                    self._counts["rejected"] += 1
+                    self._record_result(request, PHASE_FAILED, str(exc))
+                    self.publish_status()
+                    return False
             if self._run is not None and self._run.phase in (
                     PHASE_PREPARING, PHASE_UR, PHASE_SHARPA, PHASE_VERIFY):
                 self._counts["rejected"] += 1
@@ -380,6 +395,7 @@ class BiasNode(Node):
                 action_id=action_id or uuid.uuid4().hex,
                 started_at=time.monotonic(),
                 phase=PHASE_PREPARING,
+                target=target,
                 detail="waiting for reset state and fresh hardware readiness",
             )
             self._run = run
@@ -400,7 +416,12 @@ class BiasNode(Node):
                 raise RuntimeError(
                     "no fresh /ur/state; cannot build a ramp without a start pose"
                 )
-            targets = self._load_bias_targets_locked() or both_home_joints(self.kinematics, seed=measured)
+            targets = (
+                {side: np.asarray(run.target[f"{side}_joint"], dtype=np.float64)
+                 for side in ("left", "right")}
+                if run.target is not None else
+                self._load_bias_targets_locked() or both_home_joints(self.kinematics, seed=measured)
+            )
             run.arm_target = targets
             left = interpolate(measured["left"], targets["left"], self.ur_steps)
             right = interpolate(measured["right"], targets["right"], self.ur_steps)
@@ -416,7 +437,11 @@ class BiasNode(Node):
                     "no fresh /sharpa/state; cannot prepare a safe hand hold"
                 )
             start = measured
-            run.hand_target = self._load_hand_bias_target_locked()
+            run.hand_target = (
+                np.asarray(run.target["left_hand_joint"] + run.target["right_hand_joint"],
+                           dtype=np.float64)
+                if run.target is not None else self._load_hand_bias_target_locked()
+            )
             run.hand_plan = interpolate(start, run.hand_target, self.sharpa_steps)
 
     def _prepare_locked(self, run: BiasRun) -> None:
@@ -722,6 +747,8 @@ class BiasNode(Node):
                 "node": "bias_node",
                 "active": active,
                 "request": run.request if run is not None else "",
+                "target_source": ("episode" if run is not None and run.target is not None else "bias"),
+                "target_episode": (run.target["episode"] if run is not None and run.target is not None else ""),
                 "action_id": run.action_id if run is not None else "",
                 "phase": run.phase if run is not None else PHASE_IDLE,
                 "detail": run.detail if run is not None else "",

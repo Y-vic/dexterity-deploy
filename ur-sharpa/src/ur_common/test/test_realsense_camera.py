@@ -8,6 +8,30 @@ import pytest
 from ur_common import drivers
 
 
+def test_zed_retrieve_failure_does_not_encode_previous_image():
+    camera = drivers.ZedEgoCamera()
+    camera.sl = SimpleNamespace(ERROR_CODE=SimpleNamespace(SUCCESS=0),
+                                VIEW=SimpleNamespace(LEFT=1))
+    camera.runtime = object()
+    camera.image = SimpleNamespace(get_data=lambda: pytest.fail("must not read stale pixels"))
+    camera.camera = SimpleNamespace(grab=lambda runtime: 0,
+                                    retrieve_image=lambda image, view: 17)
+    with pytest.raises(drivers.HardwareConnectionError, match="retrieve_image failed: 17"):
+        camera._grab_rgb()
+
+
+def test_camera_diagnostics_distinguishes_queue_losses():
+    camera = drivers._ThreadedCamera()
+    camera.dropped_raw_count = 2
+    camera.dropped_encoded_count = 3
+    camera.capture_error_count = 1
+    counters = camera.diagnostics()
+    assert counters["dropped_raw_count"] == 2
+    assert counters["dropped_encoded_count"] == 3
+    assert counters["capture_error_count"] == 1
+    assert counters["raw_queue_depth"] == counters["encoded_queue_depth"] == 0
+
+
 class _FakeFrame:
     def __init__(self, data=None):
         self._data = data
@@ -156,6 +180,10 @@ def test_threaded_camera_queues_frames_without_blocking_capture(monkeypatch):
 
     assert camera.capture_count == 8
     assert camera.encoded_count == 0
+    # Inference already has the newest capture while JPEG is still blocked.
+    stamp, raw = camera.read_raw_latest()
+    assert stamp > 0
+    np.testing.assert_array_equal(raw, np.full((2, 2, 3), 7, dtype=np.uint8))
     assert camera.dropped_raw_count == 0
     release_encode.set()
     deadline = time.monotonic() + 1.0

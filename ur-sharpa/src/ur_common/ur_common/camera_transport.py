@@ -16,12 +16,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .raw_camera import RAW_ENCODING, complete_bgr
+
 
 CAMERA_NAMES = ("ego", "left_wrist", "right_wrist")
 DEFAULT_PREFIX = "ur_sharpa_camera_v1"
-DEFAULT_SLOT_COUNT = 32
+DEFAULT_SLOT_COUNT = 64
 _MAGIC = b"USCAMV2\0"
 _FILE_HEADER = struct.Struct("<8sIIQ")
+_TAIL = struct.Struct("<Q")
+_TAIL_OFFSET = _FILE_HEADER.size - _TAIL.size
 _SLOT_HEADER = struct.Struct("<QQIB3x")
 
 
@@ -53,7 +57,9 @@ def _safe_prefix(prefix: str) -> str:
 
 class SharedCameraWriter:
     def __init__(self, prefix=DEFAULT_PREFIX, max_payload_bytes=4 * 1024 * 1024,
-                 directory="/dev/shm", slot_count=DEFAULT_SLOT_COUNT):
+                 directory="/dev/shm", slot_count=DEFAULT_SLOT_COUNT, reserve_space=False,
+                 *, names=CAMERA_NAMES):
+        self.names = tuple(_safe_prefix(name) for name in names)
         self.prefix = _safe_prefix(prefix)
         self.max_payload_bytes = int(max_payload_bytes)
         if self.max_payload_bytes <= 0:
@@ -64,10 +70,10 @@ class SharedCameraWriter:
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self._maps = {}
-        self._frame_ids = {name: 0 for name in CAMERA_NAMES}
+        self._frame_ids = {name: 0 for name in self.names}
         self._slot_size = _SLOT_HEADER.size + self.max_payload_bytes
         size = _FILE_HEADER.size + self.slot_count * self._slot_size
-        for name in CAMERA_NAMES:
+        for name in self.names:
             path = self.directory / f"{self.prefix}_{name}"
             descriptor, temporary_name = tempfile.mkstemp(
                 prefix=f".{self.prefix}_{name}.", dir=self.directory
@@ -76,6 +82,10 @@ class SharedCameraWriter:
             buffer = None
             try:
                 os.ftruncate(descriptor, size)
+                if reserve_space:
+                    # Reserve tmpfs pages now: ENOSPC is catchable here, whereas
+                    # touching an unbacked sparse mmap page can kill us (SIGBUS).
+                    os.posix_fallocate(descriptor, 0, size)
                 buffer = mmap.mmap(descriptor, size, access=mmap.ACCESS_WRITE)
                 _FILE_HEADER.pack_into(
                     buffer,
@@ -94,6 +104,7 @@ class SharedCameraWriter:
                     temporary_path.unlink()
                 except FileNotFoundError:
                     pass
+                self.close()
                 raise
             finally:
                 os.close(descriptor)
@@ -111,7 +122,7 @@ class SharedCameraWriter:
             data = b""
             timestamp = 0
         if len(data) > self.max_payload_bytes:
-            raise ValueError(f"{name} JPEG exceeds shared-memory capacity")
+            raise ValueError(f"{name} frame exceeds shared-memory capacity")
         frame_id = self._frame_ids[name] + 1
         sequence = frame_id * 2
         slot_index = (frame_id - 1) % self.slot_count
@@ -126,16 +137,10 @@ class SharedCameraWriter:
         _SLOT_HEADER.pack_into(
             buffer, slot_offset, sequence, timestamp, len(data), valid
         )
-        # Publish the new tail only after its slot is complete. Readers that
-        # race this assignment safely observe either the old or the new tail.
-        _FILE_HEADER.pack_into(
-            buffer,
-            0,
-            _MAGIC,
-            self.slot_count,
-            self.max_payload_bytes,
-            sequence,
-        )
+        # Do not pack_into the live header: struct clears the destination before
+        # filling its fields, exposing zero/partial metadata to other processes.
+        # Keep the configuration immutable and publish only the prepared tail.
+        buffer[_TAIL_OFFSET:_FILE_HEADER.size] = _TAIL.pack(sequence)
         self._frame_ids[name] = frame_id
 
     def close(self) -> None:
@@ -153,7 +158,13 @@ class SharedCameraWriter:
 
 
 class SharedCameraReader:
-    def __init__(self, prefix=DEFAULT_PREFIX, directory="/dev/shm"):
+    def __init__(self, prefix=DEFAULT_PREFIX, directory="/dev/shm", encoding="jpeg",
+                 *, names=CAMERA_NAMES, validate_payload=None):
+        if encoding not in ("jpeg", RAW_ENCODING) and validate_payload is None:
+            raise ValueError("unsupported shared camera encoding")
+        self.names = tuple(_safe_prefix(name) for name in names)
+        self._validate_payload = validate_payload or (complete_bgr if encoding == RAW_ENCODING else _complete_jpeg)
+        self.encoding = encoding
         self.prefix = _safe_prefix(prefix)
         self.directory = Path(directory)
         self._maps = {}
@@ -162,9 +173,9 @@ class SharedCameraReader:
         self._cache = {}
         self._cursors = {}
         self._pending_values = {
-            name: (0, b"", False) for name in CAMERA_NAMES
+            name: (0, b"", False) for name in self.names
         }
-        self.dropped_frames = {name: 0 for name in CAMERA_NAMES}
+        self.dropped_frames = {name: 0 for name in self.names}
 
     def _close_map(self, name):
         descriptor = self._maps.pop(name, None)
@@ -262,7 +273,7 @@ class SharedCameraReader:
                 return None
             payload_offset = slot_offset + _SLOT_HEADER.size
             data = os.pread(descriptor, size, payload_offset) if valid else b""
-            if valid and (len(data) != size or not _complete_jpeg(data)):
+            if valid and (len(data) != size or not self._validate_payload(data)):
                 time.sleep(0)
                 continue
             second_header = os.pread(
@@ -277,28 +288,35 @@ class SharedCameraReader:
         return None
 
     def _read_latest(self, name):
-        metadata = self._metadata(name)
-        if metadata is None:
-            return None
-        descriptor, config, latest_sequence = metadata
-        if latest_sequence == 0:
-            return 0, b"", False
-        cached = self._cache.get(name)
-        if cached is not None and cached[0] == latest_sequence:
-            return cached[1]
-        value = self._read_frame(descriptor, config, latest_sequence // 2)
-        if value is not None:
-            self._cache[name] = (latest_sequence, value)
-        return value
+        for attempt in range(4):
+            if attempt:
+                time.sleep(0)
+            # Refresh the tail as well as the slot: the ring may have wrapped,
+            # or a legacy writer may have been partway through a header update.
+            metadata = self._metadata(name)
+            if metadata is None:
+                continue
+            descriptor, config, latest_sequence = metadata
+            if latest_sequence == 0:
+                continue
+            cached = self._cache.get(name)
+            if cached is not None and cached[0] == latest_sequence:
+                return cached[1]
+            value = self._read_frame(descriptor, config, latest_sequence // 2)
+            if value is not None:
+                self._cache[name] = (latest_sequence, value)
+                # An explicitly invalid frame is authoritative; never replace
+                # it with a cached valid image or change a source timestamp.
+                return value
+        return (0, b"", False) if metadata is not None else None
 
-    @staticmethod
-    def _make_set(values):
+    def _make_set(self, values):
         values = {
             name: values.get(name) or (0, b"", False)
             for name in CAMERA_NAMES
         }
         return SharedCameraSet(
-            encoding="jpeg",
+            encoding=self.encoding,
             ego_timestamp_ns=values["ego"][0],
             ego=values["ego"][1],
             ego_valid=values["ego"][2],
@@ -316,11 +334,10 @@ class SharedCameraReader:
             return None
         return self._make_set(values)
 
-    def read_pending(self):
-        """Return every unread ring entry, with other views filled from latest."""
-
+    def read_entries(self):
+        """Drain validated (timestamp, stream name, value) entries without copying views."""
         events = []
-        for name in CAMERA_NAMES:
+        for name in self.names:
             metadata = self._metadata(name)
             if metadata is None:
                 continue
@@ -343,7 +360,12 @@ class SharedCameraReader:
             self._cursors[name] = latest_frame_id
         if not events:
             return []
-        events.sort(key=lambda event: (event[0], CAMERA_NAMES.index(event[1])))
+        events.sort(key=lambda event: (event[0], self.names.index(event[1])))
+        return events
+
+    def read_pending(self):
+        """Return every unread ring entry, with other views filled from latest."""
+        events = self.read_entries()
         frames = []
         for _, name, value in events:
             self._pending_values[name] = value
@@ -356,5 +378,5 @@ class SharedCameraReader:
         self._cache.clear()
         self._cursors.clear()
         self._pending_values = {
-            name: (0, b"", False) for name in CAMERA_NAMES
+            name: (0, b"", False) for name in self.names
         }
