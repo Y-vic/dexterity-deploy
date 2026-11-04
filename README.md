@@ -31,6 +31,9 @@ slice；本体适配器负责坐标变换、IK、命令发布和硬件保护。�
 [architecture.md](docs/architecture.md)。列出的必需 key 不能缺失，允许增加扩展 key；
 只有声明为 nullable 的值允许为 `None`。
 
+模型启动、输入输出声明及 root/camera EEF 的后续配置设计见
+[推理接口与部署配置设计](docs/inference_config.md)（尚未接入运行时）。
+
 ## 验证 interface
 
 ```bash
