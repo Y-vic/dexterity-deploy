@@ -129,7 +129,7 @@ ssh:
 
 直连时省略 ssh。SSH 模式下 remote_host 和 remote_port 是远端访问的模型服务地址；启动时应检查其与 URL 指向一致。该结构映射到现有 ServerConfig 的扁平 SSH 字段。连接配置不重复声明观测或动作格式，以服务 metadata 为准。
 
-远端 repo_root、asset_root、task_config_root、env_file 继续沿用 [模型服务配置](../ur-sharpa/config/README.md)，用于发现任务和启动 launcher；标定矩阵也不混入连接配置。
+远端 repo_root、asset_root、task_config_root、env_file 继续沿用 [模型服务配置](../config/README.md)，用于发现任务和启动 launcher；标定矩阵也不混入连接配置。
 
 ## 服务生命周期与配置发布
 

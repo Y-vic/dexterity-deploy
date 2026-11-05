@@ -34,26 +34,8 @@ Interface 不定义任何固定的 robot base。EEF 只有 `eef_def`，默认
 - `action_ik`：把 interface 的 absolute EEF slice 转成本体 joint plan。
 - `action_execute`：按 frequency 下发 plan、处理 ACK/TTL/safe-stop，并发布一次
   匹配的 `execution_done`。
-- PND 的 TCP/RTP/DDS、Adam/SharpA controller；UR 的 RTDE/Wave SDK。
+- UR RTDE 与 SharpA Wave SDK 硬件驱动。
 - dashboard、recording、replay 和真机安全开关。
-
-## PND deploy nodes
-
-| Node | 唯一职责 |
-| --- | --- |
-| `obs_node` | PND robot state/tactile 经 TCP 发到 workstation。 |
-| `actor_node` | 接收 workstation command，检查 TTL，写 Adam/SharpA controller。 |
-| `robot_states` / `tactile` / `vision` | TCP/RTP 解包为 workstation ROS facts。 |
-| `obs_sync` | 对齐 facts 并持续向 policy client 七路 buffer 写入。 |
-| `policy_client` | 唯一 server client；metadata、buffers、sync fetch 和 done gate。 |
-| `action_ik` | absolute EEF slice 到 Adam joint plan；透传 action 身份。 |
-| `action_execute` | 唯一 action 出口；执行 joint plan 并发布 `execution_done`。 |
-| `dashboard` | 只观测状态，不参与调度。 |
-| `replay` | 代替 policy client 提供离线 plan，不参与 server 通信。 |
-
-PND 的异步执行模式保持原有限制。所有 model 使用同一个 workstation launch；模型差异由
-metadata、action 和 server policy adapter 表达。
-
 
 ## UR 工作台
 
@@ -75,4 +57,4 @@ UR 的 `actor_ik_node` 合并了上图中的规划和调度职责，Policy 与 R
 ACK 不作为每步串行等待门。保护、HIL 交还和录制握手也在 Actor 侧接入。
 录制器保存原始消息、相机视频、触觉及结构化时间轴，执行与采集质量分别报告。
 
-详细启动方式、默认目录、日志和配置见 [UR README](../ur-sharpa/README.md)。
+详细启动方式、默认目录、日志和配置见 [UR README](workbench.md)。

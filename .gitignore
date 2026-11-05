@@ -1,6 +1,14 @@
-deps/cache/
+# Machine-local dependencies, data, and all generated output.
+/runtime/
+/data/*
+!/data/README.md
+/external/*
+!/external/README.md
+/config/model_servers.local.json
+/config/*.bak
 __pycache__/
 *.pyc
+*.egg-info/
 .venv/
 .pytest_cache/
 .ruff_cache/
@@ -8,54 +16,7 @@ __pycache__/
 htmlcov/
 .tmp/
 .codex/
-.codex_me/
-build/
-install/
-log/
-*.egg-info/
-# Canonical colcon output roots for the UR SharpA workspace.
-ur-sharpa/build/
-ur-sharpa/install/
-ur-sharpa/log/
-ur-sharpa/build-clean/
-ur-sharpa/install-clean/
-ur-sharpa/log-clean/
-ur-sharpa/build-*/
-ur-sharpa/install-*/
-ur-sharpa/log-*/
-ur-sharpa/build_*/
-ur-sharpa/install_*/
-ur-sharpa/log_*/
-ur-sharpa/episodes/
-ur-sharpa/demo_recordings/
-ur-sharpa/rosbag2_*/
-ur-sharpa/core
-ur-sharpa/core.*
-build-humble/
-install-humble/
-pnd-sharpa/deploy/runs/
-pnd-sharpa/deploy/runtime/
-
-# External/robot SDK payloads are installed separately on each machine.
-ur-sharpa/external/*
-!ur-sharpa/external/README.md
-**/external/**/sdk/
-**/sharpa-wave-sdk/
-**/sharpa-manus-sdk/
-pnd-sharpa/src/noitom_node/vendor/
-
-# Keep the AstrBot container directory, but never vendor the AstrBot repository.
-/astribot-sharpa/AstrBot/
-
-# Workstation-specific remote model paths.
-ur-sharpa/config/model_servers.local.json
-
-# Local investigation outputs and machine-specific experiment snapshots.
-/.work/ros_logs/
-/.work/training_data_audit/
-/.work/deploy_v5/reports/
-/.work/deploy_v5/stopped_snapshots/
-/.work/deploy_v5/*_fetched.*
-/.work/deploy_v5/*.pre_*_bak
-/ur-sharpa/.work/
-/ur-sharpa/config/*.bak
+.claude/
+core
+core.*
+/src/ur_common/ur_common/ikfastpy/build/

@@ -1,10 +1,9 @@
 # System dependencies (documented, not automated)
 
-Not everything can be shipped in `deps/cache/`. The following must be
-installed via the OS package manager on each machine. `deps/fetch.sh` does
-NOT do this — it fails cleanly if these are missing, so you know to install.
+System prerequisites for the UR + SharpA workstation. Install these separately;
+the project build does not modify system packages.
 
-## Common (both robots + workstation)
+## ROS and Python
 
 - Ubuntu 22.04 (or the exact version confirmed against the machine you
   intend to reproduce; note here when it changes).
@@ -15,15 +14,15 @@ NOT do this — it fails cleanly if these are missing, so you know to install.
 - Build and run ROS with the system Python 3.10 after sourcing only
   `/opt/ros/humble/setup.bash`; a Conda 3.8 environment shadows ROS Python
   modules and breaks `ament_package`/`rosidl_adapter`.
-- `curl`, `unzip`, `tar` (for `fetch.sh`).
+- `curl`, `unzip`, `tar` for SDK archives.
 
-## UR host only
+## Hardware runtime
 
 - CUDA runtime (for ZED). Pin the exact minor version used at the time you
   build ZED SDK.
 - `libusb-1.0-0-dev` (RTDE communication).
 - Vendor AE01 Avatar SDK, its Python 3.10 dependencies (including Zenoh), and
-  `pyzmq` for Vive input. See `ur-sharpa/scripts/install_ae01_python.sh`.
+  `pyzmq` for Vive input. See `scripts/install_ae01_python.sh`.
 - FFmpeg with the selected encoder; the workbench defaults to `hevc_nvenc`
   and needs a compatible NVIDIA driver/GPU. Policy inference itself stays remote.
 - `ssh`, `tmux`, and `curl` for remote policy lifecycle; remote profiles start
@@ -32,21 +31,7 @@ NOT do this — it fails cleanly if these are missing, so you know to install.
   `pinocchio_python_path` and `pinocchio_library_path` arguments. The existing
   compiled IKFast binding targets system Python 3.10.
 
-## PND robot only
+## 数据与运行目录
 
-- CUDA runtime (for ZED + WebRTC encoder).
-- `ffmpeg` >= 5.x (RTP push).
-- CycloneDDS or the DDS impl PND lowstate expects — check the SDK before
-  installing.
-
-## PND workstation only
-
-- CUDA runtime (for policy inference + dashboard).
-- `ffmpeg` >= 5.x (RTP receive).
-
-## Recording disk
-
-Both robots mount a dedicated NVMe at `/mnt/recording` (or whatever the
-`recording_root` launch arg points to). See each embodiment's `README.md`
-for the exact mount script. This is NOT installed by `deps/fetch.sh` because
-disk layout is intrinsically per-machine.
+采集默认写入 `data/episodes`，Demo 写入 `data/demo_recordings`，构建与日志写入 `runtime`。
+厂商 SDK 放在 `external`，见 [安装说明](../external/README.md)。

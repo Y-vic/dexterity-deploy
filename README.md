@@ -1,55 +1,56 @@
-# SharpA interface and embodiment deploy
+# UR + SharpA Deploy
 
-本 repo 定义 SharpA policy server 与机器人之间的共享 dict 接口，并为 PND、UR
-保留各自的 ROS、IK 和硬件实现。
+双 UR5＋SharpA 工作台。数采、远端 Policy、Replay 共用同一套 ROS 2 Humble 节点。
+本仓库只维护这套设备；PND、Astribot 和旧实验代码已归档移出。
+
+## 目录
 
 ```text
 Deploy/
-├── assets/          # 共用 URDF、mesh 和 MuJoCo 资源
-├── interface/       # schema、validator、transport、buffers、execution gate
-├── pnd-sharpa/      # PND ROS、Adam IK、SharpA、TCP/RTP
-├── ur-sharpa/       # UR 工作台、采集、Replay、SSH 远端推理
-└── docs/
+├── src/          # ROS 节点、共享运动学、消息；网页资源随 ur_common 打包
+├── interface/    # 远端模型协议、校验、观测缓冲与执行门
+├── config/       # 硬件保护、远端模型配置
+├── scripts/      # 构建、启动及维护工具
+├── external/     # 本机厂商 SDK 与 Python 绑定（不提交二进制）
+├── docs/         # 架构、操作、协议与安装说明
+├── data/         # episodes 与 demo_recordings（不提交采集数据）
+└── runtime/      # build、install、log、配置记忆、缓存与临时文件（不提交）
 ```
 
-UR 的当前入口是 [UR Deploy 工作台](ur-sharpa/README.md)：数采、Policy、Replay 共用
-一套硬件节点。Policy 选择 SSH BAAI 或 4090（`ps`），模型位置尚未配置，参见
-[模型服务配置](ur-sharpa/config/README.md)。HIL 核心保留、默认关闭，顶部入口隐藏。
-PND 的独立部署实现保持原有结构。
-
-## 共享协议
-
-`policy_client` 负责 server metadata、观测 buffers、session/request 身份及有效执行
-slice；本体适配器负责坐标变换、IK、命令发布和硬件保护。模型内部的 relative EEF
-必须由服务端转换为 `eef_def="absolute"` 后返回。
-
-`execution.rtc` 是现有协议的提前 fetch 步数：0 表示完成后请求，正数表示还剩指定步数
-时预取下一次推理。它不表示向模型拼接冻结前缀；本次 UR 更新没有增加本地 RTC 推理或
-修改模型训练假设。同一时间最多一个推理请求在途，停止/切换后的过期结果不执行。
-
-完整 dict 定义见 [interface_contract.md](docs/interface_contract.md)，节点分工见
-[architecture.md](docs/architecture.md)。列出的必需 key 不能缺失，允许增加扩展 key；
-只有声明为 nullable 的值允许为 `None`。
-
-模型启动、输入输出声明及 root/camera EEF 的后续配置设计见
-[推理接口与部署配置设计](docs/inference_config.md)（尚未接入运行时）。
-
-## 验证 interface
+## 构建与启动
 
 ```bash
-PYTHONPATH=interface python3 -m pytest interface/test -q
+cd /home/yns/deploy
+bash scripts/build.sh --executor sequential
+bash scripts/start.sh
 ```
 
-Python 入口：
+打开 <http://127.0.0.1:8088/>。启动会连接硬件，不会自动开始采集、Policy 或 Replay。
+启动前应停止已有实例，避免重复占用硬件和端口。仅检查参数：
 
-```python
-from sharpa_interface.server import (
-    PolicyInputBuffers,
-    ServerClient,
-    SyncExecutionGate,
-    parse_policy_action,
-)
+```bash
+bash scripts/start.sh --show-args
 ```
 
-URDF、mesh 和 MuJoCo 资源放在 `assets/`；本体目录通过相对软链接引入公共
-描述 package。机器人 SDK 安装方式见各本体的说明。
+默认数据位于 `data/episodes`，Demo 位于 `data/demo_recordings`，执行日志位于
+`runtime/log/execution`。`source scripts/setup_env.sh` 将 ROS 日志、临时文件、缓存和
+操作设置统一放到 `runtime`，并加载本仓库的 `runtime/install`。
+
+- [工作台操作](docs/workbench.md)
+- [架构](docs/architecture.md) · [文件组织与迁移](docs/layout.md)
+- [系统依赖](docs/system_deps.md) · [厂商 SDK](external/README.md)
+- [远端模型配置](config/README.md) · [协议](docs/interface_contract.md)
+- [四个 sim-real DFM checkpoint 的部署与测试](docs/dfm_policy.md)
+- [推理配置设计（未接入运行时）](docs/inference_config.md)
+
+## 验证
+
+```bash
+source scripts/setup_env.sh
+python3 -m pytest interface/test src -q -o cache_dir=runtime/cache/pytest --basetemp=runtime/tmp/pytest
+node src/nodes/dashboard_node/test/workbench_ui_test.cjs
+node src/nodes/dashboard_node/test/workbench_remote_ui_test.cjs
+```
+
+模型在 BAAI 或 4090（SSH 别名 `ps`）运行，本机不存放模型 checkpoint。
+HIL 核心保留、默认关闭，网页隐藏 HIL 顶部入口。

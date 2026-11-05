@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from .serialization import packb, unpackb
 
@@ -748,9 +749,13 @@ class SharpaV3PolicyClient:
                 f"policy metadata is {type(metadata).__name__}, expected dict"
             )
         self.metadata = metadata
+        self.owner_token = uuid4().hex if metadata.get("session_owner_token_required") is True else ""
+        infer_url = self.infer_url
+        if self.owner_token:
+            infer_url += "?owner_token=" + self.owner_token
         try:
             self.ws = SimpleWebSocket(
-                self.infer_url,
+                infer_url,
                 timeout_s=self.timeout_s,
                 ssh_host=self.ssh_host,
                 ssh_remote_host=self.ssh_remote_host,
@@ -788,7 +793,8 @@ class SharpaV3PolicyClient:
         response = _request_msgpack_http(
             self.reset_url,
             "POST",
-            {"session_id": session_id, "request_id": request_id},
+            {"session_id": session_id, "request_id": request_id,
+             **({"owner_token": self.owner_token} if self.owner_token else {})},
             timeout_s=self.timeout_s,
             ssh_host=self.ssh_host,
             ssh_remote_host=self.ssh_remote_host,
