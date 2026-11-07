@@ -30,6 +30,7 @@ def catalog_payload(*, launchable=True):
                         "id": "groot_n17_baseline",
                         "run_id": "full-run-id",
                         "checkpoint_path": "/remote/checkpoint",
+                        "prompt": "pick this checkpoint",
                         "variant": "n17_baseline",
                         "stage": "posttrain",
                         "status": "complete",
@@ -169,7 +170,9 @@ def test_checked_in_profiles_define_baai_and_ps_code_and_asset_roots():
     profiles, default = load_server_profiles(path)
 
     assert default == "baai"
-    assert set(profiles) == {'baai','4090'}
+    assert set(profiles) == {'baai','ur','4090'}
+    assert profiles['ur'].local is True
+    assert profiles['ur'].ssh_host == ''
     assert profiles['baai'].repo_root == profiles['4090'].repo_root == ''
     runner = FakeRunner(catalog_payload())
     manager = RemoteModelManager(remote_root="/remote", profile_path=path, runner=runner)
@@ -264,6 +267,44 @@ def test_stop_kills_managed_server_and_releases_fixed_port():
     assert not any("pgrep" in command[-1] for command, _ in runner.commands)
 
 
+def test_stop_waits_for_port_release_before_immediate_model_reload():
+    import threading
+
+    cleanup_requested = threading.Event()
+    release_port = threading.Event()
+
+    class DelayedExitRunner(FakeRunner):
+        def __call__(self, command, timeout_s):
+            remote = command[-1]
+            if "tmux kill-session" in remote and self.launched_port is not None:
+                cleanup_requested.set()
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if remote.startswith("(exec 3<>/dev/tcp") and cleanup_requested.is_set():
+                if release_port.is_set() and self.launched_port is not None:
+                    self.in_use_ports.discard(self.launched_port)
+                    self.launched_port = None
+            return super().__call__(command, timeout_s)
+
+    runner = DelayedExitRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
+    manager.start("ur_pick_place_push", "full-run-id")
+    wait_phase(manager, "running")
+    manager.stop()
+    try:
+        assert cleanup_requested.wait(1.0)
+        assert manager.snapshot()["phase"] == "stopping"
+        with pytest.raises(ModelManagerError, match="停止"):
+            manager.start("ur_pick_place_push", "full-run-id")
+        release_port.set()
+        wait_phase(manager, "stopped")
+        manager.start("ur_pick_place_push", "full-run-id")
+        wait_phase(manager, "running")
+        assert runner.launch_count == 2
+    finally:
+        release_port.set()
+        manager.close()
+
+
 def test_unconfigured_default_does_not_contact_remote_host():
     runner = FakeRunner(catalog_payload())
     manager = RemoteModelManager(runner=runner)
@@ -336,4 +377,87 @@ def test_delayed_notification_cannot_regress_model_status():
     wait_phase(manager, 'stopped')
     manager._notify(starting)
     assert events[-1]['phase'] == 'stopped'
+    manager.close()
+
+
+def test_checkpoint_prompt_and_path_are_published_for_exact_selected_machine():
+    runner = FakeRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
+    state = manager.start("ur_pick_place_push", "full-run-id", server_id="default")
+    assert state["prompt"] == "pick this checkpoint"
+    assert state["checkpoint_path"] == "/remote/checkpoint"
+    wait_phase(manager, "running")
+    manager.stop()
+    wait_phase(manager, "stopped")
+    assert manager.snapshot()["prompt"] == ""
+    assert manager.snapshot()["run_id"] == ""
+    assert manager.snapshot()["checkpoint_path"] == ""
+    manager.close()
+
+
+def test_stale_machine_start_and_catalog_are_rejected_before_launch():
+    runner = FakeRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root="/remote", runner=runner)
+    with pytest.raises(ModelManagerError, match="机器已切换"):
+        manager.start("ur_pick_place_push", "full-run-id", server_id="other")
+    with pytest.raises(ModelManagerError, match="机器已切换"):
+        manager.catalog(server_id="other")
+    assert runner.commands == []
+    manager.close()
+
+
+def test_local_profile_executes_catalog_locally_and_resolves_only_own_task_prompt(tmp_path):
+    (tmp_path / "scripts/deploy/dfm").mkdir(parents=True)
+    (tmp_path / "scripts/deploy/dfm/launch.sh").write_text("exit 0\n")
+    (tmp_path / "checkpoint").mkdir()
+    tasks = tmp_path / "tasks"
+    for name, prompt, override in (("ur_duck", "Duck default", "Duck checkpoint"), ("ur_button", "Button default", None), ("ur_invalid", "Other default", "")):
+        path = tasks / name
+        path.mkdir(parents=True)
+        run = {"id": name, "run_id": name, "model": "dfm", "checkpoint": "checkpoint", "status": "complete", "deployment": {"eligible": True}}
+        if override is not None:
+            run["prompt"] = override
+        (path / "task.json").write_text(json.dumps({"schema": "sharpa.deploy.task_config.v2", "task": {"id": name, "prompt": prompt}, "runs": [run]}))
+    profile = ServerProfile.from_mapping("ur", {"label": "UR", "local": True, "repo_root": str(tmp_path), "task_config_root": str(tasks)})
+    calls = []
+    def runner(command, timeout_s):
+        calls.append(command)
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout_s)
+    manager = RemoteModelManager(profiles={"ur": profile}, default_server="ur", runner=runner)
+    catalog = manager.catalog(server_id="ur")
+    runs = {task["name"]: task["runs"][0] for task in catalog["tasks"]}
+    assert runs["ur_duck"]["prompt"] == "Duck checkpoint"
+    assert runs["ur_button"]["prompt"] == "Button default"
+    assert runs["ur_invalid"]["prompt"] == ""
+    assert not runs["ur_invalid"]["launchable"]
+    assert "任务文本" in runs["ur_invalid"]["disabled_reason"]
+    assert catalog["server"]["local"] is True
+    assert calls[0][:2] == ["/bin/bash", "-lc"]
+    assert manager.snapshot()["local"] is True
+    manager.close()
+
+
+def test_native_model_uses_native_health_endpoint_and_transport_status():
+    payload = catalog_payload()
+    payload["models"] = ["dfm_flow"]
+    payload["tasks"][0]["runs"][0]["model"] = "dfm_flow"
+    runner = FakeRunner(payload)
+    manager = RemoteModelManager(remote_root="/remote", runner=runner, startup_timeout_s=2.0)
+    state = manager.start("ur_pick_place_push", "full-run-id")
+    assert state["policy_transport"] == "dfm_native"
+    wait_phase(manager, "running")
+    health = [command[-1] for command, _ in runner.commands if command[-1].startswith("curl ")]
+    assert health and all("/health " in command for command in health)
+    manager.stop()
+    wait_phase(manager, "stopped")
+    manager.close()
+
+
+@pytest.mark.parametrize("identity", [{"expected_prompt": "outdated instruction"}, {"expected_checkpoint": "/outdated/checkpoint"}])
+def test_changed_displayed_checkpoint_or_prompt_is_rejected_before_launch(identity):
+    runner = FakeRunner(catalog_payload())
+    manager = RemoteModelManager(remote_root="/remote", runner=runner)
+    with pytest.raises(ModelManagerError, match="文本已变化"):
+        manager.start("ur_pick_place_push", "full-run-id", server_id="default", **identity)
+    assert not any("tmux new-session" in command[-1] for command, _ in runner.commands)
     manager.close()

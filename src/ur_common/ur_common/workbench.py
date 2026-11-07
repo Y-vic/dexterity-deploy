@@ -43,9 +43,10 @@ def workbench_snapshot(operator, deployment=None, *, switchable=False):
 
 
 class WorkbenchHTTP:
-    def __init__(self, snapshot, action, preview, preferences=None):
+    def __init__(self, snapshot, action, preview, preferences=None, *, shutdown=None):
         self.snapshot, self.action, self.preview = snapshot, action, preview
         self.preferences = preferences or WorkbenchPreferences()
+        self.shutdown = shutdown
 
     def handle(self, handler):
         url = urlsplit(handler.path)
@@ -63,7 +64,10 @@ class WorkbenchHTTP:
                 kind = "text/html" if name.endswith(".html") else "text/css" if name.endswith(".css") else "text/javascript"
                 send((ASSETS / name).read_bytes(), content_type=kind + "; charset=utf-8")
             elif handler.command == "GET" and path == "/api/workbench/status":
-                send(self.snapshot())
+                value = self.snapshot()
+                if self.shutdown is not None:
+                    value = {**value, 'shutdown': self.shutdown.snapshot()}
+                send(value)
             elif handler.command == "GET" and path == "/api/workbench/preferences":
                 send(self.preferences.read())
             elif handler.command == "GET" and path == "/api/workbench/directories":
@@ -77,14 +81,22 @@ class WorkbenchHTTP:
                     send({"error": "画面未连接或已过期"}, code=503)
                 else:
                     send(frame[0], content_type="image/jpeg", headers={"X-Source-Timestamp-Ns": frame[1]})
-            elif handler.command == "POST" and path in {"/api/workbench/action", "/api/workbench/preferences", "/api/workbench/directories"}:
+            elif handler.command == "POST" and path in {"/api/workbench/action", "/api/workbench/preferences", "/api/workbench/directories", "/api/workbench/shutdown"}:
                 length = int(handler.headers.get("Content-Length", 0))
                 if not 0 < length <= 8192:
                     raise ValueError("请求大小无效")
                 payload = json.loads(handler.rfile.read(length))
                 if not isinstance(payload, dict):
                     raise ValueError("请求必须是对象")
-                if path.endswith("/directories"):
+                if path.endswith('/shutdown'):
+                    if payload != {'action': 'killed'}:
+                        raise ValueError('退出操作必须是 killed')
+                    if self.shutdown is None:
+                        raise RuntimeError('当前启动入口不支持退出 ROS')
+                    send(self.shutdown.request(), code=202)
+                elif self.shutdown is not None and self.shutdown.active():
+                    raise RuntimeError('ROS 正在退出，请等待完成')
+                elif path.endswith("/directories"):
                     send(create_directory(payload.get("parent"), payload.get("name")))
                 elif path.endswith("/preferences"):
                     send(self.preferences.update(payload))

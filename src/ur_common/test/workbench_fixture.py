@@ -101,7 +101,20 @@ def snapshot():
     state['mode_switch'] = {'allowed': not (c.get('ur_state') in (2,3,4) or c.get('sharpa_state') in (1,2,4) or c.get('execution_dry_run') or c.get('execution_paused') or r.get('recording') or r.get('saving')), 'reason': '停止执行并等待保存后可以切换'}
     return state
 
-http=WorkbenchHTTP(snapshot,action,Preview(),WorkbenchPreferences(root/'prefs.json'))
+class Shutdown:
+    def snapshot(self): return state.get('shutdown', {'phase': 'idle', 'detail': ''})
+    def active(self): return self.snapshot()['phase'] in {'stopping', 'exiting'}
+    def request(self):
+        if state.get('reject_shutdown'):
+            raise RuntimeError('退出测试拒绝')
+        if not self.active():
+            commands.append({'action': 'killed'})
+            state['shutdown'] = {'phase': 'stopping', 'detail': '正在保存并退出 ROS…'}
+            threading.Timer(.4, lambda: state.update(shutdown={'phase': 'exiting', 'detail': '正在退出 ROS…'})).start()
+            threading.Timer(1.2, lambda: state.update(status_error=True)).start()
+        return {'accepted': True, **self.snapshot()}
+
+http=WorkbenchHTTP(snapshot,action,Preview(),WorkbenchPreferences(root/'prefs.json'), shutdown=Shutdown())
 class Handler(BaseHTTPRequestHandler):
     def log_message(self,*_): pass
     def send(self,value):
@@ -111,8 +124,8 @@ class Handler(BaseHTTPRequestHandler):
         url=urlsplit(self.path); query=parse_qs(url.query)
         if url.path=='/test/commands':self.send(commands)
         elif url.path=='/test/paths':self.send({'root':str(root),'dataset':str(root/'dataset')})
-        elif url.path=='/api/servers':self.send({'selected':state['model']['server_id'],'servers':[{'id':'baai','label':'BAAI'},{'id':'4090','label':'4090'}]})
-        elif url.path=='/api/models':self.send({'tasks':[{'name':'offline-demo','prompt':'离线界面验证','runs':[{'model':'remote','run_id':'fixture','id':'fixture','launchable':True}]}]})
+        elif url.path=='/api/servers':self.send({'selected':state['model']['server_id'],'servers':[{'id':'baai','label':'BAAI'},{'id':'ur','label':'UR (4090D)'},{'id':'4090','label':'PS (4090)'}]})
+        elif url.path=='/api/models':self.send({'server':{'id':query.get('server_id',[state['model']['server_id']])[0]},'configured':True,'tasks':[{'name':'offline-demo','label':'离线任务','prompt':'默认离线任务文本','runs':[{'model':'remote','run_id':'fixture','id':'fixture','prompt':'This checkpoint has its own instruction.','checkpoint_path':'/offline/checkpoint','launchable':True}]}]})
         elif url.path=='/api/reference/config':self.send({'root':str(root/'dataset')})
         elif url.path=='/api/reference/episodes':
             dataset = Path(query['root'][0])
@@ -136,15 +149,15 @@ class Handler(BaseHTTPRequestHandler):
                 else:state[key]=value
             self.send({'ok':True});return
         if self.path=='/test/restart':
-            http=WorkbenchHTTP(snapshot,action,Preview(),WorkbenchPreferences(root/'prefs.json'))
+            http=WorkbenchHTTP(snapshot,action,Preview(),WorkbenchPreferences(root/'prefs.json'), shutdown=Shutdown())
             state['recording']['recording_root'] = RecordingPreferences(root/'recording.json').read(str(root/'captures'))
             self.send({'ok':True});return
         if urlsplit(self.path).path=='/api/reference/close':self.send({'ok':True});return
         if self.path=='/api/server/select':
             selected=payload['server_id']
-            state['model'].update(server_id=selected,server_label='BAAI' if selected=='baai' else '4090',ssh_host='BAAI' if selected=='baai' else 'ps')
+            state['model'].update(server_id=selected,server_label={'baai':'BAAI','ur':'UR (4090D)','4090':'PS (4090)'}[selected],ssh_host={'baai':'BAAI','ur':'','4090':'ps'}[selected],local=selected=='ur',prompt='',task='',task_id='',run_id='')
         if self.path=='/api/model/start':
-            state['model'].update(phase='running',model='remote',task=payload['task'],run_id=payload['run_id'])
+            state['model'].update(phase='running',model='remote',task=payload['task'],task_id=payload['task'],run_id=payload['run_id'],prompt='This checkpoint has its own instruction.')
         if self.path=='/api/model/stop':state['model']['phase']='stopped'
         if self.path=='/api/replay':state['replay']={**payload,'state':'ready','row_count':120}
         if self.path=='/api/replay/preview/start':state['control']['execution_dry_run']=True

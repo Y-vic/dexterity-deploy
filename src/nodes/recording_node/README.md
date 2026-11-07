@@ -8,7 +8,7 @@
 
 部署网页的 D435/D435i Demo 录制是独立服务，保存原始 ROS bag、RGB 和十指信息叠加视频，新相机仅启用 RGB。启动参数、文件格式和指标定义见 [DEMO.md](DEMO.md)。
 
-HIL rollout 使用本数采节点，与 D435 Demo 录制独立。部署时开启 `auto_record_rollout` 等待页面选择：HIL 自动采集，Policy 默认不采集、可选择保存，Replay 不触发采集。订阅 `/hil/rollout`，正式执行前创建 sample 并确认就绪，暂停／停止／执行故障后自动保存，预览不录制。默认目录为 `/home/yns/deploy/data/episodes`，可用 `recording_root` 启动参数指定，或在工作台“数据保存”输入／粘贴路径后应用，也可点击“选择目录”浏览主机文件系统并新建文件夹；采集启动、录制、保存期间可先选择，结束后再应用；页面修改由数采节点确认后原子保存到 `runtime/config/ur_sharpa/recording.json`（设置 `XDG_CONFIG_HOME` 时使用该目录）；重启默认恢复上次成功应用的目录，显式 `recording_root` 启动参数优先。未应用的输入及被拒绝的请求不会覆盖记忆，记忆写入失败会拒绝目录修改。人工接管和策略交还不会拆分 sample。该模式忽略手动 start/stop/discard 命令，由执行生命周期统一管理；HIL 的失败按钮在保存完成后按 rollout ID 将对应数据移到 `fail/`，保存后仍支持原有分类操作。
+HIL rollout 使用本数采节点，与 D435 Demo 录制独立。部署时开启 `auto_record_rollout` 等待页面选择：HIL 自动采集，Policy 默认不采集、可选择保存，Replay 不触发采集。订阅 `/hil/rollout`，正式执行前创建 sample 并确认就绪，暂停／停止／执行故障后自动保存，预览不录制。默认目录为 `/home/yns/deploy/data/episodes`，可用 `recording_root` 启动参数指定，或在工作台“数据保存”输入／粘贴路径后应用，也可点击“选择目录”浏览主机文件系统并新建文件夹，Policy 的“保存推理数据”旁也可直接打开“保存目录”，并显示数采节点确认的 UR 路径（推理机器为 PS／BAAI 时仍保存到 UR）；采集启动、录制、保存期间可先选择，结束后再应用；页面修改由数采节点确认后原子保存到 `runtime/config/ur_sharpa/recording.json`（设置 `XDG_CONFIG_HOME` 时使用该目录）；重启默认恢复上次成功应用的目录，显式 `recording_root` 启动参数优先。未应用的输入及被拒绝的请求不会覆盖记忆，记忆写入失败会拒绝目录修改。人工接管和策略交还不会拆分 sample。该模式忽略手动 start/stop/discard 命令，由执行生命周期统一管理；HIL 的失败按钮在保存完成后按 rollout ID 将对应数据移到 `fail/`，保存后仍支持原有分类操作。
 
 rollout 复用以下所有数采字段和文件，在 `data[].metadata` 增加 `is_hil`，并在 `timeline/clock.npz` 增加 `is_hil[T] bool`。HIL 标记来自同一成功 SDK 命令的 `HandStateFrame.is_hil`，与 `q_cmd` 同步；无效行标 false，需要结合原有 `q_cmd_valid` 判断。rollout 接受 Actor（source=3）的完整双手动作，普通示教仍只接受 AE01（source=2）。`hand_action_source/q_cmd_source` 字段继续记录真实来源，其余字段、维度、视频编码和触觉选项沿用普通数采。
 

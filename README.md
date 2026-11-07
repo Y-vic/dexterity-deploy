@@ -40,17 +40,32 @@ bash scripts/start.sh --show-args
 - [架构](docs/architecture.md) · [文件组织与迁移](docs/layout.md)
 - [系统依赖](docs/system_deps.md) · [厂商 SDK](external/README.md)
 - [远端模型配置](config/README.md) · [协议](docs/interface_contract.md)
-- [四个 sim-real DFM checkpoint 的部署与测试](docs/dfm_policy.md)
+- [八组黄鸭放盘 DFM checkpoint 的部署与测试](docs/dfm_policy.md)
 - [推理配置设计（未接入运行时）](docs/inference_config.md)
 
 ## 验证
 
+网页测试需要 Node.js 22 或以上；UR 下例使用已安装的 Node.js 24。
+
 ```bash
 source scripts/setup_env.sh
 python3 -m pytest interface/test src -q -o cache_dir=runtime/cache/pytest --basetemp=runtime/tmp/pytest
-node src/nodes/dashboard_node/test/workbench_ui_test.cjs
-node src/nodes/dashboard_node/test/workbench_remote_ui_test.cjs
+UR_TEST_NODE=/home/yns/.nvm/versions/node/v24.20.0/bin/node
+"$UR_TEST_NODE" src/nodes/dashboard_node/test/workbench_ui_test.cjs
+"$UR_TEST_NODE" src/nodes/dashboard_node/test/workbench_remote_ui_test.cjs
 ```
 
-模型在 BAAI 或 4090（SSH 别名 `ps`）运行，本机不存放模型 checkpoint。
+ROS Python 3.10 会跳过原生 DFM 测试；在安装了 `pytest` 的隔离模型环境中另外运行：
+
+```bash
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 \
+  PYTHONPATH="$PWD/runtime/dfm-source:$PWD/interface:$PWD/scripts" \
+  runtime/venvs/dfm-serving/bin/python -m pytest \
+  interface/test/test_dfm_native.py interface/test/test_dfm_deployment.py \
+  interface/test/test_dfm_validation.py -q
+```
+
+模型可在 BAAI、UR 本机 (4090D) 或额外的 PS (4090，SSH alias `ps`) 运行；页面按机器、任务、checkpoint 选择。
+DFM 使用 ROS Python 3.10 轻量客户端、隔离 Python 3.12 IPC worker 与原生 InferenceClient/InferenceServer，
+在单模型线程完成加载、两次预热和预测；接口 revision、提案重置及完整请求计时见 [部署文档](docs/dfm_policy.md)。
 HIL 核心保留、默认关闭，网页隐藏 HIL 顶部入口。

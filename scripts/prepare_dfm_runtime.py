@@ -18,7 +18,7 @@ def main(argv=None):
     parser.add_argument("--dfm-root", required=True)
     parser.add_argument("--python", required=True, help="Absolute Python path in the DFM CUDA environment")
     parser.add_argument("--calibration", required=True)
-    parser.add_argument("--require-download-verification", action="store_true")
+    parser.add_argument("--data-contract", required=True, help="Saved native physical camera/training declaration")
     args = parser.parse_args(argv)
     if not Path(args.dfm_root).is_absolute() or not Path(args.python).is_absolute():
         parser.error("DFM root and Python executable must be absolute paths")
@@ -27,6 +27,9 @@ def main(argv=None):
     calibration = Path(args.calibration).resolve()
     if not calibration.is_file():
         parser.error("Measured calibration JSON does not exist")
+    data_contract = Path(args.data_contract).resolve()
+    if not data_contract.is_file():
+        parser.error("Native data contract JSON does not exist")
     root = Path(__file__).resolve().parents[1]
     destination = Path(args.dfm_root) / "logs/deploy-runtime"
     temporary_root = root / "runtime/tmp"
@@ -41,11 +44,13 @@ def main(argv=None):
         shutil.copytree(root / "scripts/deploy", bundle / "scripts/deploy")
         shutil.copytree(root / "config/model_tasks", bundle / "config/model_tasks")
         shutil.copyfile(calibration, bundle / "config/dfm_calibration.json")
+        shutil.copyfile(data_contract, bundle / "config/real101_data_contract.json")
         environment = (
             f"export SHARPA_DEPLOY_PYTHON={shlex.quote(args.python)}\n"
             f'export PATH={shlex.quote(str(Path(args.python).parent))}:"$PATH"\n'
             f'export PYTHONPATH={shlex.quote(args.dfm_root)}:"${{PYTHONPATH:-}}"\n'
-            f"export SHARPA_DEPLOY_REQUIRE_DOWNLOAD_VERIFICATION={'1' if args.require_download_verification else '0'}\n"
+            f"export SHARPA_DEPLOY_ASSET_ROOT={shlex.quote(args.dfm_root)}\n"
+            f"export SHARPA_DEPLOY_TASK_CONFIG_ROOT={shlex.quote(str(destination / 'config/model_tasks'))}\n"
         )
         (bundle / "environment.sh").write_text(environment)
         if args.host:
@@ -58,6 +63,13 @@ def main(argv=None):
             destination.mkdir(parents=True, exist_ok=True)
             target = str(destination) + "/"
         subprocess.run(["rsync", "-a", "--protect-args", str(bundle) + "/", target], check=True)
+        # These owned directories are complete snapshots. Remove superseded
+        # catalogs/adapters only inside them; leave other runtime assets intact.
+        for relative in ("interface/sharpa_interface", "scripts/deploy", "config/model_tasks"):
+            subprocess.run(
+                ["rsync", "-a", "--delete", "--protect-args", str(bundle / relative) + "/", target + relative + "/"],
+                check=True,
+            )
     print(f"Prepared {args.host + ':' if args.host else ''}{destination}; no service started")
     return 0
 

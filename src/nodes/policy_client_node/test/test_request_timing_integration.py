@@ -16,6 +16,7 @@ class FakeNode:
     def __init__(self, name):
         self.parameters, self.messages = {}, {}
         self._test_publisher_qos, self._test_subscriptions = {}, {}
+        self.guard_callbacks = []
 
     def declare_parameter(self, name, value):
         self.parameters[name] = value
@@ -29,6 +30,13 @@ class FakeNode:
 
     def create_subscription(self, cls, topic, callback, qos, *args, **kwargs):
         self._test_subscriptions[topic] = (cls, callback, qos)
+
+    def create_guard_condition(self, callback):
+        return SimpleNamespace(trigger=lambda: self.guard_callbacks.append(callback))
+
+    def spin_guards(self):
+        while self.guard_callbacks:
+            self.guard_callbacks.pop(0)()
 
     def create_timer(self, *args, **kwargs):
         pass
@@ -160,7 +168,7 @@ def test_request_start_complete_and_rollout_reset_preserve_model_history(run_pol
         assert latest(node)["inference_pending"]
         assert latest(node)["pending_request_id"] == 0
         future.set_result(result_for(node))
-        node._tick()
+        node.spin_guards()
         completed = latest(node)
         assert not completed["inference_pending"]
         assert completed["inference_count"] == 1
@@ -196,7 +204,7 @@ def test_stopped_request_result_is_discarded_and_idle_status_retains_one_hz(run_
         node._invalidate_request("stopped")
         assert not latest(node)["inference_pending"]
         future.set_result(result)
-        node._tick()
+        node.spin_guards()
         assert node._request_metrics.inference_count == 0
         assert not node.messages["/policy/executable_action"]
         before = len(node.messages["/policy/status"])

@@ -65,7 +65,8 @@ main { max-width: 1720px; margin: auto; padding: 0 28px 28px; }
 .execution-buttons button { flex: 1; }
 .source-name { font-size: 13px; min-height: 23px; overflow-wrap: anywhere; }
 .source-panel .row { margin-top: 10px; }
-#policyRecordLabel { margin-top: 10px; }
+#policyRecordDirectory { min-height: 28px; padding: 4px 8px; }
+#policyRecordPath { margin-top: 5px; }
 .policy-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
 .policy-metrics > div { display: grid; align-content: start; gap: 4px; min-width: 0; }
 .policy-metrics span, .policy-metrics small { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
@@ -132,8 +133,14 @@ dialog::backdrop { background: #16243666; }
 .dialog-footer { padding: 15px 22px; display: flex; align-items: center; justify-content: flex-end; gap: 15px; border-top: 1px solid var(--line); }
 .dialog-footer .hint { margin-top: 0; margin-right: auto; }
 #modelTask { flex: 1; }
+.model-machine { margin-bottom: 14px; font-weight: 600; font-size: 13px; }
+.model-task-row { display: flex; align-items: flex-end; gap: 12px; }
+.model-task-row .field { flex: 1; }
+.model-list-title { margin-top: 20px; font-size: 13px; }
+.model-prompt { margin: 8px 0; padding: 10px 12px; background: #f4f7fb; border-radius: 6px; font-size: 12px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
 .model-list { display: grid; gap: 9px; margin-top: 15px; }
 .model-item { display: flex; gap: 14px; justify-content: space-between; align-items: center; border: 1px solid var(--line); border-radius: 6px; padding: 13px; min-width: 0; }
+.model-item > div { min-width: 0; flex: 1; }
 .model-item strong { font-size: 13px; overflow-wrap: anywhere; }
 .model-item button { flex-shrink: 0; }
 #directoryLocations { margin: 10px 0; }
@@ -176,6 +183,8 @@ pre { max-height: 360px; overflow: auto; padding: 12px; background: #f4f6f9; bor
   .camera-title .row { gap: 8px; }
   .frame-controls { min-width: 0; width: 100%; flex-basis: 100%; }
   .dialog-heading, .dialog-content, .dialog-footer { padding: 15px; }
+  .model-item { flex-direction: column; align-items: stretch; }
+  .model-item > button { align-self: flex-start; }
 }
 
 .sample-outcome { border-top: 1px solid var(--line); margin-top: 12px; padding-top: 10px; }

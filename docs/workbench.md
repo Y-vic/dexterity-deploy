@@ -1,7 +1,7 @@
 # UR Deploy 工作台
 
 双 UR5 + SharpA 双手的 ROS 2 Humble 工作区。本项目仅维护 UR 工作台；Policy 使用 `interface/` 的远端模型协议，通过
-SSH 选择 BAAI 或 4090（SSH alias 为 `ps`）。本机不加载模型 checkpoint。
+选择 BAAI、UR本机 (4090D) 或额外的 PS (4090，SSH alias `ps`)。UR本机模式直接连接模型，其余机器使用SSH。
 
 ## 构建与启动
 
@@ -51,23 +51,26 @@ ros2 launch ur_launch workbench.launch.py --show-args
 
 ## 远端 Policy
 
-四个 sim-real DFM 模型已在本机覆盖配置中接入 BAAI / 4090；checkpoint、标定、
-推理 bundle 和逐个测试流程见 [DFM Policy 部署](dfm_policy.md)。
+本轮八组黄鸭放盘 DFM 模型已在本机覆盖配置中接入 BAAI / PS (4090)；UR (4090D)
+保留软件与机器入口，缺少本轮 checkpoint 的选项禁用。checkpoint、标定、推理 bundle
+和逐个测试流程见 [DFM Policy 部署](dfm_policy.md)。
 
-仓库内 [config/model_servers.json](../config/model_servers.json) 只预置 BAAI 和 4090
-两个 SSH 入口，**模型目录为空**。此时页面展示“尚未配置模型目录”，模型列表为空，
+仓库内 [config/model_servers.json](../config/model_servers.json) 预置 BAAI、UR本机和PS三个机器入口，**模型目录为空**。此时页面展示“尚未配置模型目录”，模型列表为空，
 不会扫描远端或启动模型。先按 [模型服务配置](../config/README.md) 填写真实路径和远端
-task/run catalog，再加载模型。工作台优先读取 `config/model_servers.local.json`，
+task/run catalog，再按「机器 → 任务 → checkpoint」加载模型。任务和checkpoint均可配置自己的任务文本，页面逐项显示最终生效文本；切换机器后重新选择任务。工作台优先读取 `config/model_servers.local.json`，
 也可通过 `model_config:=/absolute/path.json` 显式指定。
 
-加载模型时，Dashboard 在所选服务器创建独立 tmux 会话，等待健康检查。
-`policy_client_node` 随 `/model/status` 切换 SSH 隧道目标，通过原有 interface 获取
-metadata、发送观测并接收 action；Actor 执行服务器指定的有效 slice 和频率。
+加载模型时，Dashboard 在所选机器创建独立 tmux 会话，等待健康检查。
+`policy_client_node` 随 `/model/status` 切换本机直连或 SSH 隧道目标。DFM 完成两次预热后
+开放 `/health`，ROS Python 3.10 客户端通过隔离 Python 3.12 worker 使用原生双向接口。
+确认 model、task、run、有效文本和 checkpoint 路径后发送观测并接收动作；Actor 执行
+完整动作中的有效窗口和频率。接口 revision 与提案生命周期见 [DFM 部署文档](dfm_policy.md)。
 模型启动使用固定配置端口，端口已占用会报错；卸载只清理本实例创建的 tmux 会话。
 
 Policy 来源面板显示请求耗时、累计平均和当前 Chunk 的已下发步数。请求等待中显示
-当前 Request 编号和客户端已等待时间，返回后显示最近完成的 Request 编号及 RPC
-耗时；它包含客户端等待和传输。累计平均只统计当前加载模型成功且被当前会话接受的
+当前 Request 编号和客户端已等待时间，返回后显示最近完成的 Request 编号及客户端
+完整请求耗时；DFM 计时包含 IPC、worker 处理、网络传输和推理，原生调用耗时另存于
+`native_rpc_latency_s` 诊断字段。累计平均只统计当前加载模型成功且被当前会话接受的
 请求，跨停止／继续和 rollout reset 保留；切换、卸载模型时清零。失败、取消和过期
 结果不计入平均，模型加载预热也不计入请求次数。
 
@@ -77,7 +80,7 @@ Chunk 进度直接读取 Actor 的已发布命令计数，显示 `已下发 / �
 这个计数的含义。暂停保留当前真实步数，停止、失败、断线或换模型后清除活动进度。
 网页在请求或 Chunk 活动期间每 200 ms 更新状态，空闲及暂停时每 500 ms 更新。
 
-界面不提供本地模型、RTC 前缀、execution horizon 或 sync skip 控件。
+界面提供UR本机模型选择；不提供RTC前缀、execution horizon或sync skip控件。
 已有 wire 字段 `execution.rtc` 保留兼容：它表示“剩余 N 步时预取下一次推理”，
 不向模型注入上一 chunk 前缀，也不声明 checkpoint 支持某种 RTC 训练方式。
 输入/输出维度、EEF 表示、history 窗口由现有
@@ -108,9 +111,31 @@ Replay 的文件校验与源时间对齐位于 `replay_node/sample.py`，参数�
 顶部 HIL 入口始终隐藏。高级集成可显式启用后通过现有控制 API 使用 HIL；本版没有
 本地模型的影子推理或在线 RLT 训练流程。交还策略后从新观测请求远端推理，丢弃接管前
 未完成请求的结果。HIL rollout 以及选择保存的 Policy rollout 在正式执行前等待录制
-节点确认就绪；预览不录制。详细字段见 [数采文档](../src/nodes/recording_node/README.md)。
+节点确认就绪；预览不录制。Policy 的「保存推理数据」旁显示数采节点确认的 UR 保存目录，
+点击「保存目录」可直接打开共用目录选择器。推理机器选择 PS 或 BAAI 时，录制数据仍保存在 UR。
+录制或保存期间选择的新目录仅为待应用项，页面继续显示当前生效目录；结束后在「数据保存」
+点击「应用目录」，收到数采节点确认后才更新并记忆。
+每条 episode 保存在 `<recording_root>/<开始录制的本地时间>/`，推理事件位于
+`<episode>/raw/policy_inference.jsonl`，三路相机、实测状态与命令保存在同一 episode 的对应文件中。
+标记成功或失败后，整个 episode 移至根目录下的 `success/` 或 `fail/`。
+详细字段见 [数采文档](../src/nodes/recording_node/README.md)。
 
 Policy/Replay 的 Actor 执行日志保存到 `runtime/log/execution/<timestamp>/`，包括轨迹、调度、
 命令/ACK 和跨节点诊断。默认保留 7 天、100 次、总量 5 GiB，超过任一限制时删除最旧
 的已完成记录；可通过 `execution_log_*` launch 参数调整。录制 sample 与执行 trace
 用途不同，质量检查和故障诊断均应保留。
+
+## 完整退出 ROS
+
+顶部红色 `killed` 按钮用于退出本次工作台 ROS launch。点击后先关闭执行门、停止
+Replay，等待当前 episode 保存完成并卸载本工作台加载的模型，再向 launch 发送
+SIGINT。独立后台进程在网页节点退出后继续检查本次 launch 的子进程，必要时依次
+使用 SIGTERM、SIGKILL 清理残留，释放相机和机器人连接。此操作只处理本次 launch
+的进程树。普通「停止」仍只停止当前执行。
+
+退出期间禁止继续提交操作。录制保存或模型卸载失败、超过 60 秒未完成时，页面
+显示错误并保留 ROS，检查后可以再次点击 `killed`。网页服务关闭后停止轮询和相机
+预览，提示重新启动 ROS 后刷新页面。退出日志位于
+`runtime/log/ros/workbench_shutdown.log`，最后一行确认 launch 及其子进程均已退出。
+仅由 `ur_launch` 的 workbench/deploy/teleop launch 启动的 Dashboard 支持此操作；
+离线页面或单独启动的节点不会清理其他 ROS。

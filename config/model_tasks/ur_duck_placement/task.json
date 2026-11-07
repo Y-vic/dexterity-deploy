@@ -1,0 +1,195 @@
+{
+  "schema": "sharpa.deploy.task_config.v2",
+  "task": {
+    "id": "ur_duck_placement",
+    "label": "黄鸭放盘",
+    "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+    "dataset": ""
+  },
+  "runs": [
+    {
+      "id": "real101",
+      "run_id": "flow-duck-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real · step 40000",
+      "checkpoint": "logs/flow-duck-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim100_real101",
+      "run_id": "flow-duck-sim100-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 100 sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim100-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim200_real101",
+      "run_id": "flow-duck-sim200-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 200 sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim200-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim1k_real101",
+      "run_id": "flow-duck-sim1k-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 1k sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim1k-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim2k_real101",
+      "run_id": "flow-duck-sim2k-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 2k sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim2k-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim4k_real101",
+      "run_id": "flow-duck-sim4k-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 4k sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim4k-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim8k_real101",
+      "run_id": "flow-duck-sim8k-real101-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "101 real + 8k sim · step 40000",
+      "checkpoint": "logs/flow-duck-sim8k-real101-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up the yellow ducks and place them on the pink plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    },
+    {
+      "id": "sim8k",
+      "run_id": "flow-duck-sim8k-2gpu-40k-20261106",
+      "model": "dfm_flow",
+      "label": "8k sim · 纯仿真 · step 40000",
+      "checkpoint": "logs/flow-duck-sim8k-2gpu-40k-20261106/checkpoints/checkpoint-40000",
+      "prompt": "Pick up all the yellow ducks on the table and place them in the plate.",
+      "status": "complete",
+      "variant": "三相机 Flow · 30 Hz · 30 步",
+      "deployment": {
+        "eligible": true,
+        "required_files": [
+          "config/dfm_calibration.json",
+          "config/real101_data_contract.json",
+          "environment.sh",
+          "interface/sharpa_interface/dfm/calibration.py",
+          "interface/sharpa_interface/dfm/environment.py",
+          "interface/sharpa_interface/dfm/model_runtime.py",
+          "interface/sharpa_interface/dfm/server.py",
+          "scripts/deploy/dfm_flow/launch.sh"
+        ]
+      }
+    }
+  ]
+}

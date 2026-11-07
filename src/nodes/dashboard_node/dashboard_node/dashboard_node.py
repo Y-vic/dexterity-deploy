@@ -8,16 +8,18 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .model_manager import ModelManagerError, RemoteModelManager
 from ur_common.camera_preview import OnDemandCameraPreview
 from ur_common.reference_http import ReferenceHTTP
 from ur_common.recording_config import normalize_recording_root, DEFAULT_HIL_RECORDING_ROOT
+from ur_common.paths import workspace_root
 from ur_common.workbench import WorkbenchHTTP, workbench_snapshot
+from ur_common.workbench_shutdown import WorkbenchShutdown
 
 
 DASHBOARD_ACTIONS = frozenset(
@@ -133,6 +135,48 @@ def stop_policy_deployment(
         "model": model_manager.snapshot(),
         "model_unload_requested": False,
     }
+
+
+def prepare_workbench_shutdown(state, status_api_url, model_manager,
+                               publish_replay_command, *, forward=forward_action,
+                               timeout_s=60.0):
+    """Close execution gates, finish the episode, then release our model session."""
+    requested_at = time.time()
+    snapshot = state.snapshot()
+    before = snapshot.get('recording') or {}
+    needs_save = bool(before.get('recording') or before.get('saving')
+                      or before.get('rollout_requested')
+                      or ((snapshot.get('policy') or {}).get('rollout_recording') or {}).get('requested')
+                      or (snapshot.get('control') or {}).get('execution_start_pending'))
+    try:
+        result = forward(status_api_url, 'stop', allowed_actions=OPERATOR_ACTIONS)
+        if not result.get('accepted'):
+            raise RuntimeError(result.get('gate_reason') or '停止执行未被接受')
+    except RuntimeError:
+        # With no active episode, launch shutdown can close disconnected drivers.
+        if needs_save:
+            raise
+    publish_replay_command({'action': 'stop'})
+    if needs_save:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            recording = state.snapshot().get('recording') or {}
+            if (recording.get('received_at', 0) >= requested_at
+                    and not recording.get('recording') and not recording.get('saving')
+                    and not recording.get('rollout_requested')):
+                if recording.get('error'):
+                    raise RuntimeError('录制保存失败：' + str(recording['error']))
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError('录制尚未保存完成，ROS 保持运行；请检查数采状态后重试')
+            time.sleep(0.1)
+    model_manager.stop()
+    deadline = time.monotonic() + timeout_s
+    while model_manager.snapshot().get('phase') != 'stopped':
+        model = model_manager.snapshot()
+        if model.get('phase') in {'failed', 'fault'} or time.monotonic() >= deadline:
+            raise RuntimeError(model.get('detail') or '模型服务卸载超时，请检查后重试')
+        time.sleep(0.1)
 
 
 def actor_execution_active(snapshot: dict[str, Any]) -> bool:
@@ -619,9 +663,10 @@ def make_handler(
             if self.path == "/api/servers":
                 self._send_json(model_manager.servers())
                 return
-            if self.path == "/api/models":
+            if self.path.split("?", 1)[0] == "/api/models":
                 try:
-                    self._send_json(model_manager.catalog())
+                    server_id = parse_qs(urlparse(self.path).query).get("server_id", [None])[0]
+                    self._send_json(model_manager.catalog(server_id=server_id))
                 except (ModelManagerError, ValueError, OSError) as exc:
                     self._send_json({"error": str(exc)}, 502)
                 return
@@ -629,6 +674,9 @@ def make_handler(
 
         def do_POST(self) -> None:
             if workbench_http is not None and workbench_http.handle(self):
+                return
+            if workbench_http is not None and workbench_http.shutdown is not None and workbench_http.shutdown.active():
+                self._send_json({'accepted': False, 'error': 'ROS 正在退出，请等待完成'}, 409)
                 return
             if reference_http is not None and reference_http.handle(self):
                 return
@@ -755,7 +803,12 @@ def make_handler(
                 if self.path == "/api/model/start":
                     if actor_execution_active(state.snapshot()):
                         raise ModelManagerError("请先停止执行，再加载模型")
-                    result = model_manager.start(str(payload.get("task", "")), str(payload.get("run_id", "")))
+                    result = model_manager.start(
+                        str(payload.get("task", "")), str(payload.get("run_id", "")),
+                        server_id=str(payload.get("server_id", "")),
+                        expected_prompt=str(payload.get("prompt", "")),
+                        expected_checkpoint=str(payload.get("checkpoint_path", "")),
+                    )
                     self._send_json({"accepted": True, "model": result}, 202)
                     return
                 if self.path == "/api/model/stop":
@@ -874,6 +927,12 @@ def main(args=None) -> None:
                 raise ValueError("model_config must point to the remote server configuration")
             self.model_manager = RemoteModelManager(
                 profile_path=model_config, event_callback=self._model_event)
+            self.shutdown = WorkbenchShutdown(
+                lambda: prepare_workbench_shutdown(
+                    state, str(self.get_parameter('status_api_url').value),
+                    self.model_manager, self._publish_replay_command),
+                workspace_root() / 'runtime/log/ros/workbench_shutdown.log',
+            )
             self.create_timer(
                 0.5,
                 lambda: self._model_event(self.model_manager.snapshot()),
@@ -887,7 +946,8 @@ def main(args=None) -> None:
                 ReferenceHTTP(self.preview, str(self.get_parameter("reference_dataset_root").value)),
                 publish_learning_command=self._publish_learning_command,
                 publish_recording_config=self._publish_recording_config,
-                workbench_http=WorkbenchHTTP(self._workbench_snapshot, self._operator_action, self.preview),
+                workbench_http=WorkbenchHTTP(self._workbench_snapshot, self._operator_action, self.preview,
+                                            shutdown=self.shutdown),
             )
             self.server = ThreadingHTTPServer(
                 ("127.0.0.1", int(self.get_parameter("port").value)), handler

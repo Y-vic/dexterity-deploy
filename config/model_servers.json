@@ -8,8 +8,15 @@
       "repo_root": "",
       "port": 5500
     },
+    "ur": {
+      "label": "UR (4090D)",
+      "ssh_host": "",
+      "local": true,
+      "repo_root": "",
+      "port": 5500
+    },
     "4090": {
-      "label": "4090",
+      "label": "PS (4090)",
       "ssh_host": "ps",
       "repo_root": "",
       "port": 5500

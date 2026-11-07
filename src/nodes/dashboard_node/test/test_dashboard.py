@@ -17,6 +17,7 @@ from dashboard_node.dashboard_node import (
     launch_replay_preview,
     replay_config_matches_status,
     stop_policy_deployment,
+    prepare_workbench_shutdown,
     validate_live_replay_command,
     validate_replay_command,
     wait_for_dashboard_state,
@@ -73,7 +74,7 @@ def test_dashboard_exposes_workbench_machine_and_remote_model_controls():
     page = Controls()
     page.feed((ASSETS / 'index.html').read_text(encoding='utf-8'))
     assert page.modes == ['teleop', 'policy', 'replay']
-    assert {'reset', 'resetMode', 'start', 'pause', 'resume', 'stop',
+    assert {'reset', 'resetMode', 'start', 'pause', 'resume', 'stop', 'killed',
             'startRecord', 'record', 'finish', 'serverSelect', 'chooseModel',
             'unloadModel', 'modelDialog', 'modelLog', 'policyRecord',
             'loadReplay', 'unloadReplay', 'replaySteps', 'replayHz',
@@ -92,6 +93,54 @@ def test_dashboard_exposes_workbench_machine_and_remote_model_controls():
 def test_dashboard_rejects_any_other_machine_action_before_forwarding():
     with pytest.raises(ValueError, match="unsupported dashboard action"):
         forward_action("http://127.0.0.1:1/api/action", "start_record")
+
+
+def test_shutdown_waits_for_recording_before_unloading_model(monkeypatch):
+    import time
+    state = DashboardState()
+    state.update('recording', {'recording': True})
+    events = []
+    model = {'phase': 'running'}
+    manager = SimpleNamespace(stop=lambda: (events.append('unload'), model.update(phase='stopped')),
+                              snapshot=lambda: model)
+    def forward(url, action, **kwargs):
+        assert action == 'stop' and kwargs['allowed_actions'] == OPERATOR_ACTIONS
+        events.append('stop')
+        state.update('recording', {'saving': True, 'received_at': time.time() + 1})
+        return {'accepted': True}
+    def finish(_):
+        events.append('saved')
+        state.update('recording', {'recording': False, 'saving': False,
+                                   'received_at': time.time() + 1})
+    monkeypatch.setattr('dashboard_node.dashboard_node.time.sleep', finish)
+    prepare_workbench_shutdown(state, 'status', manager,
+                               lambda command: events.append(command['action'] + '_replay'),
+                               forward=forward)
+    assert events == ['stop', 'stop_replay', 'saved', 'unload']
+
+
+def test_shutdown_preserves_ros_when_recording_has_not_finished():
+    state = DashboardState()
+    state.update('recording', {'saving': True})
+    manager = SimpleNamespace(stop=lambda: pytest.fail('must finish saving first'))
+    with pytest.raises(RuntimeError, match='录制尚未保存完成'):
+        prepare_workbench_shutdown(state, 'status', manager, lambda _: None,
+                                   forward=lambda *args, **kwargs: {'accepted': True},
+                                   timeout_s=0)
+
+
+def test_shutdown_can_close_disconnected_idle_controller_but_reports_model_failure():
+    state = DashboardState()
+    def disconnected(*args, **kwargs):
+        raise RuntimeError('status offline')
+    manager = SimpleNamespace(stop=lambda: None, snapshot=lambda: {'phase': 'stopped'})
+    prepare_workbench_shutdown(state, 'status', manager, lambda _: None, forward=disconnected)
+    manager.snapshot = lambda: {'phase': 'fault', 'detail': '模型清理失败'}
+    with pytest.raises(RuntimeError, match='模型清理失败'):
+        prepare_workbench_shutdown(state, 'status', manager, lambda _: None, forward=disconnected)
+    state.update('recording', {'recording': True})
+    with pytest.raises(RuntimeError, match='status offline'):
+        prepare_workbench_shutdown(state, 'status', manager, lambda _: None, forward=disconnected)
 
 
 def test_replay_stop_and_unload_are_distinct_commands():
@@ -663,7 +712,6 @@ def test_remote_model_picker_explains_unavailable_entries():
     from ur_common.workbench import ASSETS
     script = (ASSETS / 'workbench.js').read_text(encoding='utf-8')
     assert 'run.disabled_reason' in script
-    assert 'String(!!run.launchable)' in script
     assert "e.dataset.launchable !== 'true'" in script
     assert '/api/servers' in script and '/api/server/select' in script
     assert '尚未配置模型目录' in script

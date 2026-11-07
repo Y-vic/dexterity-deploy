@@ -11,7 +11,7 @@ from std_msgs.msg import String
 from ur_msgs.msg import ExecutableAction
 
 from actor_ik_node import actor_ik_node as actor
-from ur_common.command_guards import hand_bounds
+from ur_common.command_guards import execution_profile, hand_bounds
 from ur_common.geometry import CANONICAL_EEF_FRAME
 
 
@@ -301,4 +301,178 @@ def test_human_release_blends_new_session_without_stale_policy_completion(run_ac
         assert not node.messages['/sharpa/command'][-1].is_hil
         assert len(node.messages['/policy/execution_done']) == 1
         assert node.messages['/policy/execution_done'][0].session_id == 'policy-after-human'
+    run_actor(check)
+
+
+def test_policy_projects_complete_active_slice_and_dispatches_strict_identity(run_actor):
+    def check(node):
+        live(node)
+        target = chunk(node, session='actual-rollout', length=2)
+        target.action_length, target.execute_start = 30, 5
+        lower, _ = hand_bounds()
+        raw = np.asarray(target.hand_joint, dtype=np.float32).reshape(2, 44)
+        raw[:, 0] = lower[0] - .031
+        target.hand_joint = raw.reshape(-1).tolist()
+        original = list(target.hand_joint)
+        node._action(target)
+        hand = node.messages['/sharpa/command'][-1]
+        assert hand.strict_targets and hand.policy_session_id == 'actual-rollout'
+        expected = node._hand.copy()
+        expected[0] = lower[0]
+        np.testing.assert_array_equal(hand.q_cmd, expected)
+        trajectory = node.messages['/actor_ik/trajectory'][-1]
+        assert trajectory.execute_start == 5 and trajectory.execute_length == 2
+        assert np.asarray(trajectory.hand_joint).reshape(2, 44)[1, 0] == lower[0]
+        assert list(target.hand_joint) == original
+        projection = next(values for kind, values in node._trace.events if kind == 'actor_hand_plan_projected')
+        assert projection['corrected_values'] == 2
+        assert projection['max_projection_rad'] == pytest.approx(.031)
+        assert projection['raw_hand_joint'] == original
+        step(node)
+        assert len(node.messages['/sharpa/command']) == 2
+        assert all(command.strict_targets and command.policy_session_id == 'actual-rollout'
+                   for command in node.messages['/sharpa/command'])
+    run_actor(check)
+
+
+def test_policy_prefetch_preflights_from_current_plan_tail(run_actor):
+    def check(node):
+        live(node)
+        first = chunk(node, session='prefetch-rollout', action_id='first', length=2)
+        raw = np.asarray(first.hand_joint, dtype=np.float32).reshape(2, 44)
+        raw[:, 0] = [.2, .35]
+        first.hand_joint = raw.reshape(-1).tolist()
+        node._action(first)
+        second = chunk(node, session='prefetch-rollout', action_id='second', length=1)
+        raw = np.asarray(second.hand_joint, dtype=np.float32)
+        raw[0] = .5  # Above .4 from current measurement, close to the queued tail.
+        second.hand_joint = raw.tolist()
+        node._action(second)
+        assert node._plans.next.action.action_id == 'second'
+        node._hand[0] = .2
+        step(node)
+        node._hand[0] = .35
+        step(node)
+        hand = node.messages['/sharpa/command'][-1]
+        assert hand.action_id == 'second'
+        assert hand.q_cmd[0] == .5
+        assert hand.strict_targets and hand.policy_session_id == 'prefetch-rollout'
+    run_actor(check)
+
+
+def test_policy_rejects_empty_session_before_queue_or_outlet(run_actor):
+    def check(node):
+        live(node)
+        node._action(chunk(node, session='', length=1))
+        assert node._plans.current is None
+        assert not node.messages['/ur/command'] and not node.messages['/sharpa/command']
+        assert 'session ID' in node.messages['/policy/execution_done'][-1].error
+    run_actor(check)
+
+
+@pytest.mark.parametrize('invalid', ['excessive', np.nan, np.inf])
+def test_policy_rejects_invalid_later_target_before_queue_or_outlet(run_actor, invalid):
+    def check(node):
+        live(node)
+        target = chunk(node, length=3)
+        raw = np.asarray(target.hand_joint, dtype=np.float32).reshape(3, 44)
+        lower, _ = hand_bounds()
+        raw[2, 0] = (lower[0] - execution_profile()['max_projection_rad'][0] - .01
+                     if invalid == 'excessive' else invalid)
+        target.hand_joint = raw.reshape(-1).tolist()
+        node._action(target)
+        assert not node.messages['/ur/command']
+        assert not node.messages['/sharpa/command']
+        assert not node.messages['/actor_ik/trajectory']
+        assert node._plans.current is None and node._scheduled is None
+        assert not node.messages['/policy/execution_done'][-1].success
+        assert not any(kind == 'actor_plan_ready' for kind, _ in node._trace.events)
+    run_actor(check)
+
+
+def test_policy_rejects_startup_pose_before_either_device_command(run_actor):
+    def check(node):
+        live(node)
+        target = chunk(node, length=1)
+        raw = np.asarray(target.hand_joint, dtype=np.float32)
+        raw[0] = .8
+        target.hand_joint = raw.tolist()
+        node._action(target)
+        assert not node.messages['/ur/command'] and not node.messages['/sharpa/command']
+        assert node._plans.current is None
+        done = node.messages['/policy/execution_done'][-1]
+        assert not done.success and 'startup_pose_incompatible' in done.error
+    run_actor(check)
+
+
+def test_policy_rechecks_final_limited_hand_before_publishing_any_command(run_actor):
+    def check(node):
+        live(node)
+        node._remote.record = True
+        node._action(chunk(node, length=1))
+        assert node._scheduled is not None
+        assert not node.messages['/ur/command'] and not node.messages['/sharpa/command']
+        node._hand[0] = 3.
+        acknowledge_recording(node)
+        step(node)
+        assert not node.messages['/ur/command'] and not node.messages['/sharpa/command']
+        done = node.messages['/policy/execution_done'][-1]
+        assert not done.success and 'hand_range_rejected' in done.error
+    run_actor(check)
+
+
+def test_policy_slews_desired_target_within_declared_startup_cap(run_actor):
+    def check(node):
+        live(node)
+        node._hand[0] = .712250
+        target = chunk(node, session='measured-slew', length=1)
+        desired = np.asarray(target.hand_joint, dtype=np.float32)
+        desired[0] = 1.121647
+        target.hand_joint = desired.tolist()
+        delta = float(desired[0] - node._hand[0])
+        assert .4 < delta < execution_profile()['startup_step_rad'][0]
+        node._action(target)
+        command = node.messages['/sharpa/command'][-1]
+        expected = np.float32(node._hand[0] + np.float32(.4))
+        assert command.q_cmd[0] == expected
+        assert command.strict_targets and command.policy_session_id == 'measured-slew'
+        trajectory = node.messages['/actor_ik/trajectory'][-1]
+        assert trajectory.hand_joint[0] == desired[0]
+        assert list(target.hand_joint) == desired.tolist()
+        event = next(values for kind, values in node._trace.events if kind == 'command_published')
+        assert event['hand_joint'][0] == expected
+        assert node._policy_hand_guard.last_target[0] == expected
+        assert node.messages['/policy/execution_done'][-1].success
+    run_actor(check)
+
+
+def test_policy_final_limited_command_jump_refuses_both_next_outlets(run_actor):
+    def check(node):
+        live(node)
+        node._action(chunk(node, length=2))
+        assert len(node.messages['/ur/command']) == len(node.messages['/sharpa/command']) == 1
+        node._hand[0] = 1.1
+        step(node)
+        assert len(node.messages['/ur/command']) == len(node.messages['/sharpa/command']) == 1
+        done = node.messages['/policy/execution_done'][-1]
+        assert not done.success and 'hand_command_jump' in done.error
+    run_actor(check)
+
+
+@pytest.mark.parametrize('provider', ['replay', 'hil'])
+def test_other_actor_providers_keep_nonstrict_hand_slew(run_actor, provider):
+    def check(node):
+        live(node)
+        node._execution_provider = provider
+        target = chunk(node, length=1)
+        raw = np.asarray(target.hand_joint, dtype=np.float32)
+        raw[0] = .8
+        target.hand_joint = raw.tolist()
+        node._action(target, provider=provider)
+        if provider == 'hil':
+            acknowledge_recording(node)
+            step(node)
+        hand = node.messages['/sharpa/command'][-1]
+        assert not hand.strict_targets and hand.policy_session_id == ''
+        assert hand.q_cmd[0] == pytest.approx(.4)
     run_actor(check)

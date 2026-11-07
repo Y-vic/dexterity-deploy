@@ -136,6 +136,38 @@ def validate_hand_range(target):
     return target
 
 
+def project_hand_plan(target):
+    """Bound a physical (steps, 44) Policy hand plan in wire order, in radians.
+
+    Project only finite corrections within each joint's configured ceiling.
+    Validate the entire active execution slice before any target is admitted.
+    """
+    target = np.asarray(target, dtype=np.float32)
+    if target.ndim != 2 or target.shape[0] == 0 or target.shape[1] != 44 or not np.isfinite(target).all():
+        raise ValueError('expected a nonempty plan of 44 finite hand joint values per step')
+    lo, hi = hand_bounds()
+    projected = np.clip(target, lo, hi)
+    limit = np.asarray(execution_profile()['max_projection_rad'], dtype=np.float64)
+    correction = np.abs(target.astype(np.float64) - projected.astype(np.float64))
+    bad_steps, bad_joints = np.nonzero(correction > limit)
+    if len(bad_steps):
+        rows = []
+        for step, joint in zip(bad_steps, bad_joints):
+            row = joint_details([joint], projected[step], target[step], limit)[0]
+            row.update(chunk_step=int(step), lower_rad=float(lo[joint]), upper_rad=float(hi[joint]))
+            rows.append(row)
+        raise ExecutionContractError('hand_projection_too_large', rows,
+                                     'active execution slice exceeds bounded firmware-range correction')
+    return projected
+
+
+def validate_hand_step(reference, target, limit, code='hand_command_jump', detail=''):
+    reference, target = vector(reference, 44), vector(target, 44)
+    bad = np.flatnonzero(abs(target-reference) > np.broadcast_to(limit, (44,)))
+    if len(bad):
+        raise ExecutionContractError(code, joint_details(bad, reference, target, limit), detail)
+
+
 class HandCommandGuard:
     def __init__(self):
         self.profile = execution_profile()
@@ -169,11 +201,9 @@ class HandCommandGuard:
         self.check_tracking(measured, now)
         reference = measured if self.last_target is None else self.last_target
         limit = self.profile['startup_step_rad'] if self.last_target is None else self.profile['command_step_rad']
-        bad = np.flatnonzero(abs(target-reference) > limit)
-        if len(bad):
-            raise ExecutionContractError('startup_pose_incompatible' if self.last_target is None else 'hand_command_jump',
-                joint_details(bad, reference, target, limit),
-                'prepare task reset pose and re-observe' if self.last_target is None else 'reference is last accepted command')
+        validate_hand_step(reference, target, limit,
+            'startup_pose_incompatible' if self.last_target is None else 'hand_command_jump',
+            'prepare task reset pose and re-observe' if self.last_target is None else 'reference is last accepted command')
         hard = np.flatnonzero(abs(target-measured) > self.profile['tracking_hard_rad'])
         if len(hard):
             raise ExecutionContractError('hand_tracking_hard_stop',

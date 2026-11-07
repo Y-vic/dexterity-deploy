@@ -16,6 +16,7 @@
     </nav>
     <div class="top-status"><span id="connection">连接中</span><span id="stage">已停止</span><span id="ownership"></span></div>
     <button id="showProtection" class="danger subtle" hidden>最近保护</button>
+    <button id="killed" class="danger" title="停止执行、保存当前录制并完整退出本次 ROS" disabled>killed</button>
   </header>
 
   <main>
@@ -45,10 +46,14 @@
         <div data-modes="teleop"><p class="source-name">Vive + AE01 人工示教</p><p class="hint">先复位，再启用遥操。录制单独开始和结束。</p></div>
         <div data-modes="policy hil" hidden>
           <p id="currentModel" class="source-name">尚未加载模型</p>
-          <label class="field">推理服务器<select id="serverSelect" aria-label="推理服务器"></select></label>
-          <p id="serverHint" class="hint">选择 BAAI 或 4090；配置模型后可连接推理。</p>
-          <div class="row"><button id="chooseModel">选择 / 加载模型</button><button id="unloadModel">卸载模型</button></div>
-          <label id="policyRecordLabel" class="check"><input id="policyRecord" type="checkbox">保存推理数据</label>
+          <p id="currentPrompt" class="model-prompt" hidden></p>
+          <label class="field">1 · 推理机器<select id="serverSelect" aria-label="推理机器"></select></label>
+          <p id="serverHint" class="hint">先选择推理机器，再选择任务和 checkpoint。</p>
+          <div class="row"><button id="chooseModel">选择任务 / checkpoint</button><button id="unloadModel">卸载模型</button></div>
+          <div id="policyRecordingOptions" data-modes="policy" hidden>
+            <div class="row policy-recording-row"><label id="policyRecordLabel" class="check"><input id="policyRecord" type="checkbox">保存推理数据</label><button id="policyRecordDirectory" class="subtle" title="选择 UR 主机上的数据保存目录">保存目录</button></div>
+            <p id="policyRecordPath" class="hint" aria-live="polite">保存至 UR：等待数采节点确认</p>
+          </div>
           <div class="policy-metrics" aria-label="推理统计">
             <div><span>请求耗时</span><strong id="policyRequestLatency">—</strong><small id="policyRequestLabel">尚无请求</small></div>
             <div title="当前加载模型累计的有效请求；切换或卸载模型时清零"><span>累计平均</span><strong id="policyAverageLatency">—</strong><small id="policyInferenceCount">0 次有效请求</small></div>
@@ -132,8 +137,8 @@
   </main>
 
   <dialog id="modelDialog" aria-labelledby="modelTitle">
-    <div class="dialog-heading"><h2 id="modelTitle">选择模型</h2><button data-close="modelDialog" aria-label="关闭模型选择">×</button></div>
-    <div class="dialog-content"><div class="row"><select id="modelTask" aria-label="模型任务"></select><button id="refreshModels">刷新清单</button></div><p id="taskPrompt" class="hint"></p><div id="modelList" class="model-list"></div><p id="modelPhase" class="hint"></p><details><summary>加载日志</summary><pre id="modelLog"></pre></details></div>
+    <div class="dialog-heading"><h2 id="modelTitle">选择任务与 checkpoint</h2><button data-close="modelDialog" aria-label="关闭模型选择">×</button></div>
+    <div class="dialog-content"><p id="modelMachine" class="model-machine"></p><div class="model-task-row"><label class="field">2 · 任务<select id="modelTask" aria-label="模型任务"></select></label><button id="refreshModels">刷新清单</button></div><p id="taskPrompt" class="hint"></p><h3 class="model-list-title">3 · Checkpoint</h3><div id="modelList" class="model-list"></div><p id="modelPhase" class="hint"></p><details><summary>加载日志</summary><pre id="modelLog"></pre></details></div>
   </dialog>
   <dialog id="directoryDialog" aria-labelledby="directoryTitle">
     <div class="dialog-heading"><div><h2 id="directoryTitle">选择数据保存目录</h2><p class="hint">浏览机器人主机上的目录，也可以输入新的绝对路径。</p></div><button data-close="directoryDialog" aria-label="关闭目录选择">×</button></div>

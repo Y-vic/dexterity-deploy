@@ -34,6 +34,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await send('Runtime.enable');await send('Page.enable');await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});await send('Page.navigate',{url:origin});
   await waitFor("document.getElementById('connection')?.textContent==='控制器在线' && !document.getElementById('referenceRoot').disabled");
   assert.equal(await evaluate("document.querySelectorAll('[data-mode]').length"),3);
+  assert.equal(await evaluate("document.getElementById('policyRecordingOptions').hidden"),true);
   assert.equal(await evaluate("document.querySelectorAll('[data-page],aside,#deviceList,#preview').length"),0);
   assert.equal(await evaluate("document.getElementById('stop').parentElement.className"),'execution-buttons');
   await waitFor("document.querySelectorAll('.device-card').length===8");
@@ -106,6 +107,12 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   assert.equal(await evaluate("document.getElementById('recordRoot').value"),paths.root+'/latest pasted path','restart restores the applied recording directory');
   assert.equal((await commands()).length,count,'server restart and reload restore selection without execution');
   await click('[data-mode=policy]');await waitFor("document.getElementById('modeLabel').textContent==='推理'");
+  assert.equal(await evaluate("document.getElementById('policyRecordingOptions').hidden"),false);
+  assert.equal(await evaluate("document.getElementById('policyRecordPath').textContent"),'保存至 UR：'+paths.root+'/latest pasted path');
+  const policyRoot=paths.root+'/new captures',policyDraft=paths.root+'/policy pending';
+  await click('#policyRecordDirectory');await waitFor("document.getElementById('directoryDialog').open && document.getElementById('directoryTitle').textContent==='选择数据保存目录'");
+  await set('directoryPath',policyRoot,'input');await click('#useDirectory');
+  await waitFor(`document.getElementById('policyRecordPath').textContent==='保存至 UR：'+${JSON.stringify(policyRoot)} && document.getElementById('feedback').textContent.includes('保存目录已应用并记忆')`);
   // A render during command submission must not reverse the user's checkbox intent.
   await waitFor("!document.getElementById('policyRecord').disabled");
   const recordingCommands=async()=> (await commands()).filter(c=>['enable_policy_recording','disable_policy_recording'].includes(c.action));
@@ -124,13 +131,30 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await patch({reject_policy_recording:false});
   assert.equal(await evaluate("document.querySelectorAll('#rtcEnabled,#executionHorizon,#syncSkipSteps,#rltControls,[data-mode=hil]').length"),0);
   await waitFor("!document.getElementById('serverSelect').disabled");
+  await set('serverSelect','ur');
+  await waitFor("document.getElementById('serverHint').textContent.includes('UR (4090D)') && document.getElementById('serverHint').textContent.includes('本机推理')");
+  await click('#chooseModel');await waitFor("document.getElementById('modelTask').options.length===2 && !document.getElementById('modelTask').disabled");
+  assert.equal(await evaluate("document.querySelectorAll('[data-model-load]').length"),0,'task selection precedes checkpoint choice');
+  await set('modelTask','offline-demo');await waitFor("document.querySelector('[data-model-load]')&&!document.querySelector('[data-model-load]').disabled");
+  assert.equal(await evaluate("document.querySelector('.model-item .model-prompt').textContent"),'任务文本：This checkpoint has its own instruction.');
+  for(const width of [1440,390]){
+    await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:width===390});await delay(200);
+    assert.equal(await evaluate("document.getElementById('modelDialog').scrollWidth<=document.getElementById('modelDialog').clientWidth"),true,'model choices fit at '+width);
+    const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true});
+    await fs.writeFile('/tmp/ur-sharpa-model-selection-'+(width===1440?'desktop':'mobile')+'.png',Buffer.from(shot.data,'base64'));
+  }
+  await send('Emulation.setDeviceMetricsOverride',{width:1440,height:1000,deviceScaleFactor:1,mobile:false});
+  await click('[data-close=modelDialog]');
   await set('serverSelect','4090');
   await waitFor("document.getElementById('serverHint').textContent.includes('4090')");
   assert.equal((await commands()).find(c=>c.server_id==='4090').server_id,'4090');
-  await click('#chooseModel');await waitFor("document.querySelector('[data-model-load]')&&!document.querySelector('[data-model-load]').disabled");await click('[data-model-load]');
+  await click('#chooseModel');await waitFor("document.getElementById('modelTask').options.length===2 && !document.getElementById('modelTask').disabled");
+  assert.equal(await evaluate("document.getElementById('modelTask').value"),'','machine switch clears prior task choice');
+  await set('modelTask','offline-demo');await waitFor("document.querySelector('[data-model-load]')&&!document.querySelector('[data-model-load]').disabled");await click('[data-model-load]');
   await waitFor("document.getElementById('currentModel').textContent.includes('fixture') && !document.getElementById('modelDialog').open");
-  assert.deepEqual((await commands()).find(c=>c.run_id==='fixture'),{task:'offline-demo',run_id:'fixture'});
+  assert.deepEqual((await commands()).find(c=>c.run_id==='fixture'),{server_id:'4090',task:'offline-demo',run_id:'fixture',prompt:'This checkpoint has its own instruction.',checkpoint_path:'/offline/checkpoint'});
   assert.equal(await evaluate("document.getElementById('serverSelect').disabled"),true);
+  assert.match(await evaluate("document.getElementById('currentPrompt').textContent"),/This checkpoint has its own instruction/);
   const metricsCommands=(await commands()).length;
   await patch({model:{generation:4},control:{...idle,ur_state:2,sharpa_state:1},
     policy:{model_generation:4,model_identity_ok:true,session_id:'metrics-episode',inference_count:2,last_request_id:6,
@@ -142,6 +166,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   for(const width of [1440,390]){
     await send('Emulation.setDeviceMetricsOverride',{width,height:1000,deviceScaleFactor:1,mobile:width===390});await delay(200);
     assert.equal(await evaluate(`document.documentElement.scrollWidth <= ${width}`),true,'policy metrics fit at '+width);
+    assert.equal(await evaluate("(()=>{const row=document.querySelector('.policy-recording-row').getBoundingClientRect(),path=document.getElementById('policyRecordPath').getBoundingClientRect(),panel=document.querySelector('.source-panel').getBoundingClientRect();return row.width>0&&path.top>=row.bottom&&path.right<=panel.right;})()"),true,'Policy directory controls and path fit at '+width);
     assert.equal(await evaluate("(()=>{const rects=[...document.querySelectorAll('.policy-metrics > div')].map(e=>e.getBoundingClientRect());return rects.every((a,i)=>a.width>0&&rects.slice(i+1).every(b=>a.right<=b.left+.1||b.right<=a.left+.1));})()"),true,'policy metrics do not overlap');
     const clip=await evaluate("(()=>{const r=document.querySelector('.source-panel').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,scale:1};})()");
     const shot=await send('Page.captureScreenshot',{format:'png',captureBeyondViewport:true,clip});
@@ -159,14 +184,21 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await send('Page.reload');
   await waitFor("document.getElementById('connection')?.textContent==='控制器在线' && document.getElementById('serverSelect').disabled");
   await waitFor("document.getElementById('serverSelect').value==='4090'");
+  assert.equal(await evaluate("document.getElementById('policyRecordPath').textContent"),'保存至 UR：'+policyRoot,'Policy destination survives reload and remote inference selection');
   await click('#start');await waitFor("document.getElementById('stage').textContent==='执行中'");
   assert.equal(await evaluate("document.getElementById('policyRecord').disabled"),true,'running execution keeps capture setting locked');
+  const directoryCommandCount=(await commands()).filter(c=>c.recording_root).length;
+  await click('#policyRecordDirectory');await waitFor("document.getElementById('directoryDialog').open");
+  await set('directoryPath',policyDraft,'input');await click('#useDirectory');await delay(650);
+  assert.equal((await commands()).filter(c=>c.recording_root).length,directoryCommandCount,'Policy directory selection during recording keeps the current root');
+  assert.equal(await evaluate("document.getElementById('policyRecordPath').textContent"),'保存至 UR：'+policyRoot+' · 新目录待应用');
   assert.equal(await evaluate("document.querySelector('[data-label=mark_success]').disabled"),true);
   await click('#stop');await waitFor("document.getElementById('captureStatus').textContent==='正在保存'");
   assert.equal(await evaluate("document.querySelector('[data-label=mark_success]').disabled"),true,'classification waits for save');
   assert.equal(await evaluate("document.querySelector('[data-label=drop_sample]').disabled"),true,'discard waits for save');
   await waitFor("!document.querySelector('[data-label=mark_success]').disabled && document.getElementById('stage').textContent==='已停止'");
   const saved=await evaluate("document.getElementById('savedPath').textContent");
+  assert.equal(saved.startsWith(policyRoot+'/'),true,'the episode saves beneath the confirmed root rather than the draft');
   await patch({recording:{capture_notice:'启停边界 17 帧缺少动作，已保留无效标记',last_error:''}});
   await waitFor("document.getElementById('recordingHint').textContent.includes('启停边界 17 帧')");
   assert.equal(await evaluate("document.getElementById('recordError').textContent"),'');
@@ -184,6 +216,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   assert.equal((await commands()).filter(c=>c.action==='drop_sample').at(-1).saved_path,discardedPath,'discard targets the currently displayed classified episode');
   assert.equal(await evaluate("document.querySelector('[data-label=mark_success]').disabled && document.querySelector('[data-label=mark_fail]').disabled"),true);
 
+  await click('#applyRoot');await waitFor(`document.getElementById('policyRecordPath').textContent==='保存至 UR：'+${JSON.stringify(policyDraft)} && document.getElementById('feedback').textContent.includes('保存目录已应用并记忆')`);
   await click('#start');await waitFor("document.getElementById('stage').textContent==='执行中'");
   await click('#pause');await waitFor("document.getElementById('stage').textContent==='已暂停'");
   await patch({recording:{saving:true,recording:true}});await delay(650);let before=(await commands()).filter(c=>c.action==='reset_both').length;
@@ -234,8 +267,18 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await patch({status_error:true});
   await waitFor("[...document.querySelectorAll('.device-card')].every(d=>d.dataset.tone==='offline')");
   assert.equal(await evaluate("[...document.querySelectorAll('.device-card')].every(d=>d.dataset.tone==='offline')"),true,'stale cached device values are not shown as healthy after disconnect');
+  // Shutdown is simulated by the offline fixture; it never signals ROS.
+  await patch({status_error:false,control:{online:true},reject_shutdown:true});
+  await waitFor("!document.getElementById('killed').disabled");
+  await click('#killed');await waitFor("document.getElementById('feedback').textContent==='退出测试拒绝' && !document.getElementById('killed').disabled");
+  await patch({reject_shutdown:false});await click('#killed');
+  await waitFor("document.getElementById('killed').disabled && [...document.querySelectorAll('main > section')].every(section=>section.inert)");
+  await click('#killed');
+  assert.equal((await commands()).filter(command=>command.action==='killed').length,1,'duplicate clicks do not schedule another shutdown');
+  await waitFor("document.getElementById('feedback').textContent.includes('网页服务已关闭')");
+  assert.equal(await evaluate("document.getElementById('connection').textContent"),'连接已断开');
   assert.deepEqual(errors,[],'no browser script exceptions');
-  console.log('Browser smoke passed: four modes, model modal, editable paths, shared directory picker, folder creation, shared reference, restart persistence, paused reset/save/stop, inference stop/save/classification, device freshness, protection modal and four responsive layouts.');
+  console.log('Browser smoke passed: three modes, machine/task/checkpoint selection and effective prompts, model modal, editable paths, shared directory picker, folder creation, shared reference, restart persistence, paused reset/save/stop, inference stop/save/classification, device freshness, protection modal and four responsive layouts.');
 
- }finally{if(ws)ws.close();if(chrome){chrome.kill();await once(chrome,'exit').catch(()=>{});}fixture.kill();await fs.rm(directory,{recursive:true,force:true});}
+ }finally{if(ws)ws.close();if(chrome){chrome.kill();await once(chrome,'exit').catch(()=>{});}fixture.kill();await fs.rm(directory,{recursive:true,force:true,maxRetries:10,retryDelay:100});}
 })().catch(error=>{console.error(error);process.exitCode=1;});

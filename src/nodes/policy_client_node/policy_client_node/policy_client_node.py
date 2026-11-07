@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
+from threading import Lock
 from typing import Any, Mapping
 
 import numpy as np
@@ -228,6 +229,7 @@ def metadata_identity_error(
     expected_task_id: str,
     expected_run_id: str,
     expected_prompt: str = "",
+    expected_checkpoint_path: str = "",
 ) -> str:
     if not isinstance(metadata, dict):
         return "模型 metadata 缺失"
@@ -246,8 +248,10 @@ def metadata_identity_error(
         mismatches.append(f"task {actual_task_id or '<missing>'} != {expected_task_id or '<missing>'}")
     if not expected_run_id or actual_run_id != expected_run_id:
         mismatches.append(f"run {actual_run_id or '<missing>'} != {expected_run_id or '<missing>'}")
-    if expected_prompt and actual_prompt and actual_prompt != expected_prompt:
+    if expected_prompt and actual_prompt != expected_prompt:
         mismatches.append("task prompt 不一致")
+    if expected_checkpoint_path and str(metadata.get("checkpoint_path") or "") != expected_checkpoint_path:
+        mismatches.append("checkpoint_path 不一致")
     if mismatches:
         return "模型身份不匹配：" + "；".join(mismatches)
     return ""
@@ -288,6 +292,10 @@ def summarize_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
         "prompt": str(metadata.get("prompt") or ""),
         "format_id": str(active_format.get("format_id") or ""),
         "requirements": requirements,
+        "policy_transport": str(metadata.get("policy_transport") or "legacy"),
+        "native_interface": deepcopy(metadata.get("native_interface")),
+        "interface_revision": metadata.get("interface_revision"),
+        "pending_interface_update": deepcopy(metadata.get("pending_interface_update")),
     }
 
 
@@ -329,6 +337,10 @@ def main(args=None) -> None:
             self.declare_parameter("ssh_host", "BAAI")
             self.declare_parameter("ssh_remote_host", "127.0.0.1")
             self.declare_parameter("ssh_remote_port", 5500)
+            self.declare_parameter("dfm_python", "/home/yns/deploy/runtime/venvs/dfm-serving/bin/python")
+            self.declare_parameter("dfm_source_root", "/home/yns/deploy/runtime/dfm-source")
+            self.declare_parameter("dfm_calibration_path", "/home/yns/deploy/runtime/config/dfm_calibration.json")
+            self.declare_parameter("dfm_data_contract_path", "/home/yns/deploy/runtime/config/real101_data_contract.json")
             from concurrent.futures import ThreadPoolExecutor
             from ur_common.camera_transport import SharedCameraReader
             from ur_common.raw_camera import RAW_ENCODING
@@ -347,6 +359,8 @@ def main(args=None) -> None:
             self._service_future = None
             self._rpc_faulted = False
             self._inference_context = None
+            self._completion_lock = Lock()
+            self._completion_closed = False
             self._inference_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='remote-inference')
             self._raw_reader = SharedCameraReader(prefix=str(self.get_parameter('camera_shm_prefix').value)+'_raw',encoding=RAW_ENCODING)
             self._camera_encoder = RemoteCameraEncoder()
@@ -362,6 +376,8 @@ def main(args=None) -> None:
             )
             self._default_remote_port = self._server_config.ssh_remote_port
             self._client = ServerClient(self._server_config)
+            self._policy_transport = "legacy"
+            self._interface_update_error = ""
             self._metadata = None; self._started = False; self._busy = False; self._pending = None
             self._control_ready = False
             self._machine_control_ready = False
@@ -377,6 +393,7 @@ def main(args=None) -> None:
             self._expected_task_id = ""
             self._expected_run_id = ""
             self._expected_prompt = ""
+            self._expected_checkpoint_path = ""
             self._model_identity_ok = False
             self._model_identity_error = ""
             self._model_status_signature = None
@@ -412,6 +429,7 @@ def main(args=None) -> None:
                 10,
             )
             self.create_subscription(String, "/model/status", self._model_status, 10)
+            self.create_subscription(String, "/policy/interface_update", self._interface_update, 10)
             self.create_subscription(
                 UrStateFrame,
                 "/ur/state",
@@ -447,12 +465,29 @@ def main(args=None) -> None:
                 1,
                 callback_group=self._observation_group,
             )
+            self._completion_guard = self.create_guard_condition(self._tick)
             self._timer = self.create_timer(0.1, self._tick)
             self.create_timer(1/30, self._raw_cameras, callback_group=self._observation_group)
             self.create_subscription(String, '/hil/state', self._hil_status, 10)
             self.create_subscription(Bool, '/control/policy_recording', self._policy_recording_status,
                                      QoSProfile(depth=1))
             self._status_timer = self.create_timer(0.1, self._publish_timing_status)
+
+        def _submit_rpc(self, call, *args, **kwargs):
+            future = self._inference_pool.submit(call, *args, **kwargs)
+            future.add_done_callback(self._rpc_completed)
+            return future
+
+        def _rpc_completed(self, future):
+            # Worker threads only wake the ROS executor. Existing _tick checks
+            # still own epoch/session validation and all publication.
+            with self._completion_lock:
+                if not self._completion_closed:
+                    self._completion_guard.trigger()
+
+        def _close_completion_wakeups(self):
+            with self._completion_lock:
+                self._completion_closed = True
 
         def _execution_event(self, event, **fields):
             try:
@@ -483,6 +518,11 @@ def main(args=None) -> None:
                 # history. Resume only after resetting once the active chunk ends.
                 self._rollout_reset_pending = True
                 self._control_ready = False
+            if self._service_future is not None and self._service_context[0] == 'interface':
+                # An accepted proposal may have reached the native owner even
+                # when its acknowledgment belongs to a retired control epoch.
+                self._rollout_reset_pending = True
+                self._control_ready = False
             self._publish({})
 
         def _publish(self, payload):
@@ -505,6 +545,11 @@ def main(args=None) -> None:
                 "model_identity_ok": self._model_identity_ok,
                 "model_identity_error": self._model_identity_error,
                 "execution_provider": self._execution_provider,
+                "policy_transport": self._policy_transport,
+                "interface_update_error": self._interface_update_error,
+                "native_interface": (self._metadata or {}).get("native_interface"),
+                "interface_revision": (self._metadata or {}).get("interface_revision"),
+                "pending_interface_update": (self._metadata or {}).get("pending_interface_update"),
                 **self._request_metrics.snapshot(),
                 "metadata": summarize_metadata(self._metadata),
                 "buffers": self._observations.status(),
@@ -592,9 +637,13 @@ def main(args=None) -> None:
                 expected_model = str(payload.get("model") or "")
                 expected_run_id = str(payload.get("run_id") or "")
                 expected_prompt = str(payload.get("prompt") or "")
+                expected_checkpoint_path = str(payload.get("checkpoint_path") or "")
                 server_url = str(payload.get("server_url") or self._server_config.url)
                 ssh_host = str(payload.get("ssh_host") or "")
                 remote_host = str(payload.get("remote_host") or "127.0.0.1")
+                policy_transport = str(payload.get("policy_transport") or "legacy")
+                if policy_transport not in {"legacy", "dfm_native"}:
+                    raise ValueError("Unsupported model policy_transport")
                 signature = (
                     generation,
                     phase,
@@ -603,9 +652,11 @@ def main(args=None) -> None:
                     expected_task_id,
                     expected_run_id,
                     expected_prompt,
+                    expected_checkpoint_path,
                     server_url,
                     ssh_host,
                     remote_host,
+                    policy_transport,
                 )
                 if signature == self._model_status_signature:
                     return
@@ -617,6 +668,7 @@ def main(args=None) -> None:
                 self._expected_task_id = expected_task_id
                 self._expected_run_id = expected_run_id
                 self._expected_prompt = expected_prompt
+                self._expected_checkpoint_path = expected_checkpoint_path
                 self._model_available = phase == "running"
                 self._execution_event(
                     "model_status_changed",
@@ -640,7 +692,17 @@ def main(args=None) -> None:
                     ssh_remote_host=remote_host,
                     ssh_remote_port=remote_port,
                 )
-                self._client = ServerClient(self._server_config)
+                self._policy_transport = policy_transport
+                if policy_transport == "dfm_native":
+                    from sharpa_interface.dfm.client import NativePolicyClient
+                    self._client = NativePolicyClient(self._server_config,
+                        python=str(self.get_parameter("dfm_python").value),
+                        source_root=str(self.get_parameter("dfm_source_root").value),
+                        calibration_path=str(self.get_parameter("dfm_calibration_path").value),
+                        data_contract_path=str(self.get_parameter("dfm_data_contract_path").value))
+                else:
+                    self._client = ServerClient(self._server_config)
+                self._interface_update_error = ""
                 self._metadata = None
                 self._model_identity_ok = False
                 self._model_identity_error = ""
@@ -836,7 +898,7 @@ def main(args=None) -> None:
                 self._request_metrics.begin(
                     self._core.session_id, pending.request_id, self._request_epoch
                 )
-                self._inference_future = self._inference_pool.submit(
+                self._inference_future = self._submit_rpc(
                     self._client.infer_action, payload,
                     expected_session_id=self._core.session_id,
                     expected_request_id=pending.request_id)
@@ -855,12 +917,52 @@ def main(args=None) -> None:
                 f"-r{self._rollout_generation}"
             )
             self._service_context = ('reset', self._client, self._epoch, session_id)
-            self._service_future = self._inference_pool.submit(self._client.reset, session_id, request_id=0)
+            self._service_future = self._submit_rpc(self._client.reset, session_id, request_id=0)
+
+        def _interface_update(self, message):
+            try:
+                if self._policy_transport != "dfm_native" or not self._started:
+                    raise ValueError("Interface proposals require a connected native DFM policy")
+                if self._inference_future is not None or self._service_future is not None:
+                    raise ValueError("Wait for the current policy operation before proposing an interface")
+                value = json.loads(message.data)
+                if set(value) != {"model_generation", "session_id", "interface_revision", "interface"}:
+                    raise ValueError("Proposal requires model_generation, session_id, interface_revision and full interface")
+                if type(value["model_generation"]) is not int or value["model_generation"] != self._model_generation:
+                    raise ValueError("Proposal belongs to a retired model generation")
+                if value["session_id"] != self._core.session_id:
+                    raise ValueError("Proposal belongs to a retired policy session")
+                if type(value["interface_revision"]) is not int or value["interface_revision"] != self._metadata.get("interface_revision"):
+                    raise ValueError("Proposal interface_revision differs from the active native declaration")
+                self._interface_update_error = ""
+                self._service_context = ('interface', self._client, self._epoch, self._core.session_id)
+                self._interface_proposal_generation = self._model_generation
+                self._service_future = self._submit_rpc(self._client.update_interface, value["interface"])
+            except Exception as exc:
+                self._interface_update_error = str(exc)
+                self._publish({})
 
         def _finish_service(self):
             future, self._service_future = self._service_future, None
             kind, client, epoch, session_id = self._service_context
             if client is not self._client:
+                return
+            if kind == 'interface':
+                if (epoch != self._epoch or session_id != self._core.session_id
+                        or self._interface_proposal_generation != self._model_generation):
+                    self._interface_update_error = "Interface acknowledgment belongs to a retired model or rollout"
+                    self._rollout_reset_pending = True
+                    self._control_ready = False
+                    self._publish({})
+                    return
+                try:
+                    future.result()
+                    self._metadata = deepcopy(client.current_metadata)
+                    self._interface_update_error = ""
+                except Exception as exc:
+                    # A rejected declaration does not invalidate model history.
+                    self._interface_update_error = str(exc)
+                self._publish({})
                 return
             if kind == 'reset' and epoch != self._epoch:
                 # Stop/pause/provider changes while reset was outstanding.
@@ -873,7 +975,10 @@ def main(args=None) -> None:
                 identity_error = metadata_identity_error(
                     self._metadata, expected_model=self._expected_model,
                     expected_task_id=self._expected_task_id, expected_run_id=self._expected_run_id,
-                    expected_prompt=self._expected_prompt)
+                    expected_prompt=self._expected_prompt,
+                    expected_checkpoint_path=(self._expected_checkpoint_path if self._policy_transport == "dfm_native" else ""))
+                if self._policy_transport == "dfm_native" and (not self._expected_prompt or not self._expected_checkpoint_path):
+                    identity_error = "Native model status requires exact prompt and checkpoint_path"
                 if identity_error:
                     self._model_identity_ok = False
                     self._model_identity_error = identity_error
@@ -889,6 +994,8 @@ def main(args=None) -> None:
                 self._control_ready = False
                 self._publish({'phase': 'connected', 'reason': '', 'error': ''})
                 return
+            if self._policy_transport == "dfm_native":
+                self._metadata = deepcopy(client.current_metadata)
             self._metadata = activate_reset_metadata(self._metadata, result)
             self._core = PolicyClientCore(session_id)
             self._core.update_actor_gate(self._actor_gate_running)
@@ -965,7 +1072,7 @@ def main(args=None) -> None:
                 if not self._model_available: return
                 if not self._started:
                     self._service_context = ('connect', self._client, self._epoch, self._core.session_id)
-                    self._service_future = self._inference_pool.submit(self._client.connect)
+                    self._service_future = self._submit_rpc(self._client.connect)
                     return
                 if self._rollout_reset_pending:
                     if not self._actor_gate_running or not self._machine_control_ready or self._core.executing:
@@ -1006,12 +1113,15 @@ def main(args=None) -> None:
                     self._request_metrics.cancel()
                     self._core.cancel_request(); self._publish({"phase": "waiting", "reason": "control state changed before inference"}); return
                 action, latency = self._inference_result.result()
+                if self._policy_transport == "dfm_native":
+                    self._metadata = deepcopy(self._client.current_metadata)
                 self._inference_event('completed', result=asdict(action), latency_s=float(latency))
                 self._execution_event(
                     "model_inference_completed",
                     session_id=self._core.session_id,
                     request_id=int(self._pending.request_id),
                     latency_ms=float(latency) * 1000.0,
+                    diagnostics=inference_json(action.diagnostics),
                     success=True,
                 )
                 if action.next_metadata_format is not None:
@@ -1169,6 +1279,7 @@ def main(args=None) -> None:
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException, RCLError):
         pass
     finally:
+        node._close_completion_wakeups()
         executor.shutdown()
         node._invalidate_request('policy client shutdown')
         node._client.close()

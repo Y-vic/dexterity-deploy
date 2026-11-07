@@ -6,7 +6,9 @@
   let protectionKey = '', protection = null, protectionDiagnostics = '', directoryVersion = 0;
   let directoryTarget = 'recording', directoryParent = '', creatingDirectory = false;
   const images = new Map(), stamps = new Map(), cameraHealth = {};
-  let deviceKey = '', catalogVersion = 0, replayRequest = null;
+  let deviceKey = '', catalogVersion = 0, catalogServerId = '', replayRequest = null;
+  let shutdownRequested = false, shutdownPhase = '';
+  const shuttingDown = () => shutdownRequested || ['stopping','exiting','closed'].includes(shutdownPhase);
   function feedback(text, error=false) {$('feedback').textContent = text; $('feedback').classList.toggle('error', error);}
   async function json(url, options={}) {
     const response = await fetch(url, {cache:'no-store', signal:AbortSignal.timeout(25000), ...options});
@@ -17,8 +19,8 @@
   const post = (url, payload) => json(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
   const action = (name, extra={}) => post('/api/action', {action:name, ...extra});
   const operator = (name, extra={}) => post('/api/workbench/action', {action:name, ...extra});
-  function view() {return WorkbenchState.derive(snapshot, busy || !!pending);}
-  function referenceLocked() {return busy || !!pending || reference.initializing || (view().executing && !view().paused) || view().resetting;}
+  function view() {return WorkbenchState.derive(snapshot, busy || !!pending || shuttingDown());}
+  function referenceLocked() {return shuttingDown() || busy || !!pending || reference.initializing || (view().executing && !view().paused) || view().resetting;}
   const reference = new WorkbenchReference({json, post, changed:render, locked:referenceLocked});
   function referencePath() {const s = reference.selection; return s ? s.root.replace(/\/$/, '') + '/' + s.episode : '';}
   function replayMatches() {
@@ -36,6 +38,7 @@
     return {mode:'episode', ...reference.selection};
   }
   async function command(operation, {urgent=false, ack=null, ackValue=null}={}) {
+    if (shuttingDown()) return false;
     if (!urgent && (busy || pending)) return false;
     if (!connected) {feedback('连接已断开，请等待状态恢复。', true); return false;}
     if (!urgent) busy = true;
@@ -119,13 +122,16 @@
     const v = view(), s = snapshot, r = s.recording || {}, m = s.model || {}, p = s.policy || {};
     $('connection').textContent = connected && v.online ? '控制器在线' : '连接已断开';
     $('connection').classList.toggle('online', connected && v.online);
+    $('killed').disabled = !connected || !s.shutdown || shuttingDown();
+    $('killed').textContent = shuttingDown() ? '退出中…' : 'killed';
+    all('main > section').forEach(section => section.inert = shuttingDown());
     $('ownership').textContent = v.owner; $('captureStatus').textContent = v.capture; $('stage').textContent = v.stage;
     $('modeLabel').textContent = v.names[v.mode];
     $('modeReason').textContent = s.capabilities?.switchable ? s.mode_switch?.allowed ? '' : s.mode_switch?.reason : '当前启动入口仅提供部分模式';
     all('[data-mode]').forEach(e => {
       const available = s.capabilities?.modes.includes(e.dataset.mode);
       e.classList.toggle('selected', e.dataset.mode === v.mode); e.setAttribute('aria-pressed', String(e.dataset.mode === v.mode));
-      e.disabled = busy || !!pending || !s.mode_switch?.allowed || !available;
+      e.disabled = shuttingDown() || busy || !!pending || !s.mode_switch?.allowed || !available;
       e.title = !available ? '当前入口不提供此模式' : s.mode_switch?.reason || '';
     });
     all('[data-modes]').forEach(e => e.hidden = !e.dataset.modes.split(' ').includes(v.mode));
@@ -146,21 +152,27 @@
     $('policyRecordLabel').hidden = v.mode !== 'policy'; $('policyRecord').checked = !!s.policy_recording;
     $('policyRecord').disabled = !v.allowed.policyRecord;
     $('policyRecordLabel').title = v.allowed.policyRecord ? '正式执行时采集，预览不录制' : !v.online ? '等待控制器连接' : busy || pending ? '正在提交操作' : '请先停止执行再修改保存选项';
-    $('currentModel').textContent = m.run_id ? `${m.task} / ${m.run_id}` : '尚未加载模型';
+    $('currentModel').textContent = m.run_id ? `${m.server_label || m.server_id} / ${m.task_id || m.task} / ${m.run_id}` : '尚未加载模型';
+    $('currentPrompt').textContent = m.prompt ? '当前任务文本：' + m.prompt : ''; $('currentPrompt').hidden = !m.prompt;
+    if (catalogServerId && m.server_id && catalogServerId !== m.server_id) clearModelCatalog();
+    $('modelMachine').textContent = '1 · 推理机器：' + (m.server_label || '等待选择');
     $('serverSelect').disabled = !v.allowed.serverConfigure;
     if (m.server_id && [...$('serverSelect').options].some(option => option.value === m.server_id)) $('serverSelect').value = m.server_id;
-    $('serverHint').textContent = m.server_label ? `${m.server_label} · ${m.ssh_host || ''}${m.configured === false ? ' · 尚未配置模型目录' : ''}` : '等待服务器配置';
-    const phase = ({stopped:'未加载', starting:'启动中', loading:'加载与预热中', running:p.model_identity_ok ? '模型就绪' : '校验模型身份', stopping:'卸载中', fault:'加载失败'})[m.phase] || '';
+    $('serverHint').textContent = m.server_label ? `${m.server_label}${m.local ? ' · 本机推理' : m.ssh_host ? ' · ' + m.ssh_host : ''}${m.configured === false ? ' · 尚未配置模型目录' : ''}` : '等待服务器配置';
+    const phase = ({stopped:'未加载', starting:'启动中', loading:'加载与预热中', running:p.pending_interface_update ? '更新观测接口' : p.model_identity_ok ? '模型就绪' : '确认模型与观测接口', stopping:'卸载中', fault:'加载失败'})[m.phase] || '';
     $('sourcePhase').textContent = ['policy','hil'].includes(v.mode) ? phase : '';
     $('modelPhase').textContent = phase + (m.detail ? ' · ' + m.detail : '');
     $('modelLog').textContent = m.log_tail || '等待模型输出'; $('unloadModel').disabled = !v.allowed.modelUnload;
     $('chooseModel').disabled = !s.capabilities?.deployment;
     $('refreshModels').disabled = !s.capabilities?.deployment || busy;
+    $('modelTask').disabled = !catalog || busy;
     all('[data-model-load]').forEach(e => e.disabled = !v.allowed.modelLoad || e.dataset.launchable !== 'true');
     renderPolicyMetrics(v, p, m);
     const root = r.recording_root || s.operator?.recording_root;
     if (root && !rootEdited) $('recordRoot').value = root;
     $('recordRootActual').textContent = (rootEdited ? '待应用；当前：' : '当前：') + (root || '等待数采节点');
+    $('policyRecordPath').textContent = '保存至 UR：' + (root || '等待数采节点确认') + (rootEdited ? ' · 新目录待应用' : '');
+    $('policyRecordPath').title = root ? `${root}/<episode>/raw/policy_inference.jsonl；相机和实测状态保存在同一 episode。` : '';
     $('applyRoot').disabled = !v.allowed.configure || !rootEdited;
     $('recordingHint').textContent = v.mode === 'hil' ? '正式执行自动采集；暂停或停止自动保存本条。' : v.mode === 'policy' ? s.policy_recording ? '已开启采集：停止自动保存，保存后可标记成功 / 失败。' : '勾选「保存推理数据」后，停止会自动保存 episode。' : v.mode === 'replay' ? 'Replay 使用参考 episode，不覆盖原始样本。' : '可随时浏览目录；录制或保存结束后应用。';
     $('directoryApplyHint').textContent = directoryTarget === 'reference' ? '选择后加载参考 episode 列表。' : v.allowed.configure ? '选择后应用为数据保存目录。' : '可先选择，录制 / 保存完成后再应用。';
@@ -267,15 +279,30 @@
     } else if (Date.now() - pending.at > 10000) {feedback('尚未收到控制器确认，请检查状态；不会自动重试。', true); pending = null;}
   }
   function refresh() {
+    if (shutdownPhase === 'closed') return Promise.resolve();
     if (pollFlight) return pollFlight;
     pollFlight = (async () => {
-      try {snapshot = await json('/api/workbench/status', {signal:AbortSignal.timeout(2000)}); connected = true; checkAck(); render();}
-      catch (error) {connected = false; snapshot = {...snapshot, control:{...snapshot.control, online:false}, mode_switch:{allowed:false, reason:'等待控制器连接'}}; render(); feedback(error.message, true);}
+      try {
+        snapshot = await json('/api/workbench/status', {signal:AbortSignal.timeout(2000)}); connected = true;
+        if (snapshot.shutdown) {
+          shutdownPhase = snapshot.shutdown.phase;
+          if (shutdownPhase === 'failed') shutdownRequested = false;
+        }
+        checkAck(); render();
+        if (shuttingDown() || shutdownPhase === 'failed') feedback(snapshot.shutdown?.detail || '正在退出 ROS…', shutdownPhase === 'failed');
+      }
+      catch (error) {
+        connected = false; snapshot = {...snapshot, control:{...snapshot.control, online:false}, mode_switch:{allowed:false, reason:'等待控制器连接'}};
+        if (shutdownPhase === 'exiting') shutdownPhase = 'closed';
+        render();
+        feedback(shutdownPhase === 'closed' ? 'ROS 正在退出，网页服务已关闭。重新启动 ROS 后刷新页面。' : error.message, shutdownPhase !== 'closed');
+      }
       finally {pollFlight = null;}
     })(); return pollFlight;
   }
   async function poll() {
     await refresh();
+    if (shutdownPhase === 'closed') return;
     const v = view(), p = snapshot.policy || {};
     const active = connected && v.online && !v.paused && ['policy','hil'].includes(v.mode) && (v.running || v.preview) &&
       snapshot.model?.phase === 'running' && !p.error && p.phase !== 'fault' &&
@@ -283,6 +310,7 @@
     setTimeout(poll, active ? 200 : 500);
   }
   async function cameraLoop(name) {
+    if (['exiting','closed'].includes(shutdownPhase)) return;
     const image = document.querySelector(`[data-camera="${name}"]`), empty = document.querySelector(`[data-camera-empty="${name}"]`), status = document.querySelector(`[data-camera-state="${name}"]`);
     if (!document.hidden) {
       let url;
@@ -303,37 +331,57 @@
         if (name === 'ego') reference.live(null);
       } finally {if (url) URL.revokeObjectURL(url);}
     }
-    setTimeout(() => cameraLoop(name), 200);
+    if (!['exiting','closed'].includes(shutdownPhase)) setTimeout(() => cameraLoop(name), 200);
+  }
+  function clearModelCatalog() {
+    catalogVersion++; catalog = null; catalogServerId = '';
+    $('modelTask').replaceChildren(); $('modelList').replaceChildren();
+    $('taskPrompt').textContent = '请选择当前机器的任务。';
   }
   async function loadModels() {
     const version = ++catalogVersion;
-    catalog = null; renderModels();
+    const previousServer = catalogServerId, selectedTask = $('modelTask').value;
+    catalog = null; $('modelTask').replaceChildren(); renderModels();
     try {
       const servers = await json('/api/servers');
       if (version !== catalogVersion) return;
+      const serverId = servers.selected;
+      catalogServerId = serverId;
       $('serverSelect').replaceChildren();
       for (const server of servers.servers) $('serverSelect').add(new Option(server.label, server.id));
-      $('serverSelect').value = servers.selected;
-      const models = await json('/api/models');
-      if (version !== catalogVersion) return;
-      catalog = models; const selected = $('modelTask').value; $('modelTask').replaceChildren();
-      for (const task of catalog.tasks || []) $('modelTask').add(new Option(task.name, task.name));
-      if ([...$('modelTask').options].some(o => o.value === selected)) $('modelTask').value = selected;
+      $('serverSelect').value = serverId;
+      const models = await json('/api/models?' + new URLSearchParams({server_id:serverId}));
+      if (version !== catalogVersion || (snapshot.model?.server_id && snapshot.model.server_id !== serverId)) return;
+      if (models.server?.id !== serverId) throw new Error('推理机器已变化，请刷新清单。');
+      catalog = models; $('modelTask').replaceChildren();
+      $('modelTask').add(new Option('请选择任务', ''));
+      for (const task of catalog.tasks || []) $('modelTask').add(new Option(task.label || task.task_id || task.name, task.name));
+      if (previousServer === serverId && [...$('modelTask').options].some(o => o.value === selectedTask)) $('modelTask').value = selectedTask;
       renderModels();
     } catch (error) {if (version === catalogVersion) feedback(error.message, true);}
   }
   function renderModels() {
-    const task = catalog?.tasks?.find(t => t.name === $('modelTask').value); $('taskPrompt').textContent = task?.prompt || (catalog?.configured === false ? '尚未配置模型目录。配置所选服务器后刷新清单。' : '模型清单为空。'); $('modelList').replaceChildren();
+    const task = catalog?.tasks?.find(t => t.name === $('modelTask').value);
+    $('taskPrompt').textContent = task ? task.prompt ? '任务默认文本：' + task.prompt : '任务未设置默认文本，请查看各 checkpoint 的任务文本。' :
+      catalog?.configured === false ? '尚未配置模型目录。配置所选机器后刷新清单。' : catalog?.tasks?.length ? '请选择任务，再加载该任务下的 checkpoint。' : '模型清单为空。';
+    $('modelList').replaceChildren();
+    const version = catalogVersion, serverId = catalogServerId;
     for (const run of task?.runs || []) {
       const item = document.createElement('article'); item.className = 'model-item';
-      const copy = document.createElement('div'), name = document.createElement('strong'), detail = document.createElement('p'), button = document.createElement('button');
-      name.textContent = run.label || `${run.model} / ${run.id || run.run_id}`; detail.className = 'muted'; detail.textContent = run.launchable ? `${run.variant || run.stage || '远端模型可用'}` : run.disabled_reason || '模型不可加载';
-      button.textContent = '加载模型'; button.dataset.modelLoad = run.id || run.run_id; button.dataset.launchable = String(!!run.launchable);
+      const copy = document.createElement('div'), name = document.createElement('strong'), detail = document.createElement('p'), prompt = document.createElement('p'), button = document.createElement('button');
+      name.textContent = run.label || `${run.model} / ${run.id || run.run_id}`;
+      detail.className = 'muted'; detail.textContent = run.launchable ? `${run.variant || run.stage || '模型可用'}` : run.disabled_reason || '模型不可加载';
+      const effectivePrompt = run.prompt ?? task.prompt ?? '';
+      prompt.className = 'model-prompt'; prompt.textContent = '任务文本：' + (effectivePrompt || '未配置');
+      button.textContent = '加载 checkpoint'; button.dataset.modelLoad = run.id || run.run_id; button.dataset.launchable = String(!!run.launchable && !!effectivePrompt.trim());
       button.onclick = async () => {
-        const payload = {task:task.name, run_id:run.run_id};
+        if (version !== catalogVersion || serverId !== snapshot.model?.server_id || $('modelTask').value !== task.name) {
+          feedback('机器或任务已变化，请重新选择 checkpoint。', true); return;
+        }
+        const payload = {server_id:serverId, task:task.name, run_id:run.run_id, prompt:effectivePrompt, checkpoint_path:run.checkpoint_path};
         if (await command(() => post('/api/model/start', payload))) $('modelDialog').close();
       };
-      copy.append(name, detail); item.append(copy, button); $('modelList').append(item);
+      copy.append(name, detail, prompt); item.append(copy, button); $('modelList').append(item);
     }
     render();
   }
@@ -378,6 +426,20 @@
     }, {ack:'root', ackValue:requested});
   }
   all('[data-close]').forEach(e => e.onclick = () => $(e.dataset.close).close());
+  $('killed').onclick = async () => {
+    if (shuttingDown() || !connected) return;
+    shutdownRequested = true; resetEpoch++; pending = null;
+    all('dialog[open]').forEach(dialog => dialog.close());
+    render(); feedback('正在停止执行并准备退出 ROS…');
+    try {
+      const result = await post('/api/workbench/shutdown', {action:'killed'});
+      shutdownPhase = result.phase;
+      feedback(result.detail || '正在退出 ROS…');
+    } catch (error) {
+      shutdownRequested = false; feedback(error.message, true);
+    }
+    await refresh();
+  };
   all('[data-mode]').forEach(e => e.onclick = () => selectMode(e.dataset.mode));
   $('start').onclick = () => command(() => snapshot.mode === 'teleop' ? operator('run_ur') : snapshot.mode === 'replay' ? post('/api/replay/live/start', replayConfig(false)) : action('start_deploy'));
   $('pause').onclick = () => command(() => snapshot.mode === 'teleop' ? operator('pause') : snapshot.mode === 'replay' ? post('/api/replay', {action:'pause'}) : action('pause_deploy'));
@@ -405,6 +467,7 @@
   $('recordRoot').oninput = () => {rootEdited = true; render();};
   $('recordRoot').onkeydown = e => {if (e.key === 'Enter') applyRoot();};
   $('chooseDirectory').onclick = () => openDirectory('recording');
+  $('policyRecordDirectory').onclick = () => openDirectory('recording');
   $('chooseReferenceDirectory').onclick = () => openDirectory('reference');
   $('directoryDialog').addEventListener('close', () => {directoryVersion++; clearDirectoryParent();});
   $('browseDirectory').onclick = () => browseDirectory($('directoryPath').value.trim());
@@ -455,7 +518,7 @@
   $('saveBias').onclick = () => command(() => operator('save_bias'));
   $('serverSelect').onchange = async event => {
     const id = event.target.value;
-    catalogVersion++; catalog = null; renderModels();
+    clearModelCatalog(); renderModels();
     if (await command(() => post('/api/server/select', {server_id:id}))) await loadModels();
   };
   loadModels();

@@ -48,6 +48,40 @@ def test_serves_shared_assets_and_queues_operator_commands():
     http.handle(request);assert request.code==400;assert len(calls)==1
 
 
+def test_shutdown_route_requires_explicit_action_and_blocks_other_commands():
+    calls = []
+    class Shutdown:
+        def snapshot(self): return {'phase': 'stopping'}
+        def active(self): return bool(calls)
+        def request(self):
+            calls.append('shutdown')
+            return {'accepted': True, **self.snapshot()}
+    http = WorkbenchHTTP(lambda: {}, lambda _: pytest.fail('robot command'), None,
+                         shutdown=Shutdown())
+    for payload in ({}, {'action': 'stop'}, {'action': 'killed', 'pid': 1}, []):
+        request = Handler('/api/workbench/shutdown', 'POST', payload)
+        http.handle(request)
+        assert request.code == 400
+    assert calls == []
+    request = Handler('/api/workbench/shutdown', 'POST', {'action': 'killed'})
+    http.handle(request)
+    assert request.code == 202
+    assert json.loads(request.wfile.getvalue())['accepted']
+    request = Handler('/api/workbench/action', 'POST', {'action': 'run_ur'})
+    http.handle(request)
+    assert request.code == 400
+    request = Handler('/api/workbench/status')
+    http.handle(request)
+    assert json.loads(request.wfile.getvalue())['shutdown']['phase'] == 'stopping'
+
+
+def test_shutdown_unavailable_in_offline_or_unsupported_entry():
+    http = WorkbenchHTTP(lambda: {}, lambda _: {}, None)
+    request = Handler('/api/workbench/shutdown', 'POST', {'action': 'killed'})
+    http.handle(request)
+    assert request.code == 400
+
+
 def test_preferences_survive_server_restart_without_robot_commands(tmp_path):
     from ur_common.workbench_preferences import WorkbenchPreferences
     path = tmp_path / "config" / "workbench.json"

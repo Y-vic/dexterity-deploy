@@ -20,7 +20,9 @@ import time
 from typing import Any
 
 import numpy as np
-from ur_common.command_guards import validate_arm_step
+from ur_common.command_guards import (
+    HandCommandGuard, project_hand_plan, validate_arm_step,
+)
 
 from .trajectory import ExecutionTraceWriter, build_trajectory_payload
 from .execution_progress import ActorExecutionProgress
@@ -67,6 +69,25 @@ class PlannedAction:
 
 class ActorIkError(ValueError):
     pass
+
+
+def prepare_policy_plan(plan: IkPlan, measured_hand: Any, *, previous_hand: Any = None) -> IkPlan:
+    """Project and preflight the complete active Policy slice before admission.
+
+    A prefetched slice starts from the previous plan's final accepted target.
+    Future rows assume the preceding target is reached; dispatch checks actual
+    measured state again before publishing either arm or hand commands.
+    """
+    hand = project_hand_plan(plan.hand_joint)
+    guard = HandCommandGuard()
+    reference = measured_hand if previous_hand is None else previous_hand
+    if previous_hand is not None:
+        guard.commit(previous_hand)
+    for row in hand:
+        guard.check(reference, row, time.monotonic())
+        guard.commit(row)
+        reference = row
+    return IkPlan(plan.left_joint, plan.right_joint, hand)
 
 
 class SequentialPlanBuffer:
@@ -464,6 +485,8 @@ def main(args=None) -> None:
             self._ur_received_ns = self._hand_received_ns = 0
             self._ur_valid = False
             self._hand_valid = False
+            self._policy_hand_guard = HandCommandGuard()
+            self._policy_hand_session = ''
             self._arm_pub = self.create_publisher(ArmCommand, "/ur/command", 10)
             self._hand_pub = self.create_publisher(HandCommand, "/sharpa/command", 10)
             self._done_pub = self.create_publisher(ExecutionDone, "/policy/execution_done", 10)
@@ -1358,9 +1381,21 @@ def main(args=None) -> None:
                 right_target = limit_joint_target(
                     self._right, plan.right_joint[step], ARM_MAX_STEP_RAD
                 )
-            hand_target = limit_joint_target(
-                self._hand, plan.hand_joint[step], HAND_MAX_STEP_RAD
-            )
+            strict_policy = self._execution_provider == 'policy' and not self._human_publish
+            if strict_policy:
+                if self._policy_hand_session != str(action.session_id):
+                    self._policy_hand_guard.reset()
+                    self._policy_hand_session = str(action.session_id)
+                hand_target = limit_joint_target(
+                    self._hand, plan.hand_joint[step], HAND_MAX_STEP_RAD
+                )
+                self._policy_hand_guard.check(self._hand, hand_target, time.monotonic())
+            else:
+                self._policy_hand_guard.reset()
+                self._policy_hand_session = ''
+                hand_target = limit_joint_target(
+                    self._hand, plan.hand_joint[step], HAND_MAX_STEP_RAD
+                )
             arm = None
             if not hands_only:
                 arm = ArmCommand()
@@ -1384,8 +1419,8 @@ def main(args=None) -> None:
             hand.left_enable = True
             hand.right_enable = True
             hand.dry_run = bool(self._execution_dry_run)
-            hand.strict_targets = False
-            hand.policy_session_id = ""
+            hand.strict_targets = strict_policy
+            hand.policy_session_id = str(action.session_id) if strict_policy else ""
             hand.is_hil = bool(self._human_publish)
             key = (action.action_id, int(action.revision), step)
             command_timestamp_ns = time.time_ns()
@@ -1416,6 +1451,8 @@ def main(args=None) -> None:
             if arm is not None:
                 self._arm_pub.publish(arm)
             self._hand_pub.publish(hand)
+            if strict_policy:
+                self._policy_hand_guard.commit(hand_target)
             if not self._human_publish and self._execution_progress.dispatched(
                 action, step, command_timestamp_ns
             ):
@@ -1631,6 +1668,20 @@ def main(args=None) -> None:
                     right = _array(action.right_arm_joint, action.execute_length, 6, "right_arm_joint")
                     hand = _array(action.hand_joint, action.execute_length, 44, "hand_joint")
                     plan = IkPlan(left.astype(np.float32), right.astype(np.float32), hand.astype(np.float32))
+                if provider == 'policy':
+                    if not str(action.session_id).strip():
+                        raise ActorIkError('Policy hand execution requires a nonempty session ID')
+                    current = self._plans.current
+                    previous_hand = None if current is None else current.plan.hand_joint[-1]
+                    plan = prepare_policy_plan(plan, self._hand, previous_hand=previous_hand)
+                    correction = np.abs(plan.hand_joint - np.asarray(action.hand_joint, dtype=np.float32).reshape(plan.hand_joint.shape))
+                    self._trace.event('actor_hand_plan_projected',
+                        session_id=str(action.session_id), action_id=str(action.action_id),
+                        revision=int(action.revision), execute_start=int(action.execute_start),
+                        execute_length=int(action.execute_length),
+                        corrected_values=int(np.count_nonzero(correction)),
+                        max_projection_rad=float(correction.max()),
+                        raw_hand_joint=list(action.hand_joint))
                 self._trace.event(
                     "actor_plan_ready",
                     node="actor_ik_node",

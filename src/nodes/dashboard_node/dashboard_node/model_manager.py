@@ -1,4 +1,4 @@
-"""Safe remote lifecycle management for the dashboard policy server."""
+"""Machine-scoped lifecycle management for the dashboard policy server."""
 
 from __future__ import annotations
 
@@ -39,6 +39,7 @@ class ServerProfile:
     port: int = 5500
     env_file: str = ""
     require_download_verification: bool = False
+    local: bool = False
 
     @classmethod
     def from_mapping(cls, server_id: str, value: Any) -> "ServerProfile":
@@ -46,7 +47,10 @@ class ServerProfile:
             raise ModelManagerError(f"无效的模型 server profile: {server_id!r}")
         repo_root = str(value.get("repo_root") or "").strip()
         ssh_host = str(value.get("ssh_host") or "").strip()
-        if (repo_root and not repo_root.startswith("/")) or not ssh_host or ssh_host.startswith("-"):
+        local = value.get("local", False)
+        if type(local) is not bool:
+            raise ModelManagerError("local 必须是布尔值")
+        if (repo_root and not repo_root.startswith("/")) or (not local and not ssh_host) or ssh_host.startswith("-"):
             raise ModelManagerError(f"server profile {server_id!r} 缺少 ssh_host/repo_root")
         port = int(value.get("port", 5500))
         if not 1 <= port <= 65535:
@@ -67,6 +71,7 @@ class ServerProfile:
             port=port,
             env_file=str(value.get("env_file") or ""),
             require_download_verification=value.get("require_download_verification", False),
+            local=local,
         )
 
     def public(self) -> dict[str, Any]:
@@ -74,6 +79,7 @@ class ServerProfile:
             "id": self.server_id,
             "label": self.label,
             "ssh_host": self.ssh_host,
+            "local": self.local,
             "repo_root": self.repo_root,
             "asset_root": self.asset_root,
             "remote_host": self.remote_host,
@@ -168,6 +174,8 @@ class RemoteModelManager:
             "model": "",
             "run_id": "",
             "prompt": "",
+            "checkpoint_path": "",
+            "policy_transport": "legacy",
             "port": 0,
             "detail": "",
             "log_tail": "",
@@ -186,6 +194,7 @@ class RemoteModelManager:
             "server_id": profile.server_id,
             "server_label": profile.label,
             "ssh_host": profile.ssh_host,
+            "local": profile.local,
             "repo_root": profile.repo_root,
             "asset_root": profile.asset_root,
             "remote_host": profile.remote_host,
@@ -220,6 +229,8 @@ class RemoteModelManager:
                 model="",
                 run_id="",
                 prompt="",
+                checkpoint_path="",
+                policy_transport="legacy",
                 port=0,
                 detail=f"已切换到 {profile.label}",
                 log_tail="",
@@ -234,10 +245,14 @@ class RemoteModelManager:
         with self._lock:
             return self._profiles[self._server_id]
 
-    def catalog(self) -> dict[str, Any]:
-        profile = self._active_profile()
+    def catalog(self, *, server_id: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            if server_id is not None and server_id != self._server_id:
+                raise ModelManagerError("推理机器已切换，请刷新清单")
+            profile = self._profiles[self._server_id]
+            generation = self._generation
         if not profile.repo_root:
-            return {"models": [], "tasks": [], "server": profile.public(), "configured": False, "reason": "尚未配置模型目录"}
+            return {"models": [], "tasks": [], "server": profile.public(), "generation": generation, "configured": False, "reason": "尚未配置模型目录"}
         script = """
 import json
 from pathlib import Path
@@ -256,7 +271,8 @@ tasks = []
 for path in sorted(config_root.glob("*/task.json")):
     data = json.loads(path.read_text(encoding="utf-8"))
     task_name = path.parent.name
-    compatible = task_name.startswith("ur_")
+    task = data.get("task") or {}
+    compatible = task_name.startswith("ur_") and data.get("schema") == "sharpa.deploy.task_config.v2"
     runs = []
     entries = data.get("runs") or []
     if not isinstance(entries, list):
@@ -269,7 +285,10 @@ for path in sorted(config_root.glob("*/task.json")):
         checkpoint_exists = bool(checkpoint_path) and Path(checkpoint_path).is_dir()
         eligible = bool((entry.get("deployment") or {}).get("eligible", False))
         status = str(entry.get("status") or "")
+        prompt = entry.get("prompt", task.get("prompt", ""))
         reasons = []
+        if not isinstance(prompt, str) or not prompt.strip():
+            reasons.append("任务文本缺失或格式错误")
         if not compatible:
             reasons.append("不是 UR task")
         if not model:
@@ -298,6 +317,7 @@ for path in sorted(config_root.glob("*/task.json")):
                     reasons.append(f"缺少部署依赖 {required}")
         runs.append({
             "model": model,
+            "prompt": prompt if isinstance(prompt, str) else "",
             "id": str(entry.get("id") or ""),
             "run_id": str(entry.get("run_id") or ""),
             "checkpoint_path": checkpoint_path,
@@ -312,8 +332,9 @@ for path in sorted(config_root.glob("*/task.json")):
         })
     tasks.append({
         "name": task_name,
-        "task_id": str((data.get("task") or {}).get("id") or task_name),
-        "prompt": str((data.get("task") or {}).get("prompt") or ""),
+        "task_id": str(task.get("id") or task_name),
+        "label": str(task.get("label") or task.get("id") or task_name),
+        "prompt": str(task.get("prompt") or ""),
         "dataset_path": str((asset_root / str((data.get("task") or {}).get("dataset") or "")).resolve()),
         "compatible": compatible,
         "runs": runs,
@@ -334,16 +355,32 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
             raise ModelManagerError("远端 task catalog 不是有效 JSON") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
             raise ModelManagerError("远端 task catalog 格式错误")
+        with self._lock:
+            if self._server_id != profile.server_id or self._generation != generation:
+                raise ModelManagerError("模型状态已变化，请刷新清单")
         payload["server"] = profile.public()
+        payload["generation"] = generation
         payload["configured"] = True
         return payload
 
-    def start(self, task: str, run_id: str) -> dict[str, Any]:
+    def start(
+        self, task: str, run_id: str, *, server_id: str | None = None,
+        expected_prompt: str | None = None, expected_checkpoint: str | None = None,
+    ) -> dict[str, Any]:
         with self._lock:
             if self._closed:
                 raise ModelManagerError("模型管理器已关闭")
         profile = self._active_profile()
-        selected = self._find_run(task, run_id)
+        if server_id is not None and server_id != profile.server_id:
+            raise ModelManagerError("推理机器已切换，请重新选择模型")
+        selected = self._find_run(task, run_id, server_id=profile.server_id)
+        prompt = selected["run"].get("prompt", selected["task"].get("prompt", ""))
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ModelManagerError("所选 checkpoint 的任务文本缺失或格式错误")
+        if (expected_prompt is not None and expected_prompt != prompt) or (
+            expected_checkpoint is not None and expected_checkpoint != selected["run"]["checkpoint_path"]
+        ):
+            raise ModelManagerError("checkpoint 或任务文本已变化，请刷新清单后重新选择")
         if not selected["run"]["launchable"]:
             raise ModelManagerError(selected["run"]["disabled_reason"] or "该模型不可部署")
         with self._lock:
@@ -369,9 +406,11 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 task_id=selected["task"]["task_id"],
                 model=selected["run"]["model"],
                 run_id=run_id,
-                prompt=selected["task"]["prompt"],
+                prompt=prompt,
+                checkpoint_path=selected["run"]["checkpoint_path"],
+                policy_transport="dfm_native" if selected["run"]["model"] == "dfm_flow" else "legacy",
                 port=0,
-                detail="正在创建远端模型进程",
+                detail="正在创建模型进程",
                 log_tail="",
                 updated_at=time.time(),
             )
@@ -380,7 +419,7 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
             launch_run.update(
                 task=task,
                 task_id=selected["task"]["task_id"],
-                prompt=selected["task"]["prompt"],
+                prompt=prompt,
                 dataset_path=selected["task"]["dataset_path"],
             )
             self._worker = threading.Thread(
@@ -403,7 +442,7 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
             self._state.update(
                 phase="stopping",
                 generation=generation,
-                detail="正在停止远端模型",
+                detail="正在停止模型",
                 updated_at=time.time(),
             )
             state = deepcopy(self._state)
@@ -417,8 +456,8 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         self._notify(state)
         return state
 
-    def _find_run(self, task: str, run_id: str) -> dict[str, Any]:
-        catalog = self.catalog()
+    def _find_run(self, task: str, run_id: str, *, server_id: str | None = None) -> dict[str, Any]:
+        catalog = self.catalog(server_id=server_id)
         for task_entry in catalog["tasks"]:
             if task_entry["name"] != task:
                 continue
@@ -457,11 +496,11 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 log_tail = self._captured_log()
                 self._update_log(generation, log_tail)
                 if self._pane_dead():
-                    raise ModelManagerError(self._error_log(log_tail) or "远端模型进程已退出")
-                if self._healthy(port):
+                    raise ModelManagerError(self._error_log(log_tail) or "模型进程已退出")
+                if self._healthy(port, native=run["model"] == "dfm_flow"):
                     self._transition(generation, "running", f"模型服务已在端口 {port} 就绪", port=port)
                     return
-            raise ModelManagerError("等待远端模型健康检查超时")
+            raise ModelManagerError("等待模型健康检查超时")
         except Exception as exc:
             detail = f"模型启动失败：{exc}"
             try:
@@ -529,7 +568,11 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
                 if self._worker.is_alive():
                     raise ModelManagerError("模型启动线程尚未退出")
             self._cleanup_remote_model(self.base_port)
-            self._transition(generation, "stopped", "模型已停止", port=0)
+            self._transition(
+                generation, "stopped", "模型已停止", port=0,
+                task="", task_id="", model="", run_id="", prompt="",
+                checkpoint_path="", policy_transport="legacy",
+            )
         except Exception as exc:
             self._transition(generation, "fault", str(exc))
 
@@ -538,6 +581,14 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
             return
         remote_command = "tmux kill-session -t {} 2>/dev/null || true".format(shlex.quote(self.session_name))
         self._ssh(remote_command, timeout_s=12.0)
+        # tmux acknowledges session removal before an exiting model necessarily
+        # releases its socket. Do not expose "stopped" while the next load would
+        # still collide with the previous server on the fixed serving port.
+        deadline = time.monotonic() + 12.0
+        while self._port_in_use(port):
+            if time.monotonic() >= deadline:
+                raise ModelManagerError(f"旧模型尚未释放端口 {port}，请稍后重试停止")
+            time.sleep(0.1)
         self._owns_session = False
 
     def _stop_remote_session(self) -> None:
@@ -561,9 +612,10 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         )
         return result.returncode != 0 or result.stdout.strip() == "1"
 
-    def _healthy(self, port: int) -> bool:
+    def _healthy(self, port: int, *, native: bool = False) -> bool:
+        endpoint = "health" if native else "healthz"
         result = self._ssh_raw(
-            f"curl -fsS --max-time 2 http://127.0.0.1:{int(port)}/healthz >/dev/null",
+            f"curl -fsS --max-time 2 http://127.0.0.1:{int(port)}/{endpoint} >/dev/null",
             timeout_s=8.0,
         )
         return result.returncode == 0
@@ -644,7 +696,7 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         self, remote_command: str, *, timeout_s: float, profile: ServerProfile | None = None
     ) -> subprocess.CompletedProcess[str]:
         profile = profile or self._active_profile()
-        command = [
+        command = ["/bin/bash", "-lc", remote_command] if profile.local else [
             "/usr/bin/ssh",
             "-T",
             "-o",
@@ -659,7 +711,7 @@ print(json.dumps({"models": models, "tasks": tasks}, ensure_ascii=False, separat
         try:
             return self.runner(command, timeout_s)
         except subprocess.TimeoutExpired as exc:
-            raise ModelManagerError("SSH 操作超时") from exc
+            raise ModelManagerError("模型机器操作超时") from exc
 
     def close(self):
         with self._lock:

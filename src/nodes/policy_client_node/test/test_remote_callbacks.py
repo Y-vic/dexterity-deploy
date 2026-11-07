@@ -40,6 +40,7 @@ class Node:
     def __init__(self, name):
         self.parameters = {}
         self.messages = {}
+        self.guard_callbacks = []
 
     def declare_parameter(self, name, value):
         self.parameters[name] = value
@@ -53,6 +54,13 @@ class Node:
 
     def create_subscription(self, *args, **kwargs):
         return None
+
+    def create_guard_condition(self, callback):
+        return SimpleNamespace(trigger=lambda: self.guard_callbacks.append(callback))
+
+    def spin_guards(self):
+        while self.guard_callbacks:
+            self.guard_callbacks.pop(0)()
 
     def create_timer(self, *args, **kwargs):
         return None
@@ -380,4 +388,41 @@ def test_bridge_ack_arriving_before_local_control_status_is_accepted(run_node):
         started.timestamp_ns = 400
         node._control_status(started)
         assert node._recording_ready()
+    run_node(check)
+
+
+def test_rpc_completion_wakes_executor_without_periodic_tick(run_node):
+    def check(node):
+        ready(node)
+        node._tick()
+        result, latency = response(node)
+        result = replace(result, diagnostics={'client_response_wait_s': 0.04})
+        node._inference_pool.finish((result, latency))
+        # The worker completion must not publish in its callback thread.
+        assert not node.messages['/policy/executable_action']
+        assert node.guard_callbacks
+        node.spin_guards()
+        assert len(node.messages['/policy/executable_action']) == 1
+        assert node._request_metrics.inference_count == 1
+        completed = [json.loads(message.data) for message in
+                     node.messages['/deploy/execution_event']
+                     if json.loads(message.data)['event'] == 'model_inference_completed']
+        assert completed[0]['diagnostics']['client_response_wait_s'] == 0.04
+    run_node(check)
+
+
+def test_completion_wakeup_preserves_cancelled_response_and_shutdown(run_node):
+    def check(node):
+        ready(node)
+        node._tick()
+        value = response(node)
+        node._control_status(control(paused=True))
+        node._inference_pool.finish(value)
+        node.spin_guards()
+        assert not node.messages['/policy/executable_action']
+        assert node._request_metrics.inference_count == 0
+        future = node._submit_rpc(lambda: None)
+        node._close_completion_wakeups()
+        node._inference_pool.finish()
+        assert future.done() and not node.guard_callbacks
     run_node(check)

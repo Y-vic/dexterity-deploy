@@ -9,7 +9,7 @@ const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');
 const script=fs.readFileSync(path.join(assets,'workbench.js'),'utf8');
 const {derive,deviceCards}=require(path.join(assets,'workbench-state.js'));
 const flush=async()=>{for(let i=0;i<4;i++)await new Promise(resolve=>setImmediate(resolve));};
-function fixture({configured=false, rejectSwitch=false, firstCatalog=null, mode='policy', replay=null, reference=null, replayReply={queued:true,command_id:'load-new'}}={}) {
+function fixture({configured=false, rejectSwitch=false, firstCatalog=null, catalogs=null, mode='policy', replay=null, reference=null, replayReply={queued:true,command_id:'load-new'}}={}) {
   class Element {
     constructor(tag='div',attrs={}) {
       this.tagName=tag;this.attrs=attrs;this.dataset={};this.children=[];this.value=attrs.value||'';
@@ -43,7 +43,7 @@ function fixture({configured=false, rejectSwitch=false, firstCatalog=null, mode=
     capabilities:{modes:['teleop','policy','replay'],deployment:true,switchable:true},mode_switch:{allowed:true},
     model:{phase:'stopped',server_id:'baai',server_label:'BAAI',ssh_host:'BAAI',configured}};
   const requests=[],scheduled=[],pollDelays=[];let catalogRequests=0,clockOffset=0;
-  const context={console,AbortSignal,URL,Date:class extends Date{static now(){return Date.now()+clockOffset;}},Map,JSON,Event,performance,
+  const context={console,AbortSignal,URL,URLSearchParams,Date:class extends Date{static now(){return Date.now()+clockOffset;}},Map,JSON,Event,performance,
     document:{hidden:true,getElementById:id=>ids.get(id)||null,querySelectorAll,querySelector:s=>querySelectorAll(s)[0],createElement:tag=>new Element(tag)},
     window:{addEventListener(){}},WorkbenchState:{derive,deviceCards},
     WorkbenchReference:class{initializing=false;selection=reference;init(){}},
@@ -54,9 +54,10 @@ function fixture({configured=false, rejectSwitch=false, firstCatalog=null, mode=
       let body;
       if(url==='/api/workbench/status')body=state;
       else if(url==='/api/servers')body={selected:state.model.server_id,servers:[{id:'baai',label:'BAAI'},{id:'4090',label:'4090'}]};
-      else if(url==='/api/models') {
+      else if(url.startsWith('/api/models?')) {
         if(++catalogRequests===1&&firstCatalog)return {ok:true,json:()=>firstCatalog};
-        body={configured,tasks:configured?[{name:'task',prompt:'Test',runs:[{id:'run',run_id:'immutable-training-run',label:'50 real + 500 sim',model:'remote',launchable:true}]}]:[]};
+        const serverId=new URL(url,'http://fixture').searchParams.get('server_id');
+        body={server:{id:serverId},configured,tasks:catalogs?.[serverId] || (configured?[{name:'task',label:'Duck task',prompt:'Test',runs:[{id:'run',run_id:'immutable-training-run',label:'101 real + 500 sim',model:'remote',prompt:'Checkpoint instruction',checkpoint_path:'/offline/checkpoint',launchable:true}]}]:[])};
       } else if(url==='/api/server/select') {
         if(rejectSwitch)body={accepted:false,error:'模型启动中，暂不可切换'};
         else {const id=JSON.parse(options.body).server_id;Object.assign(state.model,{server_id:id,server_label:id==='baai'?'BAAI':'4090',ssh_host:id==='baai'?'BAAI':'ps'});body={accepted:true};}
@@ -67,7 +68,7 @@ function fixture({configured=false, rejectSwitch=false, firstCatalog=null, mode=
     },
   };
   vm.runInNewContext(script,context,{filename:'workbench.js'});
-  return {ids,state,requests,pollDelays,querySelectorAll,advanceTime:ms=>{clockOffset+=ms;},refresh:async()=>{await scheduled.find(callback=>callback.name==='poll')();await flush();},switchServer:async id=>{const select=ids.get('serverSelect');select.value=id;await select.onchange({target:select});await flush();}};
+  return {ids,state,requests,pollDelays,querySelectorAll,chooseTask:name=>{ids.get('modelTask').value=name;ids.get('modelTask').onchange();},advanceTime:ms=>{clockOffset+=ms;},refresh:async()=>{await scheduled.find(callback=>callback.name==='poll')();await flush();},switchServer:async id=>{const select=ids.get('serverSelect');select.value=id;await select.onchange({target:select});await flush();}};
 }
 
 test('page initializes with all DOM references present and only three primary modes',async()=>{
@@ -81,6 +82,26 @@ test('page initializes with all DOM references present and only three primary mo
   assert.equal(page.ids.get('policyAverageLatency').textContent,'—');
   assert.equal(page.ids.get('policyChunkProgress').textContent,'—');
   assert.equal(page.ids.get('policyInferenceCount').textContent,'0 次有效请求');
+});
+
+test('Policy shows the confirmed UR recording root while directory edits remain pending',async()=>{
+  const page=fixture();await flush();
+  page.state.recording.recording_root='/media/yns/T9/captures';
+  await page.refresh();
+  assert.equal(page.ids.get('policyRecordingOptions').hidden,false);
+  assert.equal(page.ids.get('policyRecordPath').textContent,'保存至 UR：/media/yns/T9/captures');
+  page.ids.get('recordRoot').value='/home/yns/data/new captures';
+  page.ids.get('recordRoot').oninput();
+  page.state.recording.recording=true;
+  await page.refresh();await page.refresh();
+  assert.equal(page.ids.get('recordRoot').value,'/home/yns/data/new captures');
+  assert.equal(page.ids.get('policyRecordPath').textContent,'保存至 UR：/media/yns/T9/captures · 新目录待应用');
+  assert.equal(page.ids.get('applyRoot').disabled,true);
+  assert.equal(page.requests.some(r=>r.url==='/api/recording/config'),false);
+  page.state.model.server_id='4090';await page.refresh();
+  assert.match(page.ids.get('policyRecordPath').textContent,/^保存至 UR：/,'storage remains on UR for remote inference');
+  page.state.mode='teleop';await page.refresh();
+  assert.equal(page.ids.get('policyRecordingOptions').hidden,true);
 });
 
 function runningPolicy(page, extra={}) {
@@ -162,11 +183,11 @@ test('remote selection posts server identity and empty catalogs remain usable',a
 });
 
 test('model start sends the established remote task/run contract without local runtime overrides',async()=>{
-  const page=fixture({configured:true});await flush();
+  const page=fixture({configured:true});await flush();page.chooseTask('task');
   const button=page.querySelectorAll('[data-model-load]')[0];assert.equal(button.disabled,false);
   await button.onclick();await flush();
-  assert.deepEqual(page.requests.find(r=>r.url==='/api/model/start').payload,{task:'task',run_id:'immutable-training-run'});
-  assert.equal(page.ids.get('modelList').children[0].children[0].children[0].textContent,'50 real + 500 sim');
+  assert.deepEqual(page.requests.find(r=>r.url==='/api/model/start').payload,{server_id:'baai',task:'task',run_id:'immutable-training-run',prompt:'Checkpoint instruction',checkpoint_path:'/offline/checkpoint'});
+  assert.equal(page.ids.get('modelList').children[0].children[0].children[0].textContent,'101 real + 500 sim');
   assert.equal(page.ids.get('serverSelect').disabled,true);
 });
 
@@ -246,4 +267,49 @@ test('Replay acknowledgment timeout stays distinct from old fault and accepts a 
   assert.equal(page.ids.get('replayError').hidden,true);
   assert.equal(page.ids.get('start').disabled,false);
   assert.match(page.ids.get('feedback').textContent,/样本已加载/);
+});
+
+
+test('machine then task scopes checkpoint prompts without carrying task selection across machines',async()=>{
+  const run=(id,prompt)=>({id,run_id:id,model:'dfm',label:id,prompt,launchable:true});
+  const task=(name,prompt,runs)=>({name,label:name,prompt,runs});
+  const catalogs={baai:[task('duck','Pick ducks',[run('duck-small','Pick yellow ducks'),run('duck-large','Pick ducks gently')]),task('button','Press button',[run('button-run','Press the blue button')])],
+    '4090':[task('duck','Different machine task',[run('ur-run','UR machine instruction')])]};
+  const page=fixture({configured:true,catalogs});await flush();
+  assert.equal(page.ids.get('modelTask').value,'');
+  assert.equal(page.ids.get('modelList').children.length,0);
+  page.chooseTask('duck');
+  assert.match(page.ids.get('modelList').children[0].children[0].children[2].textContent,/Pick yellow ducks/);
+  assert.match(page.ids.get('modelList').children[1].children[0].children[2].textContent,/Pick ducks gently/);
+  const oldButton=page.querySelectorAll('[data-model-load]')[0];
+  page.chooseTask('button');
+  assert.match(page.ids.get('taskPrompt').textContent,/Press button/);
+  assert.match(page.ids.get('modelList').children[0].children[0].children[2].textContent,/blue button/);
+  await oldButton.onclick();
+  assert.equal(page.requests.some(r=>r.url==='/api/model/start'),false);
+  await page.switchServer('4090');
+  assert.equal(page.ids.get('modelTask').value,'');
+  assert.equal(page.ids.get('modelList').children.length,0);
+  page.chooseTask('duck');
+  assert.match(page.ids.get('modelList').children[0].children[0].children[2].textContent,/UR machine instruction/);
+  assert.doesNotMatch(page.ids.get('taskPrompt').textContent,/Pick ducks|Press button/);
+});
+
+test('catalog with a mismatched machine is rejected before creating model options',async()=>{
+  const firstCatalog=Promise.resolve({server:{id:'4090'},configured:true,tasks:[{name:'wrong',prompt:'wrong',runs:[]}]});
+  const page=fixture({configured:true,firstCatalog});await flush();
+  assert.equal(page.ids.get('modelTask').options.length,0);
+  assert.match(page.ids.get('feedback').textContent,/推理机器已变化/);
+});
+
+
+test('unavailable checkpoints explain their reason and missing effective prompts stay disabled',async()=>{
+  const catalogs={baai:[{name:'task',prompt:'Default instruction',runs:[
+    {id:'missing',run_id:'missing',model:'dfm',prompt:'',launchable:true},
+    {id:'not-ready',run_id:'not-ready',model:'dfm',prompt:'Use this instruction',launchable:false,disabled_reason:'checkpoint 不存在'}]}]};
+  const page=fixture({configured:true,catalogs});await flush();page.chooseTask('task');
+  const buttons=page.querySelectorAll('[data-model-load]');
+  assert.ok(buttons.every(button=>button.disabled));
+  assert.match(page.ids.get('modelList').children[0].children[0].children[2].textContent,/未配置/);
+  assert.equal(page.ids.get('modelList').children[1].children[0].children[1].textContent,'checkpoint 不存在');
 });
